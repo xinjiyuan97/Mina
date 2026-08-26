@@ -1,0 +1,23 @@
+# Rust
+/target/
+/data/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# Local configuration
+.env
+.env.*
+!.env.example
+!.env.local.example
+/config/*.toml
+!/config/*.example.toml
+
+# Logs and editor files
+*.log
+.DS_Store
+.idea/
+.vscode/

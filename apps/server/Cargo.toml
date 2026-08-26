@@ -1,0 +1,24 @@
+[package]
+name = "mina-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agent-core.workspace = true
+agent-extension = { workspace = true, features = ["full"] }
+async-stream.workspace = true
+axum.workspace = true
+futures-util.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

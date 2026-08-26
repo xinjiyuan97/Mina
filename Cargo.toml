@@ -1,0 +1,54 @@
+[workspace]
+members = [
+    "apps/agent-cli",
+    "apps/server",
+    "crates/core",
+    "crates/extension",
+]
+default-members = [
+    "apps/agent-cli",
+    "apps/server",
+    "crates/core",
+    "crates/extension",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+repository = "https://github.com/xinjiyuan97/mina"
+
+[workspace.dependencies]
+async-stream = "0.3.6"
+agent-core = { path = "crates/core" }
+agent-extension = { path = "crates/extension" }
+axum = { version = "0.8.9", features = ["json", "macros"] }
+eventsource-stream = "0.2.3"
+futures-core = "0.3.31"
+futures-util = "0.3.31"
+jsonschema = { version = "0.18.3", default-features = false }
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+thiserror = "2.0.20"
+tempfile = "3.23.0"
+time = { version = "0.3.44", features = ["formatting"] }
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio-util = { version = "0.7.17", features = ["rt"] }
+toml = "1.1.4"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = { version = "2.5.8", features = ["serde"] }
+uuid = { version = "1.25.0", features = ["serde", "v4"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"

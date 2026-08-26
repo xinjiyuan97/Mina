@@ -1,0 +1,14 @@
+skill_id = "rust-project-guide"
+version = "0.1.0"
+description = "Inspect, explain, and safely validate Rust workspace changes."
+required_tools = ["list_directory", "read", "search"]
+optional_tools = ["edit", "run_command", "write"]
+required_capabilities = ["tool_calling"]
+
+[compatibility]
+contract_version = 1
+minimum_harness_version = "0.1.0"
+
+[activation]
+type = "routable"
+hints = ["rust", "cargo", "crate", "workspace", "编译", "测试", "依赖"]

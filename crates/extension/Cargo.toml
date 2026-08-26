@@ -1,0 +1,60 @@
+[package]
+name = "agent-extension"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "External providers, tools, stores, sandboxes and observability adapters"
+
+[features]
+default = []
+openai = [
+    "dep:async-stream",
+    "dep:eventsource-stream",
+    "dep:futures-util",
+    "dep:reqwest",
+]
+builtin-tools = ["host-sandbox", "dep:time"]
+host-sandbox = ["dep:tokio", "dep:tokio-util"]
+sqlite = ["dep:rusqlite", "dep:tokio"]
+filesystem = ["dep:sha2", "dep:tokio", "dep:toml"]
+observability-tracing = ["dep:async-stream", "dep:futures-util", "dep:tracing"]
+full = [
+    "openai",
+    "builtin-tools",
+    "host-sandbox",
+    "sqlite",
+    "filesystem",
+    "observability-tracing",
+]
+
+[dependencies]
+agent-core.workspace = true
+async-stream = { workspace = true, optional = true }
+eventsource-stream = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = { workspace = true, optional = true }
+thiserror.workspace = true
+time = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["fs", "io-util", "process"] }
+tokio-util = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+url.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[[test]]
+name = "context_engine"
+required-features = ["sqlite"]
+
+[lints]
+workspace = true

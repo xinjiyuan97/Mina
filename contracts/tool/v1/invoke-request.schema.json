@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xinjiyuan97/mina/contracts/tool/v1/invoke-request.schema.json",
+  "title": "Mina Tool Invoke Request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "run_id",
+    "call_id",
+    "tool_name",
+    "arguments"
+  ],
+  "properties": {
+    "protocol_version": { "const": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "call_id": { "type": "string", "minLength": 1 },
+    "tool_name": { "type": "string", "minLength": 1 },
+    "arguments": {},
+    "deadline_unix_ms": { "type": "integer", "minimum": 0 }
+  }
+}

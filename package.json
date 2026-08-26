@@ -1,0 +1,27 @@
+{
+  "name": "mina",
+  "private": true,
+  "packageManager": "pnpm@10.26.1",
+  "engines": {
+    "node": ">=22",
+    "pnpm": ">=10"
+  },
+  "scripts": {
+    "dev": "concurrently -n web,server -c cyan,magenta \"pnpm dev:web\" \"pnpm dev:server\"",
+    "dev:web": "pnpm --filter @mina/web dev",
+    "dev:server": "cargo run -p mina-server",
+    "build": "pnpm build:web && cargo build --workspace",
+    "build:web": "pnpm --filter @mina/web build",
+    "check": "pnpm check:web && pnpm check:rust-boundaries && cargo check --workspace --all-targets",
+    "check:rust-boundaries": "scripts/check-rust-boundaries.sh",
+    "check:web": "pnpm --filter @mina/web check",
+    "test": "cargo test --workspace"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.0.0",
+    "concurrently": "^9.2.1",
+    "tailwindcss": "^4.0.0",
+    "tsup": "^8.3.5",
+    "typescript": "5.9.3"
+  }
+}

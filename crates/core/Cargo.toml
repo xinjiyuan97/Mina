@@ -1,0 +1,29 @@
+[package]
+name = "agent-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent contracts and transport-independent harness runtime"
+
+[dependencies]
+async-stream.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+jsonschema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+jsonschema = { workspace = true, features = ["draft202012"] }
+
+[lints]
+workspace = true
