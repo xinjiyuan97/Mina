@@ -2,7 +2,7 @@ skill_id = "rust-project-guide"
 version = "0.1.0"
 description = "Inspect, explain, and safely validate Rust workspace changes."
 required_tools = ["list_directory", "read", "search"]
-optional_tools = ["edit", "run_command", "write"]
+optional_tools = ["edit", "shell_command", "write"]
 required_capabilities = ["tool_calling"]
 
 [compatibility]

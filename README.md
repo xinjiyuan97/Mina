@@ -104,9 +104,9 @@ Next.js -> Session submit -> SkillOrchestrator -> ContextEngine
 
 `EchoAgent` 用于本地 UI 开发；`SingleTurnAgent` 只调用模型一次；`AgentLoop` 可以消费流式 tool call、校验 JSON Schema，并在执行中高风险工具前等待用户审批。拒绝结果会返回模型且不会执行工具。三者使用同一个 HTTP API，切换时不需要修改前端。前端停止按钮会调用 `POST /api/v1/runs/{run_id}/cancel`，取消信号贯穿 run、审批、模型和工具执行。
 
-`agent-extension::tool` 当前提供 `get_current_time`、`read`、`list_directory`、`search`、`write`、`edit` 和 `run_command`。`read/list/search` 默认 Low，`write/edit` 默认 Medium，`run_command` 始终 High。文件工具限制在 workspace 内并拒绝密钥配置、`.env`、私钥和 `.git` 路径；`search` 通过可替换的 `SearchBackend` 工作，默认 adapter 是不联网的 workspace text search。
+`agent-extension::tool` 当前提供 `get_current_time`、`read`、`list_directory`、`search`、`write`、`edit`、`apply_patch`、`shell_command`、`exec_command` 和 `write_stdin`。`read/list/search` 默认 Low，`write/edit/apply_patch` 默认 Medium，terminal process tools 始终 High。文件工具限制在 workspace 内并拒绝密钥配置、`.env`、私钥和 `.git` 路径；`search` 通过可替换的 `SearchBackend` 工作，默认 adapter 是不联网的 workspace text search。
 
-`run_command` 通过 `agent-core::sandbox::ProcessSandbox` 契约执行，当前 `agent-extension::sandbox` 提供 `HostProcessSandbox`：无 shell、固定 cwd、清空继承环境并限制输出，但它会如实报告 `isolation=none`，不是内核级安全边界。生产环境应替换为 bubblewrap/nsjail、OCI/gVisor 或 microVM adapter；详细选型见 [进程沙箱与工具后端](./docs/10-process-sandbox-and-tool-backends.md)。
+`shell_command/exec_command/write_stdin` 通过 `agent-core::sandbox::ProcessSandbox` 契约执行，当前 `agent-extension::sandbox` 提供 `HostProcessSandbox`：固定 cwd、清空继承环境、管理会话并限制输出，但它会如实报告 `isolation=none`，不是内核级安全边界。生产环境应替换为 bubblewrap/nsjail、OCI/gVisor 或 microVM adapter；详细选型见 [进程沙箱与工具后端](./docs/10-process-sandbox-and-tool-backends.md)。
 
 Tool failure 统一包含稳定 `code`、`category`、安全 `message`、`retryable` 和可选 `retry_after_ms`；失败会进入 RunEvent/RunSnapshot 并作为结构化 tool result 返回模型，不会因为普通工具失败直接终止整个 Agent。`agent-core::observability` 定义同步、非阻塞 Hook，`agent-extension::observability` 提供 ModelPort/ToolPort 装饰器和结构化 tracing adapter，Host 可以继续接 OpenTelemetry/Langfuse，而 Harness 不依赖具体监控厂商。
 

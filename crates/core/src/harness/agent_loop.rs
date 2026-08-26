@@ -571,12 +571,13 @@ mod tests {
 
     struct FakeProvider {
         calls: AtomicUsize,
+        tool_name: &'static str,
     }
 
     impl ModelPort for FakeProvider {
         fn stream(&self, request: ModelRequest) -> ModelEventStream {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(request.tools[0].name, "get_current_time");
+            assert_eq!(request.tools[0].name, self.tool_name);
 
             if call == 0 {
                 assert_eq!(request.messages.len(), 2);
@@ -586,7 +587,7 @@ mod tests {
                     },
                     ModelEvent::ToolCallStarted {
                         call_id: "call_1".into(),
-                        name: "get_current_time".into(),
+                        name: self.tool_name.into(),
                     },
                     ModelEvent::ToolCallArgumentsDelta {
                         call_id: "call_1".into(),
@@ -716,8 +717,8 @@ mod tests {
         fn definitions(&self) -> Vec<ToolDefinition> {
             vec![
                 ToolDefinition::new(
-                    "get_current_time",
-                    "Return the current time.",
+                    "exec_command",
+                    "Run a managed terminal command.",
                     json!({"type": "object", "properties": {}}),
                 )
                 .with_risk_level(ToolRiskLevel::High),
@@ -736,7 +737,7 @@ mod tests {
 
     impl ApprovalPort for FixedApproval {
         fn request(&self, request: ApprovalRequest) -> crate::harness::ApprovalFuture {
-            assert_eq!(request.tool_name, "get_current_time");
+            assert_eq!(request.tool_name, "exec_command");
             assert_eq!(request.risk_level, ToolRiskLevel::High);
             assert_eq!(request.arguments, json!({}));
             let resolution = self.resolution.clone();
@@ -749,6 +750,7 @@ mod tests {
         let harness = Harness::new(AgentLoop::new(
             FakeProvider {
                 calls: AtomicUsize::new(0),
+                tool_name: "get_current_time",
             },
             FakeTools,
             "test-model",
@@ -849,6 +851,7 @@ mod tests {
             AgentLoop::new(
                 FakeProvider {
                     calls: AtomicUsize::new(0),
+                    tool_name: "exec_command",
                 },
                 RiskyTools {
                     calls: Arc::clone(&calls),
@@ -893,6 +896,7 @@ mod tests {
             AgentLoop::new(
                 FakeProvider {
                     calls: AtomicUsize::new(0),
+                    tool_name: "exec_command",
                 },
                 RiskyTools {
                     calls: Arc::clone(&calls),

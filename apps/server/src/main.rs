@@ -631,7 +631,7 @@ fn build_agent(
             let tools = BuiltinToolCatalog::new(workspace)
                 .with_process_sandbox(process_sandbox)
                 .with_search_backend(search_backend)
-                .enable_command_tool()
+                .enable_terminal_tools()
                 .build()?;
             let definitions = tools.definitions();
             let tools = ObservedTools::new(tools, hook);

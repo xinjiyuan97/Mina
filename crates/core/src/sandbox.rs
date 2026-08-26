@@ -1,6 +1,6 @@
 //! Process sandbox contract implemented by host-specific extensions.
 
-use std::{future::Future, path::PathBuf, pin::Pin};
+use std::{future::Future, path::PathBuf, pin::Pin, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -33,6 +33,7 @@ pub struct ProcessSandboxRequest {
     pub args: Vec<String>,
     pub workspace_root: PathBuf,
     pub cancellation: CancellationToken,
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +44,39 @@ pub struct ProcessSandboxOutput {
     pub stderr: String,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessSandboxSessionRequest {
+    pub execution_id: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub workspace_root: PathBuf,
+    pub cancellation: CancellationToken,
+    pub timeout: Option<Duration>,
+    pub yield_time: Duration,
+    pub max_output_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessSandboxWriteRequest {
+    pub session_id: String,
+    pub input: String,
+    pub close_stdin: bool,
+    pub terminate: bool,
+    pub yield_time: Duration,
+    pub max_output_bytes: usize,
+    pub cancellation: CancellationToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessSandboxSessionOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub exit_code: Option<i32>,
+    pub output: String,
+    pub output_truncated: bool,
     pub duration_ms: u64,
 }
 
@@ -108,8 +142,13 @@ impl SandboxError {
 
 pub type ProcessSandboxFuture =
     Pin<Box<dyn Future<Output = Result<ProcessSandboxOutput, SandboxError>> + Send + 'static>>;
+pub type ProcessSandboxSessionFuture = Pin<
+    Box<dyn Future<Output = Result<ProcessSandboxSessionOutput, SandboxError>> + Send + 'static>,
+>;
 
 pub trait ProcessSandbox: Send + Sync + 'static {
     fn descriptor(&self) -> ProcessSandboxDescriptor;
     fn execute(&self, request: ProcessSandboxRequest) -> ProcessSandboxFuture;
+    fn start(&self, request: ProcessSandboxSessionRequest) -> ProcessSandboxSessionFuture;
+    fn write(&self, request: ProcessSandboxWriteRequest) -> ProcessSandboxSessionFuture;
 }

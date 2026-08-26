@@ -92,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tools = BuiltinToolCatalog::new(workspace)
         .with_process_sandbox(process_sandbox)
         .with_search_backend(search_backend)
-        .enable_command_tool()
+        .enable_terminal_tools()
         .build()?;
     let tools = ObservedTools::new(tools, hook);
 

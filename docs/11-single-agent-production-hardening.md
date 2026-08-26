@@ -7,7 +7,7 @@
 `ProcessSandbox` 是独立基础设施端口。契约位于 `agent-core::sandbox`，具体 adapter 位于 `agent-extension::sandbox`：
 
 ```text
-AgentLoop -> run_command -> agent-core Sandbox contract
+AgentLoop -> shell_command/exec_command/write_stdin -> agent-core Sandbox contract
                               ├─ HostProcessSandbox (development, isolation=none)
                               ├─ Bubblewrap adapter
                               ├─ OCI/gVisor worker

@@ -8,9 +8,10 @@ use agent_core::harness::{ToolRegistrationError, ToolRegistry};
 use thiserror::Error;
 
 use crate::tool::{
-    command::RunCommandTool,
     filesystem::{EditTool, ListDirectoryTool, ReadTool, WriteTool},
+    patch::ApplyPatchTool,
     search::{SearchBackend, SearchTool, WorkspaceSearchBackend},
+    terminal::{ExecCommandTool, ShellCommandTool, WriteStdinTool},
     time_tool::GetCurrentTimeTool,
     workspace::Workspace,
 };
@@ -20,7 +21,7 @@ use crate::tool::{
 #[derive(Clone)]
 pub struct BuiltinToolCatalog {
     workspace_root: PathBuf,
-    command_enabled: bool,
+    terminal_enabled: bool,
     process_sandbox: Option<Arc<dyn ProcessSandbox>>,
     search_enabled: bool,
     search_backend: Option<Arc<dyn SearchBackend>>,
@@ -31,7 +32,7 @@ impl std::fmt::Debug for BuiltinToolCatalog {
         formatter
             .debug_struct("BuiltinToolCatalog")
             .field("workspace_root", &self.workspace_root)
-            .field("command_enabled", &self.command_enabled)
+            .field("terminal_enabled", &self.terminal_enabled)
             .field(
                 "process_sandbox",
                 &self
@@ -53,16 +54,19 @@ impl BuiltinToolCatalog {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
         Self {
             workspace_root: workspace_root.into(),
-            command_enabled: false,
+            terminal_enabled: false,
             process_sandbox: None,
             search_enabled: true,
             search_backend: None,
         }
     }
 
+    /// Enables the shell, managed-session, stdin and workspace patch tools.
+    /// Terminal process tools remain high risk
+    /// and therefore require the harness ApprovalPort.
     #[must_use]
-    pub const fn enable_command_tool(mut self) -> Self {
-        self.command_enabled = true;
+    pub const fn enable_terminal_tools(mut self) -> Self {
+        self.terminal_enabled = true;
         self
     }
 
@@ -99,13 +103,20 @@ impl BuiltinToolCatalog {
             });
             registry.register(SearchTool::new(backend))?;
         }
-        if self.command_enabled {
-            let command = if let Some(sandbox) = self.process_sandbox {
-                RunCommandTool::from_workspace_with_sandbox(workspace, sandbox)
-            } else {
-                RunCommandTool::from_workspace(workspace)
-            };
-            registry.register(command)?;
+        if self.terminal_enabled {
+            let sandbox = self
+                .process_sandbox
+                .unwrap_or_else(|| Arc::new(crate::sandbox::HostProcessSandbox::default()));
+            registry.register(ShellCommandTool::from_workspace_with_sandbox(
+                workspace.clone(),
+                Arc::clone(&sandbox),
+            ))?;
+            registry.register(ExecCommandTool::from_workspace_with_sandbox(
+                workspace.clone(),
+                Arc::clone(&sandbox),
+            ))?;
+            registry.register(WriteStdinTool::new(sandbox))?;
+            registry.register(ApplyPatchTool::from_workspace(workspace))?;
         }
         Ok(registry)
     }
@@ -166,19 +177,21 @@ mod tests {
     }
 
     #[test]
-    fn command_execution_requires_explicit_host_opt_in() {
+    fn terminal_execution_requires_explicit_host_opt_in() {
         let directory = tempdir().expect("temporary workspace should be created");
         let registry = BuiltinToolCatalog::new(directory.path())
-            .enable_command_tool()
+            .enable_terminal_tools()
             .build()
             .expect("catalog should build");
-        let command = registry
-            .definitions()
-            .into_iter()
-            .find(|tool| tool.name == "run_command")
-            .expect("command tool should be registered");
-
-        assert_eq!(command.risk_level, ToolRiskLevel::High);
-        assert!(command.risk_level.requires_approval());
+        let definitions = registry.definitions();
+        assert!(!definitions.iter().any(|tool| tool.name == "run_command"));
+        for name in ["shell_command", "exec_command", "write_stdin"] {
+            let terminal = definitions
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("terminal tool should be registered");
+            assert_eq!(terminal.risk_level, ToolRiskLevel::High);
+            assert!(terminal.risk_level.requires_approval());
+        }
     }
 }

@@ -54,10 +54,19 @@ list_directory({"path":"crates"})
 search({"query":"ToolDefinition","limit":20})
 write({"path":"notes.txt","content":"complete file content"})
 edit({"path":"notes.txt","old_text":"old","new_text":"new"})
-run_command({"program":"cargo","args":["test","--workspace"]})
+shell_command({"command":"cargo test --workspace","timeout_ms":300000})
+exec_command({"cmd":"server --watch","yield_time_ms":1000})
+write_stdin({"session_id":"<run>:<call>","chars":"reload\n"})
+apply_patch({"patch":"*** Begin Patch\n...\n*** End Patch"})
 ```
 
-文件工具只允许解析 workspace 内的相对路径，并在 canonicalize 后再次检查边界；密钥配置、`.env`、私钥与 `.git` 路径由 Host policy 默认拒绝。`write/edit` 属于 Medium，必须审批。`run_command` 不启动 shell，并通过 Host 注入的 `ProcessSandbox` 执行；当前 Host adapter 只固定工作目录、清理环境和限制输出，不等于内核隔离。它仍属于 High，server 必须显式启用，Agent Loop 还必须等待用户审批。工具名称经过 registry allow-list 分派；未知工具和非法参数都作为工具失败返回模型，使模型有机会修正或解释。
+文件工具只允许解析 workspace 内的相对路径，并在 canonicalize 后再次检查边界；密钥配置、`.env`、私钥与 `.git` 路径由 Host policy 默认拒绝。`write/edit/apply_patch` 属于 Medium，必须审批。Mina 的 provider-neutral `ToolDefinition` 当前只支持 JSON function schema，因此 Codex 的 freeform `apply_patch` 在这里适配为必填 `{patch: string}`；解析和写入仍位于 workspace tool，绝不通过 shell 或 process adapter 绕过路径策略。
+
+`shell_command` 是有 wall-time 限制的一次性 shell 调用。`exec_command` 启动可持续会话，初次等待后若进程仍运行就返回 `session_id`；`write_stdin` 用该 id 写字符、空写轮询、关闭 stdin 或终止进程组，并返回本次新增的有界输出。当前实现使用 plain pipes，不宣称 PTY。三个进程工具都通过 Host 注入的同一个 `ProcessSandbox` 实例执行并声明 High；server 必须调用 `enable_terminal_tools()` 显式启用，Agent Loop 还必须在每次调用前等待用户审批。
+
+Codex 的 `request_permissions` 承载 attached environment 的 filesystem/network permission profile 和 turn/session grant 生命周期。Mina 当前没有等价的 permission-profile contract；其已有 `ApprovalPort` 已完整覆盖工具执行前的用户决定。因此 catalog 不注册 `request_permissions`，也不创建可绕过审批的旁路。兼容规则是：所有 terminal definition 固定为 High，由统一的 `ToolPort::validate -> ApprovalPort -> ToolPort::call` 链处理；未配置 ApprovalPort 时 fail closed。
+
+当前 `HostProcessSandbox` 只固定工作目录、清理环境、限制输出、管理 stdin/进程组和回收直接子进程，不等于内核隔离；其 descriptor 始终为 `host_process / isolation=none`。工具名称经过 registry allow-list 分派；未知工具和非法参数都作为安全的结构化工具失败返回模型，使模型有机会修正或解释，宿主 I/O 错误不会原样泄漏。
 
 风险由工具作者声明，模型不能通过参数修改：
 

@@ -12,6 +12,6 @@ Use this skill for tasks involving Rust crates, Cargo workspaces, compilation, t
 
 ## Safety
 
-- Treat `run_command` as an optional high-risk capability that still requires host approval.
+- Treat `shell_command` as an optional high-risk capability that still requires host approval.
 - Do not read secret configuration values unless the user explicitly asks for them.
 - Do not use destructive Git or filesystem operations to repair a build.
