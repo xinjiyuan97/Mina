@@ -9,11 +9,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
+use agent_core::harness::{ToolApprovalPolicy, ToolCallStrategy};
+
 /// Validated, transport-independent configuration for an agent harness.
 #[derive(Debug, Clone)]
 pub struct HarnessConfig {
     agent: AgentConfig,
+    approval: ApprovalConfig,
     orchestration: OrchestrationConfig,
+    script: ScriptConfig,
+    adf: AdfConfig,
+    jobs: JobsConfig,
     default_model: String,
     models: BTreeMap<String, ModelConfig>,
 }
@@ -24,7 +30,15 @@ struct RawHarnessConfig {
     #[serde(default)]
     agent: AgentConfig,
     #[serde(default)]
+    approval: ApprovalConfig,
+    #[serde(default)]
     orchestration: OrchestrationConfig,
+    #[serde(default)]
+    script: ScriptConfig,
+    #[serde(default)]
+    adf: AdfConfig,
+    #[serde(default)]
+    jobs: JobsConfig,
     default_model: String,
     models: BTreeMap<String, ModelConfig>,
 }
@@ -55,8 +69,28 @@ impl HarnessConfig {
     }
 
     #[must_use]
+    pub const fn approval(&self) -> &ApprovalConfig {
+        &self.approval
+    }
+
+    #[must_use]
     pub const fn orchestration(&self) -> &OrchestrationConfig {
         &self.orchestration
+    }
+
+    #[must_use]
+    pub const fn script(&self) -> &ScriptConfig {
+        &self.script
+    }
+
+    #[must_use]
+    pub const fn adf(&self) -> &AdfConfig {
+        &self.adf
+    }
+
+    #[must_use]
+    pub const fn jobs(&self) -> &JobsConfig {
+        &self.jobs
     }
 
     #[must_use]
@@ -79,7 +113,17 @@ impl HarnessConfig {
 
     fn normalize_and_validate(&mut self) -> Result<(), ConfigError> {
         self.agent.normalize_and_validate("agent")?;
+        self.approval.normalize_and_validate("approval")?;
         self.orchestration.normalize_and_validate("orchestration")?;
+        self.script.normalize_and_validate("script")?;
+        self.adf.normalize_and_validate("adf")?;
+        self.jobs.normalize_and_validate("jobs")?;
+        if self.adf.enabled && !self.script.quickjs.enabled {
+            return Err(ConfigError::validation(
+                "adf.enabled",
+                "requires script.quickjs.enabled because JavaScript is the only ADF runtime",
+            ));
+        }
         validate_non_empty("default_model", &self.default_model)?;
 
         if self.models.is_empty() {
@@ -112,13 +156,242 @@ impl FromStr for HarnessConfig {
         let raw: RawHarnessConfig = toml::from_str(source)?;
         let mut config = Self {
             agent: raw.agent,
+            approval: raw.approval,
             orchestration: raw.orchestration,
+            script: raw.script,
+            adf: raw.adf,
+            jobs: raw.jobs,
             default_model: raw.default_model,
             models: raw.models,
         };
         config.normalize_and_validate()?;
         Ok(config)
     }
+}
+
+/// Host-owned numeric filter for Tool review. Tool authors declare risk;
+/// deployment owners choose which severities require user approval.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalConfig {
+    #[serde(default = "default_review_level")]
+    pub review_level: u8,
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            review_level: default_review_level(),
+        }
+    }
+}
+
+impl ApprovalConfig {
+    fn normalize_and_validate(&self, field: &str) -> Result<(), ConfigError> {
+        if self.review_level > ToolApprovalPolicy::DISABLED_REVIEW_LEVEL {
+            return Err(ConfigError::validation(
+                format!("{field}.review_level"),
+                "must be between 0 and 100",
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn policy(&self) -> ToolApprovalPolicy {
+        ToolApprovalPolicy::new(self.review_level)
+    }
+}
+
+const fn default_review_level() -> u8 {
+    ToolApprovalPolicy::DEFAULT_REVIEW_LEVEL
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptConfig {
+    #[serde(default)]
+    pub quickjs: QuickJsConfig,
+}
+
+impl ScriptConfig {
+    fn normalize_and_validate(&self, field: &str) -> Result<(), ConfigError> {
+        self.quickjs
+            .normalize_and_validate(&format!("{field}.quickjs"))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuickJsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_quickjs_source_bytes")]
+    pub max_source_bytes: u64,
+    #[serde(default = "default_quickjs_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_quickjs_memory_bytes")]
+    pub memory_bytes: u64,
+    #[serde(default = "default_quickjs_stack_bytes")]
+    pub max_stack_bytes: u64,
+    #[serde(default = "default_quickjs_output_bytes")]
+    pub max_output_bytes: u64,
+    #[serde(default = "default_quickjs_concurrency")]
+    pub max_concurrent_executions: usize,
+}
+
+impl Default for QuickJsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_source_bytes: default_quickjs_source_bytes(),
+            timeout_ms: default_quickjs_timeout_ms(),
+            memory_bytes: default_quickjs_memory_bytes(),
+            max_stack_bytes: default_quickjs_stack_bytes(),
+            max_output_bytes: default_quickjs_output_bytes(),
+            max_concurrent_executions: default_quickjs_concurrency(),
+        }
+    }
+}
+
+impl QuickJsConfig {
+    fn normalize_and_validate(&self, field: &str) -> Result<(), ConfigError> {
+        if self.max_source_bytes == 0
+            || self.timeout_ms == 0
+            || self.memory_bytes == 0
+            || self.max_stack_bytes == 0
+            || self.max_output_bytes == 0
+            || self.max_concurrent_executions == 0
+        {
+            return Err(ConfigError::validation(
+                field,
+                "enabled QuickJS limits and concurrency must be greater than zero",
+            ));
+        }
+        if self.max_source_bytes > 4 * 1024 * 1024
+            || self.timeout_ms > 60_000
+            || self.memory_bytes > 512 * 1024 * 1024
+            || self.max_stack_bytes > 16 * 1024 * 1024
+            || self.max_output_bytes > 16 * 1024 * 1024
+            || self.max_concurrent_executions > 64
+        {
+            return Err(ConfigError::validation(
+                field,
+                "QuickJS limits exceed the portable in-process runtime ceiling",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdfConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_max_active_adf")]
+    pub max_active_per_run: usize,
+}
+
+impl Default for AdfConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_active_per_run: default_max_active_adf(),
+        }
+    }
+}
+
+impl AdfConfig {
+    fn normalize_and_validate(&self, field: &str) -> Result<(), ConfigError> {
+        if self.max_active_per_run == 0 || self.max_active_per_run > 64 {
+            return Err(ConfigError::validation(
+                format!("{field}.max_active_per_run"),
+                "must be between 1 and 64",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_allowed_job_kinds")]
+    pub allowed_kinds: BTreeSet<String>,
+}
+
+impl Default for JobsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_kinds: default_allowed_job_kinds(),
+        }
+    }
+}
+
+impl JobsConfig {
+    fn normalize_and_validate(&self, field: &str) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.allowed_kinds.is_empty() || self.allowed_kinds.len() > 64 {
+            return Err(ConfigError::validation(
+                format!("{field}.allowed_kinds"),
+                "must contain between 1 and 64 job kinds when enabled",
+            ));
+        }
+        for kind in &self.allowed_kinds {
+            if kind.is_empty()
+                || kind.len() > 128
+                || !kind.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'.' | b'_' | b'-')
+                })
+            {
+                return Err(ConfigError::validation(
+                    format!("{field}.allowed_kinds"),
+                    "job kinds must use 1 to 128 lowercase ASCII name characters",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+const fn default_quickjs_source_bytes() -> u64 {
+    256 * 1024
+}
+
+const fn default_quickjs_timeout_ms() -> u64 {
+    2_000
+}
+
+const fn default_quickjs_memory_bytes() -> u64 {
+    32 * 1024 * 1024
+}
+
+const fn default_quickjs_stack_bytes() -> u64 {
+    1024 * 1024
+}
+
+const fn default_quickjs_output_bytes() -> u64 {
+    1024 * 1024
+}
+
+const fn default_quickjs_concurrency() -> usize {
+    2
+}
+
+const fn default_max_active_adf() -> usize {
+    8
+}
+
+fn default_allowed_job_kinds() -> BTreeSet<String> {
+    BTreeSet::from(["builtin.delay".into()])
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -276,6 +549,8 @@ pub struct AgentConfig {
     pub model_timeout_seconds: u64,
     #[serde(default = "default_tool_timeout_seconds")]
     pub tool_timeout_seconds: u64,
+    #[serde(default)]
+    pub tool_call_strategy: ToolCallStrategy,
 }
 
 impl Default for AgentConfig {
@@ -287,6 +562,7 @@ impl Default for AgentConfig {
             run_timeout_seconds: default_run_timeout_seconds(),
             model_timeout_seconds: default_model_timeout_seconds(),
             tool_timeout_seconds: default_tool_timeout_seconds(),
+            tool_call_strategy: ToolCallStrategy::default(),
         }
     }
 }
@@ -302,10 +578,10 @@ impl AgentConfig {
                 "must be greater than zero",
             ));
         }
-        if self.max_steps > 64 {
+        if self.max_steps > 100 {
             return Err(ConfigError::validation(
                 format!("{field}.max_steps"),
-                "must not exceed 64",
+                "must not exceed 100",
             ));
         }
         validate_timeout_seconds(
@@ -718,6 +994,19 @@ organization = "org-example"
         let model = config.default_model();
 
         assert_eq!(config.default_model_name(), "primary");
+        assert!(config.script().quickjs.enabled);
+        assert_eq!(config.script().quickjs.timeout_ms, 2_000);
+        assert!(config.adf().enabled);
+        assert_eq!(config.adf().max_active_per_run, 8);
+        assert!(config.jobs().enabled);
+        assert!(config.jobs().allowed_kinds.contains("builtin.delay"));
+        assert_eq!(config.approval().review_level, 50);
+        assert!(
+            config
+                .approval()
+                .policy()
+                .requires_review(agent_core::tool::ToolRiskLevel::Medium)
+        );
         assert_eq!(model.model, "gpt-4.1");
         assert!(model.modalities.input.contains(&Modality::Image));
         assert_eq!(model.provider.kind(), "openai-compatible");
@@ -734,6 +1023,33 @@ organization = "org-example"
             .expect("literal value should resolve");
         assert_eq!(api_key.expose_secret(), "sk-config-file-value");
         assert!(!format!("{api_key:?}").contains("sk-config-file-value"));
+    }
+
+    #[test]
+    fn maps_and_validates_numeric_review_level() {
+        let source = VALID_CONFIG.replacen(
+            "default_model = \"primary\"",
+            "default_model = \"primary\"\n\n[approval]\nreview_level = 90",
+            1,
+        );
+        let config = HarnessConfig::from_toml_str(&source).expect("config should parse");
+        assert_eq!(config.approval().review_level, 90);
+        assert!(
+            !config
+                .approval()
+                .policy()
+                .requires_review(agent_core::tool::ToolRiskLevel::Medium)
+        );
+        assert!(
+            config
+                .approval()
+                .policy()
+                .requires_review(agent_core::tool::ToolRiskLevel::High)
+        );
+
+        let invalid = source.replace("review_level = 90", "review_level = 101");
+        let error = HarnessConfig::from_toml_str(&invalid).expect_err("101 must fail");
+        assert!(error.to_string().contains("approval.review_level"));
     }
 
     #[test]
@@ -755,6 +1071,29 @@ system_prompt = "Complete one task.""#,
         assert_eq!(config.agent().run_timeout_seconds, 300);
         assert_eq!(config.agent().model_timeout_seconds, 120);
         assert_eq!(config.agent().tool_timeout_seconds, 30);
+        assert_eq!(
+            config.agent().tool_call_strategy,
+            ToolCallStrategy::Sequential
+        );
+    }
+
+    #[test]
+    fn maps_parallel_safe_tool_call_strategy() {
+        let source = VALID_CONFIG.replacen(
+            "default_model = \"primary\"",
+            r#"default_model = "primary"
+
+[agent]
+kind = "agent-loop"
+tool_call_strategy = "parallel-safe""#,
+            1,
+        );
+        let config = HarnessConfig::from_toml_str(&source).expect("config should parse");
+
+        assert_eq!(
+            config.agent().tool_call_strategy,
+            ToolCallStrategy::ParallelSafe
+        );
     }
 
     #[test]
@@ -818,5 +1157,25 @@ base_url = "https://api.openai.com/v1"
         let source = SecretSource::Literal("sk-do-not-log".into());
 
         assert!(!format!("{source:?}").contains("sk-do-not-log"));
+    }
+
+    #[test]
+    fn rejects_adf_when_no_script_runtime_is_enabled() {
+        let source = VALID_CONFIG.replacen(
+            "default_model = \"primary\"",
+            r#"default_model = "primary"
+
+[script.quickjs]
+enabled = false
+
+[adf]
+enabled = true"#,
+            1,
+        );
+        let error = HarnessConfig::from_toml_str(&source)
+            .expect_err("ADF must not claim an unavailable runtime");
+
+        assert!(error.to_string().contains("adf.enabled"));
+        assert!(error.to_string().contains("script.quickjs.enabled"));
     }
 }

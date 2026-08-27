@@ -5,6 +5,12 @@
 
 pub use agent_core as core;
 
+#[cfg(feature = "context-model")]
+pub mod context;
+
+#[cfg(feature = "adf")]
+pub mod adf;
+
 #[cfg(feature = "openai")]
 pub mod provider;
 

@@ -1,55 +1,72 @@
-//! Transport-agnostic primitives for building and hosting Mina agents.
+//! Transport-agnostic Agent contracts and decision loops.
 
-use std::sync::Arc;
-use std::{fmt, str::FromStr, time::Duration};
+use std::{fmt, str::FromStr};
 
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use uuid::Uuid;
+
+#[cfg(test)]
+use futures_util::StreamExt;
+#[cfg(test)]
+use std::{sync::Arc, time::Duration};
+#[cfg(test)]
+use thiserror::Error;
 
 mod agent_loop;
 mod approval;
-mod config;
 mod control;
 mod event;
+mod job;
+mod machine;
 mod model;
 mod run_state;
 mod session;
 mod single_turn;
 mod tool;
 
-pub use agent_loop::AgentLoop;
+pub use agent_loop::{AgentLoop, ToolCallStrategy};
 pub use approval::{
     ApprovalDecision, ApprovalError, ApprovalFuture, ApprovalId, ApprovalPort, ApprovalRequest,
-    ApprovalResolution, RejectAllApprovals,
-};
-pub use config::{
-    AgentConfig, AgentKind, ConfigError, ConfiguredSkill, ContextStrategy, HarnessConfig,
-    Modalities, Modality, ModelConfig, OrchestrationConfig, ProviderConfig, SecretSource,
-    SecretString,
+    ApprovalResolution, RejectAllApprovals, ToolApprovalPolicy,
 };
 pub use control::RunCancellation;
 pub use event::{
     AgentEvent, AgentEventStream, OutputChannel, RunEvent, RunEventKind, RunEventStream,
+    run_event_stream,
+};
+pub use job::{
+    ClaimJobNotifications, ClaimJobs, CompleteJob, CompleteJobNotification, JobComponentDescriptor,
+    JobExecutionError, JobExecutionFuture, JobFuture, JobNotificationStatus, JobOutcome, JobRecord,
+    JobRouter, JobStatus, JobStore, JobStoreError, RetryJob, RetryJobNotification, SubmitJobResult,
+};
+pub use machine::{
+    ActivationId, AgentMachine, CheckpointCodec, CheckpointEnvelope, ClaimedActivation,
+    CompleteFlowEffect, CompleteFlowRun, ContinueFlowRun, EffectRequest, FlowEffect, FlowEffectId,
+    FlowEffectRouter, FlowEffectStatus, FlowError, FlowFuture, FlowInboxItem, FlowRunState,
+    FlowRunStatus, FlowStore, JobId, MachineError, MachineOutput, MachineResumeRequest,
+    MachineStartRequest, MachineStream, RetryFlowEffect, StartJob, StepOutcome, SuspendFlowRun,
+    WaitSpec, WakeFlowRun,
 };
 pub use model::{
     FinishReason, ModelError, ModelErrorKind, ModelEvent, ModelEventStream, ModelMessage,
     ModelPort, ModelRequest, ModelRole, ModelToolCall, TokenUsage, TokenUsageSource,
 };
 pub use run_state::{
-    RUN_STATE_SCHEMA_VERSION, RunApprovalState, RunFailure, RunSnapshot, RunStateError, RunStatus,
-    RunStore, RunStoreError, RunStoreFuture, RunToolFailure, RunToolState, RunToolStatus,
+    ObservedRunEvent, RUN_STATE_SCHEMA_VERSION, RunApprovalState, RunFailure, RunSnapshot,
+    RunStateError, RunStatus, RunStore, RunStoreError, RunStoreFuture, RunToolFailure,
+    RunToolSetState, RunToolState, RunToolStatus,
 };
 pub use session::{
     ArchiveSession, BeginRunResult, BeginSessionRun, ContentPart, ConversationRole, CreateSession,
-    FinalizeSessionRun, MessageId, SessionId, SessionMessage, SessionSnapshot, SessionStatus,
-    SessionStore, SessionStoreError, SessionStoreFuture,
+    FinalizeSessionRun, MAX_SESSION_PAGE_SIZE, MessageId, SessionId, SessionMessage,
+    SessionSnapshot, SessionStatus, SessionStore, SessionStoreError, SessionStoreFuture,
 };
 pub use single_turn::SingleTurnAgent;
 pub use tool::{
-    Tool, ToolCallFuture, ToolCallRequest, ToolDefinition, ToolError, ToolErrorCategory,
-    ToolOutput, ToolPort, ToolRegistrationError, ToolRegistry, ToolRiskLevel,
+    RunToolSession, Tool, ToolArgumentVisibility, ToolBinding, ToolBindingKind, ToolCallFuture,
+    ToolCallRequest, ToolCompletion, ToolConcurrency, ToolDefinition, ToolError, ToolErrorCategory,
+    ToolExecutionPolicy, ToolIdempotency, ToolOutput, ToolPort, ToolRegistrationError,
+    ToolRegistry, ToolRetryPolicy, ToolRiskLevel, ToolSetSnapshot, ToolSuspension,
 };
 
 /// Current semantic protocol exposed by the harness library.
@@ -123,8 +140,31 @@ pub struct RunRequest {
     /// `None` exposes all host-registered tools; `Some` is the per-run
     /// capability intersection produced by orchestration.
     pub allowed_tools: Option<Vec<String>>,
+    /// Allows bindings created by a policy-approved Run-scoped ADF even though
+    /// their content-derived names cannot exist in the initial allow-list.
+    pub allow_run_adf: bool,
+    /// Optional per-run model-step budget. Agent implementations may apply a
+    /// stricter host-level ceiling, but must never exceed this value.
+    pub max_steps: Option<u32>,
     pub cancellation: RunCancellation,
 }
+
+/// Host-supplied policy for one run.
+///
+/// This is deliberately separate from conversation context so callers can
+/// vary budgets and capabilities without rewriting model messages.
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    pub allowed_tools: Option<Vec<String>>,
+    pub allow_run_adf: bool,
+    pub max_steps: Option<u32>,
+}
+
+/// Portable upper bound accepted by the Harness contract. Individual hosts or
+/// agents may enforce a smaller ceiling.
+#[cfg(test)]
+pub const MAX_RUN_STEPS: u32 = 100;
 
 /// Stable response returned by the harness to a host application.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,10 +176,14 @@ pub struct RunResponse {
     pub usage: Option<TokenUsage>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Error)]
 pub enum HarnessError {
     #[error("input must not be empty")]
     InvalidInput,
+
+    #[error("max_steps must be between 1 and {MAX_RUN_STEPS}, got {requested}")]
+    InvalidMaxSteps { requested: u32 },
 
     #[error("agent failed: {message}")]
     Agent {
@@ -149,11 +193,13 @@ pub enum HarnessError {
     },
 }
 
+#[cfg(test)]
 impl HarnessError {
     #[must_use]
     pub fn code(&self) -> &str {
         match self {
             Self::InvalidInput => "invalid_input",
+            Self::InvalidMaxSteps { .. } => "invalid_max_steps",
             Self::Agent { code, .. } => code,
         }
     }
@@ -170,7 +216,7 @@ impl HarnessError {
     #[must_use]
     pub const fn retryable(&self) -> bool {
         match self {
-            Self::InvalidInput => false,
+            Self::InvalidInput | Self::InvalidMaxSteps { .. } => false,
             Self::Agent { retryable, .. } => *retryable,
         }
     }
@@ -186,21 +232,25 @@ pub trait Agent: Send + Sync + 'static {
 }
 
 /// Owns an agent implementation and exposes the host-facing execution API.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct Harness<A> {
     agent: Arc<A>,
     run_timeout: Duration,
 }
 
+#[cfg(test)]
 const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A newly accepted run plus the host-owned cancellation handle.
+#[cfg(test)]
 pub struct RunExecution {
     pub run_id: RunId,
     pub cancellation: RunCancellation,
     pub events: RunEventStream,
 }
 
+#[cfg(test)]
 impl<A> Clone for Harness<A> {
     fn clone(&self) -> Self {
         Self {
@@ -210,6 +260,7 @@ impl<A> Clone for Harness<A> {
     }
 }
 
+#[cfg(test)]
 impl<A> Harness<A>
 where
     A: Agent,
@@ -233,6 +284,13 @@ where
         self.agent.metadata()
     }
 
+    /// Shared handle used by hosts that expose both the legacy one-Future
+    /// `Agent` adapter and the durable `AgentMachine` coordinator.
+    #[must_use]
+    pub fn agent_handle(&self) -> Arc<A> {
+        Arc::clone(&self.agent)
+    }
+
     pub fn start(&self, input: impl Into<String>) -> Result<RunExecution, HarnessError> {
         self.start_with_context(RunId::new(), input, Vec::new(), None)
     }
@@ -253,9 +311,33 @@ where
         prior_messages: Vec<ModelMessage>,
         allowed_tools: Option<Vec<String>>,
     ) -> Result<RunExecution, HarnessError> {
+        self.start_with_options(
+            run_id,
+            input,
+            prior_messages,
+            RunOptions {
+                allowed_tools,
+                allow_run_adf: false,
+                max_steps: None,
+            },
+        )
+    }
+
+    pub fn start_with_options(
+        &self,
+        run_id: RunId,
+        input: impl Into<String>,
+        prior_messages: Vec<ModelMessage>,
+        options: RunOptions,
+    ) -> Result<RunExecution, HarnessError> {
         let input = input.into();
         if input.trim().is_empty() {
             return Err(HarnessError::InvalidInput);
+        }
+        if let Some(requested) = options.max_steps
+            && !(1..=MAX_RUN_STEPS).contains(&requested)
+        {
+            return Err(HarnessError::InvalidMaxSteps { requested });
         }
 
         let cancellation = RunCancellation::new();
@@ -263,7 +345,9 @@ where
             run_id,
             input,
             prior_messages,
-            allowed_tools,
+            allowed_tools: options.allowed_tools,
+            allow_run_adf: options.allow_run_adf,
+            max_steps: options.max_steps,
             cancellation: cancellation.clone(),
         });
         Ok(RunExecution {
@@ -278,20 +362,34 @@ where
     }
 
     pub async fn execute(&self, input: impl Into<String>) -> Result<RunResponse, HarnessError> {
-        let mut events = self.stream(input)?;
+        self.execute_with_options(input, RunOptions::default())
+            .await
+    }
+
+    pub async fn execute_with_options(
+        &self,
+        input: impl Into<String>,
+        options: RunOptions,
+    ) -> Result<RunResponse, HarnessError> {
+        let mut events = self
+            .start_with_options(RunId::new(), input, Vec::new(), options)?
+            .events;
         let mut output = String::new();
         let mut usage = None;
 
         while let Some(event) = events.next().await {
             match event.kind {
-                RunEventKind::RunStarted => {}
+                RunEventKind::RunStarted
+                | RunEventKind::RunWaiting { .. }
+                | RunEventKind::RunResumed { .. } => {}
                 RunEventKind::OutputDelta {
                     channel: OutputChannel::AssistantText,
                     delta,
                 } => output.push_str(&delta),
                 RunEventKind::OutputDelta { .. } => {}
                 RunEventKind::UsageUpdated { usage: next } => usage = Some(next),
-                RunEventKind::ToolCallStarted { .. }
+                RunEventKind::ToolSetUpdated { .. }
+                | RunEventKind::ToolCallStarted { .. }
                 | RunEventKind::ToolCallArgumentsDelta { .. }
                 | RunEventKind::ApprovalRequested { .. }
                 | RunEventKind::ApprovalResolved { .. }
@@ -368,6 +466,28 @@ mod tests {
             .expect_err("empty input must fail");
 
         assert_eq!(error.code(), "invalid_input");
+    }
+
+    #[test]
+    fn harness_validates_per_run_step_limits() {
+        let harness = Harness::new(TestAgent);
+
+        for requested in [0, MAX_RUN_STEPS + 1] {
+            let result = harness.start_with_options(
+                RunId::new(),
+                "hello",
+                Vec::new(),
+                RunOptions {
+                    allowed_tools: None,
+                    allow_run_adf: false,
+                    max_steps: Some(requested),
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(HarnessError::InvalidMaxSteps { requested: actual }) if actual == requested
+            ));
+        }
     }
 
     #[tokio::test]

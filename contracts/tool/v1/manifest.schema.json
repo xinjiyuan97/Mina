@@ -27,6 +27,58 @@
           "type": "string",
           "enum": ["low", "medium", "high"],
           "default": "low"
+        },
+        "execution": {
+          "$ref": "#/$defs/execution_policy"
+        }
+      }
+    },
+    "execution_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "idempotency": {
+          "type": "string",
+          "enum": ["unknown", "read_only", "idempotent"],
+          "default": "unknown"
+        },
+        "concurrency": {
+          "type": "string",
+          "enum": ["exclusive", "parallel_safe"],
+          "default": "exclusive"
+        },
+        "completion": {
+          "type": "string",
+          "enum": ["immediate", "may_suspend"],
+          "default": "immediate"
+        },
+        "retry": {
+          "$ref": "#/$defs/retry_policy"
+        }
+      }
+    },
+    "retry_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_attempts", "initial_backoff_ms", "max_backoff_ms"],
+      "properties": {
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5,
+          "default": 1
+        },
+        "initial_backoff_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60000,
+          "default": 100
+        },
+        "max_backoff_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60000,
+          "default": 1000
         }
       }
     }

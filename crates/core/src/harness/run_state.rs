@@ -20,8 +20,10 @@ pub const RUN_STATE_SCHEMA_VERSION: u32 = 1;
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Accepted,
+    Runnable,
     Running,
     WaitingApproval,
+    WaitingEvent,
     ExecutingTool,
     Completed,
     Failed,
@@ -94,6 +96,14 @@ pub struct RunToolState {
     pub failure: Option<RunToolFailure>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunToolSetState {
+    pub revision: u64,
+    pub digest: String,
+    pub tools: Vec<String>,
+    pub dynamic_tools: Vec<String>,
+}
+
 /// Durable, query-friendly projection of a single run's event stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunSnapshot {
@@ -107,6 +117,8 @@ pub struct RunSnapshot {
     pub reasoning: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_set: Option<RunToolSetState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<FinishReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,6 +144,7 @@ impl RunSnapshot {
             output: String::new(),
             reasoning: String::new(),
             usage: None,
+            tool_set: None,
             finish_reason: None,
             failure: None,
             approvals: Vec::new(),
@@ -188,6 +201,23 @@ impl RunSnapshot {
                 }
                 self.status = RunStatus::Running;
             }
+            RunEventKind::RunWaiting { .. } => {
+                self.require_started(event)?;
+                self.status = RunStatus::WaitingEvent;
+            }
+            RunEventKind::RunResumed { .. } => {
+                self.require_started(event)?;
+                if !matches!(
+                    self.status,
+                    RunStatus::WaitingEvent | RunStatus::Runnable | RunStatus::Running
+                ) {
+                    return Err(RunStateError::InvalidTransition {
+                        status: self.status,
+                        event: event.kind.event_name(),
+                    });
+                }
+                self.status = RunStatus::Running;
+            }
             RunEventKind::OutputDelta { channel, delta } => {
                 self.require_started(event)?;
                 match channel {
@@ -198,6 +228,20 @@ impl RunSnapshot {
             RunEventKind::UsageUpdated { usage } => {
                 self.require_started(event)?;
                 self.usage = Some(*usage);
+            }
+            RunEventKind::ToolSetUpdated {
+                revision,
+                digest,
+                tools,
+                dynamic_tools,
+            } => {
+                self.require_started(event)?;
+                self.tool_set = Some(RunToolSetState {
+                    revision: *revision,
+                    digest: digest.clone(),
+                    tools: tools.clone(),
+                    dynamic_tools: dynamic_tools.clone(),
+                });
             }
             RunEventKind::ToolCallStarted { call_id, name } => {
                 self.require_started(event)?;
@@ -415,6 +459,27 @@ impl RunStoreError {
 pub type RunStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, RunStoreError>> + Send + 'a>>;
 
+/// One durable event together with the time at which the runtime observed it.
+///
+/// Stores may persist a group of these records in one transaction. The event
+/// order and sequence numbers remain authoritative; batching is only a storage
+/// optimization and never changes replay semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedRunEvent {
+    pub event: RunEvent,
+    pub observed_at_ms: i64,
+}
+
+impl ObservedRunEvent {
+    #[must_use]
+    pub const fn new(event: RunEvent, observed_at_ms: i64) -> Self {
+        Self {
+            event,
+            observed_at_ms,
+        }
+    }
+}
+
 /// Persistence port for one-run snapshots and their append-only event logs.
 ///
 /// `append_event` must atomically persist the event and its projected snapshot.
@@ -433,6 +498,24 @@ pub trait RunStore: Send + Sync + 'static {
 
     fn append_event(&self, event: RunEvent, observed_at_ms: i64)
     -> RunStoreFuture<'_, RunSnapshot>;
+
+    /// Persists a non-empty, contiguous group of events in order.
+    ///
+    /// The default implementation preserves compatibility for external store
+    /// adapters. Transactional adapters should override this method so the
+    /// group and its final projected snapshot are committed atomically.
+    fn append_events(&self, events: Vec<ObservedRunEvent>) -> RunStoreFuture<'_, RunSnapshot> {
+        Box::pin(async move {
+            let mut snapshot = None;
+            for observed in events {
+                snapshot = Some(
+                    self.append_event(observed.event, observed.observed_at_ms)
+                        .await?,
+                );
+            }
+            snapshot.ok_or_else(|| RunStoreError::backend("cannot append an empty event batch"))
+        })
+    }
 
     fn events_after(
         &self,
@@ -546,6 +629,34 @@ mod tests {
                 actual: 2
             }
         ));
+    }
+
+    #[test]
+    fn projects_the_current_tool_set_revision() {
+        let run_id = RunId::new();
+        let mut snapshot = RunSnapshot::new(run_id, "hello", 10);
+        snapshot
+            .apply(&RunEvent::new(run_id, 1, RunEventKind::RunStarted), 11)
+            .expect("run should start");
+        snapshot
+            .apply(
+                &RunEvent::new(
+                    run_id,
+                    2,
+                    RunEventKind::ToolSetUpdated {
+                        revision: 3,
+                        digest: "sha256:tool-set".into(),
+                        tools: vec!["adf_define".into(), "adf_sum_12345678".into()],
+                        dynamic_tools: vec!["adf_sum_12345678".into()],
+                    },
+                ),
+                12,
+            )
+            .expect("tool-set update should project");
+
+        let tool_set = snapshot.tool_set.expect("tool-set state should exist");
+        assert_eq!(tool_set.revision, 3);
+        assert_eq!(tool_set.dynamic_tools, vec!["adf_sum_12345678"]);
     }
 
     #[test]

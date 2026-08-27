@@ -1,8 +1,8 @@
 use std::{future::Future, path::Path, pin::Pin, sync::Arc};
 
 use agent_core::harness::{
-    RunCancellation, Tool, ToolCallFuture, ToolCallRequest, ToolDefinition, ToolError, ToolOutput,
-    ToolRiskLevel,
+    RunCancellation, Tool, ToolCallFuture, ToolCallRequest, ToolConcurrency, ToolDefinition,
+    ToolError, ToolExecutionPolicy, ToolOutput, ToolRetryPolicy, ToolRiskLevel,
 };
 use serde::{Deserialize, Serialize};
 
@@ -94,6 +94,11 @@ impl Tool for SearchTool {
             }),
         )
         .with_risk_level(self.backend.risk_level())
+        .with_execution_policy(
+            ToolExecutionPolicy::read_only()
+                .with_concurrency(ToolConcurrency::ParallelSafe)
+                .with_retry(ToolRetryPolicy::bounded(2, 100, 1_000)),
+        )
     }
 
     fn call(&self, request: ToolCallRequest) -> ToolCallFuture {

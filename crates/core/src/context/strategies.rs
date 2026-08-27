@@ -121,6 +121,7 @@ impl ContextCompressor for HybridCompressor {
     fn compress(&self, request: CompressionRequest) -> ContextFuture<'_, CompressionResult> {
         Box::pin(async move {
             let policy_version = request.policy_version;
+            let run_id = request.run_id;
             let model_profile = request.model_profile.clone();
             let available_input_tokens = request.budget.available_input_tokens();
             let artifact_source_digest = request.source_digest.clone();
@@ -178,6 +179,7 @@ impl ContextCompressor for HybridCompressor {
             let summary = self
                 .summary
                 .summarize(SummaryRequest {
+                    run_id,
                     model_profile: model_profile.clone(),
                     items: summary_items.clone(),
                     maximum_tokens: remaining_tokens.saturating_sub(8).min(512),
@@ -266,6 +268,36 @@ impl SummaryGenerator for DeterministicSummaryGenerator {
                 output_digest,
                 generator: self.descriptor(),
             })
+        })
+    }
+}
+
+/// Runs a preferred summary implementation and falls back to a local strategy
+/// when the external component is unavailable. Context construction must not
+/// become unavailable merely because an optional summary model failed.
+pub struct FallbackSummaryGenerator {
+    primary: Arc<dyn SummaryGenerator>,
+    fallback: Arc<dyn SummaryGenerator>,
+}
+
+impl FallbackSummaryGenerator {
+    #[must_use]
+    pub fn new(primary: Arc<dyn SummaryGenerator>, fallback: Arc<dyn SummaryGenerator>) -> Self {
+        Self { primary, fallback }
+    }
+}
+
+impl SummaryGenerator for FallbackSummaryGenerator {
+    fn descriptor(&self) -> ContextComponentDescriptor {
+        descriptor("context:fallback-summary-v1", "fallback_summary_generator")
+    }
+
+    fn summarize(&self, request: SummaryRequest) -> ContextFuture<'_, SummaryResult> {
+        Box::pin(async move {
+            match self.primary.summarize(request.clone()).await {
+                Ok(summary) => Ok(summary),
+                Err(_) => self.fallback.summarize(request).await,
+            }
         })
     }
 }
@@ -610,6 +642,7 @@ mod tests {
         let compressor = SlidingWindowCompressor::new(estimator);
         let result = compressor
             .compress(CompressionRequest {
+                run_id: crate::harness::RunId::new(),
                 candidates: vec![
                     item(
                         "old",
@@ -645,6 +678,7 @@ mod tests {
         constrained.max_memory_tokens = 1;
         let error = compressor
             .compress(CompressionRequest {
+                run_id: crate::harness::RunId::new(),
                 candidates: vec![item(
                     "memory",
                     "memory",

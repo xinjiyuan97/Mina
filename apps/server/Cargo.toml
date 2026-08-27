@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 agent-core.workspace = true
+agent-harness = { workspace = true, features = ["quickjs"] }
 agent-extension = { workspace = true, features = ["full"] }
 async-stream.workspace = true
 axum.workspace = true
@@ -19,6 +20,9 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

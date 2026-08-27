@@ -1,6 +1,24 @@
 # 下一阶段：Session、上下文编排与可恢复流程框架
 
-> 状态：实施设计。本文承接已经完成的单次 Run 状态层，定义 Mina 接下来从“独立任务执行器”演进为“多轮 Agent Harness + Skill/Context/Memory 上层编排 + 可挂起流程运行时”的顺序、边界和核心契约。
+> 状态：主线已实现，本文保留当时的分阶段设计及已落地边界。Session、Skill/Context/Memory/Compression、AgentMachine、Event/Timer/Job 和 QuickJS Flow 已经形成可运行的单 Agent Harness；外部 adapter 与多 Agent 编排不属于本文的单 Agent封版范围。
+
+## 0. 当前实现快照（2026-08-27）
+
+原计划 Slice A–G 的主链已经完成：
+
+- SQLite Session/Message/Run 关联、幂等提交、刷新后历史查询；
+- `SkillStore`/目录验证与上层 Skill resolution；
+- 契约化 Context Engine、Memory Store/Retriever/Writer、Compressor、artifact/fingerprint；
+- versioned `AgentMachine` checkpoint、activation lease、Continue/Suspend/Complete/Failed；
+- SQLite Event/Subscription/Delivery/Timer/Flow inbox/outbox，重试与 dead letter；
+- 审批和普通 Tool 的 durable suspend/resume；
+- `async_job` 的 Job runtime 与跨重启唤醒；
+- QuickJS `start/resume` Flow Machine，每次 activation 新 Context，只保存 JSON checkpoint；
+- Run-scoped JavaScript ADF 与动态 ToolSet revision；
+- Tool 风险、幂等、有限重试、`parallel-safe` 保序并发；
+- 脱敏的 Model/Tool/Approval/Flow 观测，以及有界异步 export queue。
+
+下文 P0–P4 和 Slice A–G 是已执行的演进依据，而不是当前待办清单。仍明确后置的项目是强 Sandbox adapter、ADF durable artifact/promotion、Cron/Webhook/外部 broker 和多 Agent orchestration。
 
 ## 1. 总体结论
 
@@ -24,15 +42,17 @@ Session 1 ─ Run A ─ Run B ── ExecutionPlan ── Run B
 - **Event Runtime** 提供审批、后台 Job、Timer、Webhook 等统一唤醒事实；
 - **Gateway/UI** 只提交命令和订阅投影，不拥有 Session 或 Flow 状态机。
 
-实施顺序必须是：
+当时采用并已经完成的实施顺序是：
 
 ```text
 P0 Session
   → P1 Context/Memory/Compression + Skill orchestration
   → P2 AgentMachine/checkpoint
   → P3 Event/Job/Timer
-  → P4 JS
+  → P4 JS Flow binding
 ```
+
+这里的 P4 仅指需要 durable checkpoint/event 的 JS `start/resume` binding。纯计算 `javascript_eval` 和 Run-scoped JavaScript ADF 不依赖 Flow Runtime，可以按独立的 Q0–Q3/A0–A3 切片更早交付。
 
 ## 2. 与当前单次 Run 的兼容
 
@@ -244,6 +264,7 @@ pub struct RunRequest {
 ```text
 POST   /api/v1/sessions
 GET    /api/v1/sessions/{session_id}
+GET    /api/v1/sessions?status=active&limit=100
 GET    /api/v1/sessions/{session_id}/messages?before=&limit=
 POST   /api/v1/sessions/{session_id}/runs
 POST   /api/v1/sessions/{session_id}/archive
@@ -983,20 +1004,27 @@ JS 继续使用独立、可选的 QuickJS adapter。每次 `start()`/`resume()` 
 
 ## 8. 物理包与模块边界
 
-为避免细粒度 crate 膨胀，当前 workspace 已收敛为两个内部库：
+为避免细粒度 crate 膨胀，同时隔离 Agent 决策与宿主执行，当前 workspace 收敛为三个内部库：
 
 ```text
 crates/
 ├── core/                       # agent-core
 │   └── src/
-│       ├── harness/            # Run/Session/AgentLoop 与纯状态机
+│       ├── harness/            # Agent/Run/Flow 契约与 AgentLoop
 │       ├── context/            # Context 契约、引擎与默认策略
 │       ├── memory/             # Memory 契约与写入协调
 │       ├── skill/              # Skill 契约、选择、解析和编译
 │       ├── tool/               # Tool port 与跨语言 DTO
 │       ├── sandbox.rs          # ProcessSandbox port
 │       ├── observability.rs    # vendor-neutral Hook
-│       └── script.rs           # ScriptRuntime；QuickJS 可选实现归属
+│       └── script/             # ScriptRuntime 契约
+├── harness/                    # agent-harness
+│   └── src/
+│       ├── runtime.rs          # Harness facade
+│       ├── run_runtime.rs      # durable Run/activation coordinator
+│       ├── event/job/flow      # Event、Job、Flow effect coordinator
+│       ├── script/             # QuickJS 与 JavaScriptAgentMachine
+│       └── adf/                # definition lock 与 JavaScript executor
 └── extension/                  # agent-extension
     └── src/
         ├── provider/           # OpenAI-compatible 与未来 Provider
@@ -1011,14 +1039,14 @@ crates/
 依赖方向固定为：
 
 ```text
-apps/server + apps/agent-cli ──> agent-core
-              │
-              └───────────────> agent-extension ──> agent-core
+apps/server + apps/agent-cli ──> agent-harness ──> agent-core
+              │                       ▲
+              └───────────────> agent-extension
 
-agent-core -X-> agent-extension / axum / reqwest / rusqlite / tracing
+agent-core -X-> agent-harness / agent-extension / axum / reqwest / rusqlite / rquickjs / tracing
 ```
 
-QuickJS 属于 Harness 的可选执行能力，因此放在 Core；数据库、事件 Broker、网络与文件能力只能通过显式 capability port 注入。OpenAI-compatible Provider 可在应用装配层实现 `SummaryGenerator`，Context 策略不依赖具体 Provider。
+QuickJS 属于 Harness 的可选执行能力，因此放在 `agent-harness`，Core 只保留 `ScriptRuntime` 契约；数据库、事件 Broker、网络与文件能力只能通过显式 capability port 注入。OpenAI-compatible Provider 可在应用装配层实现 `SummaryGenerator`，Context 策略不依赖具体 Provider。
 
 具体选择只在 Server composition root 根据配置完成。默认组合建议是 `FilesystemSkillStore + SqliteMemoryStore/SqliteFtsRetriever + RuleMemoryExtractor + HostMemoryWritePolicy + HybridCompressor + HeuristicTokenEstimator`；测试替换为 in-memory fake，未来替换远端 Store、向量 Retriever 或新的 Compressor 时，不改 Gateway、Session、Harness 和 AgentLoop。
 
@@ -1145,8 +1173,10 @@ UI <- approval.resolved + following tool events
 - Rust/JS 共用 command fixtures；
 - 无 Node/npm/文件/网络默认能力。
 
+QuickJS 的便携计算入口、运行时契约和 Q0–Q5 实施切片见 [QuickJS 便携脚本运行时设计与执行计划](./13-quickjs-portable-script-runtime.md)；Agent 动态定义 Tool 的生命周期与 A0–A6 计划见 [Agent Defined Functions（ADF）设计与执行计划](./14-agent-defined-functions.md)。
+
 ## 12. 当前推荐的下一步
 
-立即实现 **Slice A**，不要同时开发 JS、Cron 或通用 webhook。它会先固定 Session 的身份、revision、消息与 run 原子边界，是后续 Context Engine、Skill Orchestrator 和 Flow Runtime 都必须依赖的地基。
+单 Agent 主线完成全量验收后应冻结 Core 契约，下一阶段转到多 Agent orchestration：父 Agent 派发、子 Run ownership、消息/结果路由、预算传播、取消树和 deadlock 防护。强 Sandbox 继续作为 `agent-extension` 的独立 adapter 深度迭代，不反向污染 Harness。
 
-Slice A 完成后按 **B → C → D** 完成整个 P1，再进入 AgentMachine。先用 EchoAgent 做“创建 Session → 连续两个 run → 重启 → 查询历史”，再用 fake model 做“Skill 解析 → Memory 检索 → 压缩 → Context fingerprint 固定”的确定性测试。
+在进入多 Agent 前只保留三个不阻塞封版的单 Agent增强项：ADF durable artifact/promotion、具体 OTLP/Langfuse 网络 exporter、Cron/Webhook/外部 broker adapter。它们都已经有稳定 Core port，可以独立增加或替换实现。

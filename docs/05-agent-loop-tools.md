@@ -1,6 +1,6 @@
 # Mina Agent Loop 与工具协议
 
-> 状态：MVP 已实现。当前支持 OpenAI-compatible 流式 function calling、串行工具执行、风险分级、用户审批、工具 UI 事件和有界模型循环。
+> 状态：单 Agent 主链已实现。当前支持 OpenAI-compatible 流式 function calling、显式 Tool 执行策略、风险审批、有限自动重试、保序并发、耐久挂起/恢复、异步 Job、工具 UI 事件和有界模型循环。
 
 ## 1. 边界
 
@@ -39,7 +39,18 @@ trait ToolPort {
 }
 ```
 
-`ToolDefinition` 的稳定数据结构位于 `agent-core::tool`，包含稳定名称、给模型看的描述、JSON Schema 和 `risk_level`。`ToolCallRequest` 是进程内运行时类型，包含 `run_id`、上游 `call_id`、工具名称、已解析的 JSON 参数和本次 run 的 cancellation token。结果只能返回安全文本或结构化 `ToolError`；原始内部错误不能直接进入公共事件。
+`ToolDefinition` 的稳定数据结构位于 `agent-core::tool`，包含稳定名称、给模型看的描述、JSON Schema、`risk_level` 和 `execution`。`ToolCallRequest` 是进程内运行时类型，包含 `run_id`、上游 `call_id`、工具名称、已解析的 JSON 参数和本次 run 的 cancellation token。结果只能返回安全文本、声明式挂起请求或结构化 `ToolError`；原始内部错误不能直接进入公共事件。
+
+`execution` 由 Tool 作者声明、Registry 注册时校验，不能由模型参数修改：
+
+```text
+idempotency = unknown | read_only | idempotent
+concurrency = exclusive | parallel_safe
+completion  = immediate | may_suspend
+retry       = max_attempts + bounded exponential backoff
+```
+
+`retryable=true` 只是错误提示，不授权自动重放。只有 `read_only/idempotent` 才能配置 2–5 次自动尝试；`unknown` 默认只执行一次。`parallel_safe + may_suspend` 属于非法组合并在注册时拒绝。Host 通过 `[agent].tool_call_strategy = "sequential" | "parallel-safe"` 决定是否启用并发；即使启用，需审批、Exclusive 或可挂起 Tool 仍保持串行。并发完成顺序可以不同，但写回模型的 Tool result 永远按模型原调用顺序排列。
 
 内置 `ToolRegistry` 实现 `ToolPort`。每个具体工具实现 `Tool`，注册时编译 JSON Schema，并拒绝空名称、重复名称或非法 schema；调用前统一完成工具查找和参数校验，再分派到工具实现。未来的 MCP bridge 或远程工具主机仍可直接实现同一个 `ToolPort`。
 
@@ -58,13 +69,31 @@ shell_command({"command":"cargo test --workspace","timeout_ms":300000})
 exec_command({"cmd":"server --watch","yield_time_ms":1000})
 write_stdin({"session_id":"<run>:<call>","chars":"reload\n"})
 apply_patch({"patch":"*** Begin Patch\n...\n*** End Patch"})
+async_job({"kind":"builtin.delay","input":{"delay_ms":1000,"value":{...}}})
 ```
 
-文件工具只允许解析 workspace 内的相对路径，并在 canonicalize 后再次检查边界；密钥配置、`.env`、私钥与 `.git` 路径由 Host policy 默认拒绝。`write/edit/apply_patch` 属于 Medium，必须审批。Mina 的 provider-neutral `ToolDefinition` 当前只支持 JSON function schema，因此 Codex 的 freeform `apply_patch` 在这里适配为必填 `{patch: string}`；解析和写入仍位于 workspace tool，绝不通过 shell 或 process adapter 绕过路径策略。
+文件工具只允许解析 workspace 内的相对路径，并在 canonicalize 后再次检查边界；密钥配置、`.env`、私钥与 `.git` 路径由 Host policy 默认拒绝。`write/edit/apply_patch` 属于 Medium，在默认 `review_level = 50` 下需要审批。Mina 的 provider-neutral `ToolDefinition` 当前只支持 JSON function schema，因此 Codex 的 freeform `apply_patch` 在这里适配为必填 `{patch: string}`；解析和写入仍位于 workspace tool，绝不通过 shell 或 process adapter 绕过路径策略。
 
-`shell_command` 是有 wall-time 限制的一次性 shell 调用。`exec_command` 启动可持续会话，初次等待后若进程仍运行就返回 `session_id`；`write_stdin` 用该 id 写字符、空写轮询、关闭 stdin 或终止进程组，并返回本次新增的有界输出。当前实现使用 plain pipes，不宣称 PTY。三个进程工具都通过 Host 注入的同一个 `ProcessSandbox` 实例执行并声明 High；server 必须调用 `enable_terminal_tools()` 显式启用，Agent Loop 还必须在每次调用前等待用户审批。
+`shell_command` 是有 wall-time 限制的一次性 shell 调用。`exec_command` 启动可持续会话，初次等待后若进程仍运行就返回 `session_id`；`write_stdin` 用该 id 写字符、空写轮询、关闭 stdin 或终止进程组，并返回本次新增的有界输出。当前实现使用 plain pipes，不宣称 PTY。三个进程工具都通过 Host 注入的同一个 `ProcessSandbox` 实例执行并声明 High；server 必须调用 `enable_terminal_tools()` 显式启用，在默认审批策略下 Agent Loop 会在调用前等待用户决定。
 
-Codex 的 `request_permissions` 承载 attached environment 的 filesystem/network permission profile 和 turn/session grant 生命周期。Mina 当前没有等价的 permission-profile contract；其已有 `ApprovalPort` 已完整覆盖工具执行前的用户决定。因此 catalog 不注册 `request_permissions`，也不创建可绕过审批的旁路。兼容规则是：所有 terminal definition 固定为 High，由统一的 `ToolPort::validate -> ApprovalPort -> ToolPort::call` 链处理；未配置 ApprovalPort 时 fail closed。
+Codex 的 `request_permissions` 承载 attached environment 的 filesystem/network permission profile 和 turn/session grant 生命周期。Mina 当前没有等价的 permission-profile contract；其已有 `ApprovalPort` 已完整覆盖工具执行前的用户决定。因此 catalog 不注册 `request_permissions`，也不创建可绕过审批的旁路。兼容规则是：所有 terminal definition 固定为 High，由统一的 `ToolPort::validate -> ToolApprovalPolicy -> ApprovalPort -> ToolPort::call` 链处理；策略要求审核但未配置 ApprovalPort 时 fail closed。
+
+### 2.1 数值审核阈值
+
+Tool 对外仍声明分类风险，Host 将其映射为稳定数值并像日志级别一样过滤：
+
+| Tool 风险 | 数值 |
+|---|---:|
+| Low | 10 |
+| Medium | 50 |
+| High | 90 |
+
+```toml
+[approval]
+review_level = 50
+```
+
+判断规则为 `tool_level >= review_level`。`0` 审核全部 Tool；默认 `50` 审核 Medium/High；`90` 仅审核 High；`100` 关闭 Tool 人工审核。合法范围是 `0..=100`，所以也可以用中间阈值，例如 `60` 与 `90` 的效果相同。阈值属于 Host/Run 执行策略，不进入模型参数；耐久 AgentLoop 会把生效策略写入 checkpoint，重启恢复时不会因配置变化而让同一 Run 的策略漂移。
 
 当前 `HostProcessSandbox` 只固定工作目录、清理环境、限制输出、管理 stdin/进程组和回收直接子进程，不等于内核隔离；其 descriptor 始终为 `host_process / isolation=none`。工具名称经过 registry allow-list 分派；未知工具和非法参数都作为安全的结构化工具失败返回模型，使模型有机会修正或解释，宿主 I/O 错误不会原样泄漏。
 
@@ -163,30 +192,36 @@ WaitingModel
   └─ tool_calls
        → ParsingArguments
        → ValidatingArguments
-       → WaitingApproval (medium/high)
-       → ExecutingTool (串行)
+       → WaitingApproval (tool_level >= review_level)
+       → ExecutingTool (Exclusive 串行 / ParallelSafe 有界并发)
        → AppendingToolResult
        └─────────────────────────→ WaitingModel
 ```
 
-`agent.max_steps` 限制一次 run 中的模型调用次数，默认 8，合法范围 1–64。达到限制时产生唯一的 `agent_step_limit_exceeded` 终态。在最后一个可用 step 上模型再次请求工具时，不再执行该工具，避免执行副作用后却没有机会让模型消费结果。
+`agent.max_steps` 是 Host 配置的模型步骤上限，默认 8，合法范围 1–100。上层可在单次 Run 请求中传入更小的 `max_steps`；省略时使用 Host 上限，超过 Host 上限或小于 1 时返回 `invalid_max_steps`。
+
+最后一个正常 step 再次请求工具时不会直接让 Run 失败，也不会执行这些工具。AgentLoop 会为每个待执行调用产生 `tool_execution_failed`：错误码为 `agent_step_limit_exceeded`、类别为 `resource_exhausted`，并把同样的结构化 ToolError 追加到模型消息。随后额外进行一次不携带任何 ToolDefinition 的最终总结调用，要求模型使用已有信息回答并说明未完成工作；这次总结调用不计入 `max_steps`。总结正常结束时 Run 仍为 `run_completed`，只有总结调用超时、上游失败或违规继续请求工具时才进入 `run_failed`。
+
+```json
+{
+  "input": "...",
+  "max_steps": 4
+}
+```
 
 三个独立 deadline 通过 `[agent]` 配置：完整 run 默认 300 秒、每轮模型调用默认 120 秒、每次工具执行默认 30 秒。模型超时以 `model_timeout` 终止 run；工具超时以可重试的 `tool_timeout` 结果送回模型，让它决定降级或解释；完整 run 超时产生 `run_timeout`。显式取消则产生唯一 `run_cancelled`。
 
-当前 Gateway 使用进程内 approval registry，并通过以下接口接收决定：
+Gateway 通过以下接口接收决定：
 
 ```text
 POST /api/v1/runs/{run_id}/approvals/{approval_id}
 { "decision": "allow-once" | "deny", "reason"?: "..." }
 ```
 
-同一决定可以幂等重放，不同决定返回冲突。run 完成、取消或超时后清理进程内审批等待；SSE 断开不再结束 run。拒绝不会执行工具，而是把 `tool_rejected` 和可选原因送回模型。审批事件及其投影已经持久化，但等待中的 Future 仍是进程内对象；它将在事件运行时阶段替换为持久化 subscription + checkpoint resume。
+同一决定可以幂等重放，不同决定返回冲突。耐久 `AgentMachine` 会把待审批调用写入 versioned checkpoint，并在同一提交中创建 once subscription/outbox；run 进入 `WaitingEvent` 后释放 worker。Server 重启后，HTTP 审批产生 `tool.approval.resolved`，事件写入 run inbox 并恢复原调用。拒绝不会执行工具，而是把 `tool_rejected` 和可选原因送回模型。兼容的 `Agent::run` 仍使用进程内 `ApprovalPort`，不承诺跨重启等待。
 
-当前尚未实现：
+普通 Tool 也可以声明 `completion=may_suspend` 并返回 `ToolOutput::suspend(waits, effects)`。Harness 校验 wait/effect 数量、Run ownership、subscription 和 effect 契约，保存 `pending_tool` checkpoint；匹配事件到达后把 inbox 投影为 Tool result，产生 `tool_execution_completed` 并继续模型循环。同一模型轮中尚未执行的其余调用会收到 `tool_deferred_by_suspension`，避免在挂起边界后意外产生副作用。
 
-- 并行工具调度；
-- MCP discovery/session；
-- checkpoint resume 与可跨进程恢复的审批订阅；单次 run 事件持久化已由 `RunStore` 完成。
-- C ABI v1 的 Rust host loader；当前已发布数据契约、JSON Schema 和头文件，loader 将作为隔离且可审计的 FFI adapter 提供。
+内置 `async_job` 使用这条通路提交 `StartJob`，以 `job.completed/job.failed` 为 once wait。当前 allow-list 默认只有 `builtin.delay`；审批 → Tool suspend → SQLite reopen → Job execute-once → event → Agent resume → 最终总结已有集成测试。
 
-下一步应让事件运行时接管等待审批的挂起与恢复，再让 MCP adapter 实现同一个 `ToolPort`。MCP 协议不应进入 `AgentLoop` 或公共 `RunEvent`。
+仍未实现的是 MCP discovery/session、C ABI v1 Rust host loader，以及真正的 Linux/容器强 Sandbox adapter。它们都应继续实现同一个 `ToolPort`/`ProcessSandbox` 边界，不进入 `AgentLoop` 或公共 `RunEvent`。

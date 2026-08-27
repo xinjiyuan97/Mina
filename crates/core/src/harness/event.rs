@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::harness::{
-    ApprovalId, ApprovalResolution, FinishReason, RunCancellation, RunId, TokenUsage,
+    ActivationId, ApprovalId, ApprovalResolution, FinishReason, RunCancellation, RunId, TokenUsage,
     ToolErrorCategory, ToolRiskLevel,
 };
 
@@ -28,6 +28,12 @@ pub enum AgentEvent {
     },
     UsageUpdated {
         usage: TokenUsage,
+    },
+    ToolSetUpdated {
+        revision: u64,
+        digest: String,
+        tools: Vec<String>,
+        dynamic_tools: Vec<String>,
     },
     ToolCallStarted {
         call_id: String,
@@ -105,6 +111,88 @@ impl AgentEvent {
             Self::Cancelled | Self::Completed { .. } | Self::Failed { .. }
         )
     }
+
+    /// Converts an Agent-produced semantic event into the stable public event
+    /// vocabulary. Durable coordinators use the same mapping as the legacy
+    /// one-Future Harness so transports and projections do not diverge.
+    #[must_use]
+    pub fn into_run_event_kind(self) -> RunEventKind {
+        match self {
+            Self::OutputDelta { channel, delta } => RunEventKind::OutputDelta { channel, delta },
+            Self::UsageUpdated { usage } => RunEventKind::UsageUpdated { usage },
+            Self::ToolSetUpdated {
+                revision,
+                digest,
+                tools,
+                dynamic_tools,
+            } => RunEventKind::ToolSetUpdated {
+                revision,
+                digest,
+                tools,
+                dynamic_tools,
+            },
+            Self::ToolCallStarted { call_id, name } => {
+                RunEventKind::ToolCallStarted { call_id, name }
+            }
+            Self::ToolCallArgumentsDelta { call_id, delta } => {
+                RunEventKind::ToolCallArgumentsDelta { call_id, delta }
+            }
+            Self::ApprovalRequested {
+                approval_id,
+                call_id,
+                tool_name,
+                risk_level,
+                arguments,
+            } => RunEventKind::ApprovalRequested {
+                approval_id,
+                call_id,
+                tool_name,
+                risk_level,
+                arguments,
+            },
+            Self::ApprovalResolved {
+                approval_id,
+                call_id,
+                resolution,
+            } => RunEventKind::ApprovalResolved {
+                approval_id,
+                call_id,
+                resolution,
+            },
+            Self::ToolExecutionStarted { call_id, arguments } => {
+                RunEventKind::ToolExecutionStarted { call_id, arguments }
+            }
+            Self::ToolExecutionCompleted { call_id, output } => {
+                RunEventKind::ToolExecutionCompleted { call_id, output }
+            }
+            Self::ToolExecutionFailed {
+                call_id,
+                code,
+                message,
+                category,
+                retryable,
+                retry_after_ms,
+            } => RunEventKind::ToolExecutionFailed {
+                call_id,
+                code,
+                message,
+                category,
+                retryable,
+                retry_after_ms,
+            },
+            Self::Cancelled => RunEventKind::RunCancelled,
+            Self::Completed { finish_reason } => RunEventKind::RunCompleted { finish_reason },
+            Self::Failed {
+                code,
+                message,
+                retryable,
+            } => RunEventKind::RunFailed {
+                code,
+                message,
+                retryable,
+            },
+        }
+    }
 }
 
 /// Stable output channels. Provider-specific fields never become channel names.
@@ -133,12 +221,26 @@ pub struct RunEvent {
 #[non_exhaustive]
 pub enum RunEventKind {
     RunStarted,
+    RunWaiting {
+        checkpoint_revision: u64,
+        wait_count: u32,
+    },
+    RunResumed {
+        activation_id: ActivationId,
+        checkpoint_revision: u64,
+    },
     OutputDelta {
         channel: OutputChannel,
         delta: String,
     },
     UsageUpdated {
         usage: TokenUsage,
+    },
+    ToolSetUpdated {
+        revision: u64,
+        digest: String,
+        tools: Vec<String>,
+        dynamic_tools: Vec<String>,
     },
     ToolCallStarted {
         call_id: String,
@@ -194,8 +296,11 @@ impl RunEventKind {
     pub const fn event_name(&self) -> &'static str {
         match self {
             Self::RunStarted => "run_started",
+            Self::RunWaiting { .. } => "run_waiting",
+            Self::RunResumed { .. } => "run_resumed",
             Self::OutputDelta { .. } => "output_delta",
             Self::UsageUpdated { .. } => "usage_updated",
+            Self::ToolSetUpdated { .. } => "tool_set_updated",
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::ToolCallArgumentsDelta { .. } => "tool_call_arguments_delta",
             Self::ApprovalRequested { .. } => "approval_requested",
@@ -229,7 +334,8 @@ impl RunEvent {
 
 /// Adds the public envelope, assigns strictly increasing sequence numbers, and
 /// guarantees exactly one terminal event even when an Agent ends unexpectedly.
-pub(crate) fn run_event_stream(
+#[doc(hidden)]
+pub fn run_event_stream(
     run_id: RunId,
     mut events: AgentEventStream,
     cancellation: RunCancellation,
@@ -275,68 +381,7 @@ pub(crate) fn run_event_stream(
 
             seq += 1;
             let terminal = event.is_terminal();
-            let kind = match event {
-                AgentEvent::OutputDelta { channel, delta } => {
-                    RunEventKind::OutputDelta { channel, delta }
-                }
-                AgentEvent::UsageUpdated { usage } => RunEventKind::UsageUpdated { usage },
-                AgentEvent::ToolCallStarted { call_id, name } => {
-                    RunEventKind::ToolCallStarted { call_id, name }
-                }
-                AgentEvent::ToolCallArgumentsDelta { call_id, delta } => {
-                    RunEventKind::ToolCallArgumentsDelta { call_id, delta }
-                }
-                AgentEvent::ApprovalRequested {
-                    approval_id,
-                    call_id,
-                    tool_name,
-                    risk_level,
-                    arguments,
-                } => RunEventKind::ApprovalRequested {
-                    approval_id,
-                    call_id,
-                    tool_name,
-                    risk_level,
-                    arguments,
-                },
-                AgentEvent::ApprovalResolved {
-                    approval_id,
-                    call_id,
-                    resolution,
-                } => RunEventKind::ApprovalResolved {
-                    approval_id,
-                    call_id,
-                    resolution,
-                },
-                AgentEvent::ToolExecutionStarted { call_id, arguments } => {
-                    RunEventKind::ToolExecutionStarted { call_id, arguments }
-                }
-                AgentEvent::ToolExecutionCompleted { call_id, output } => {
-                    RunEventKind::ToolExecutionCompleted { call_id, output }
-                }
-                AgentEvent::ToolExecutionFailed {
-                    call_id,
-                    code,
-                    message,
-                    category,
-                    retryable,
-                    retry_after_ms,
-                } => RunEventKind::ToolExecutionFailed {
-                    call_id,
-                    code,
-                    message,
-                    category,
-                    retryable,
-                    retry_after_ms,
-                },
-                AgentEvent::Cancelled => RunEventKind::RunCancelled,
-                AgentEvent::Completed { finish_reason } => {
-                    RunEventKind::RunCompleted { finish_reason }
-                }
-                AgentEvent::Failed { code, message, retryable } => {
-                    RunEventKind::RunFailed { code, message, retryable }
-                }
-            };
+            let kind = event.into_run_event_kind();
             yield RunEvent::new(run_id, seq, kind);
 
             if terminal {

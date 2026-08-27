@@ -1,9 +1,12 @@
-//! Stable Agent contracts and transport-independent Harness runtime.
+//! Stable, provider-neutral Agent contracts and decision runtime.
 //!
-//! Provider SDKs, databases, host tools and monitoring vendors belong to
-//! `agent-extension` and must never become dependencies of this crate.
+//! Process orchestration and embedded engines belong to `agent-harness`;
+//! providers, databases, host tools and monitoring adapters belong to
+//! `agent-extension`. Neither may become a dependency of this crate.
 
+pub mod adf;
 pub mod context;
+pub mod event_runtime;
 pub mod harness;
 pub mod memory;
 pub mod observability;

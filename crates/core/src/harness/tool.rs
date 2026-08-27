@@ -1,11 +1,22 @@
-use std::{collections::BTreeMap, fmt, future::Future, pin::Pin, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+};
 
-pub use crate::tool::{ToolDefinition, ToolErrorCategory, ToolRiskLevel};
+pub use crate::tool::{
+    ToolCompletion, ToolConcurrency, ToolDefinition, ToolErrorCategory, ToolExecutionPolicy,
+    ToolIdempotency, ToolRetryPolicy, ToolRiskLevel,
+};
 use jsonschema::JSONSchema;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::harness::{RunCancellation, RunId};
+use crate::harness::{EffectRequest, RunCancellation, RunId, WaitSpec};
 
 /// One validated invocation crossing the Agent -> tool boundary.
 #[derive(Debug, Clone)]
@@ -18,9 +29,10 @@ pub struct ToolCallRequest {
 }
 
 /// Text returned to the model after a tool finishes successfully.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolOutput {
     pub content: String,
+    pub suspension: Option<ToolSuspension>,
 }
 
 impl ToolOutput {
@@ -28,8 +40,141 @@ impl ToolOutput {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            suspension: None,
         }
     }
+
+    #[must_use]
+    pub fn suspend(waits: Vec<WaitSpec>, effects: Vec<EffectRequest>) -> Self {
+        Self {
+            content: String::new(),
+            suspension: Some(ToolSuspension { waits, effects }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolSuspension {
+    pub waits: Vec<WaitSpec>,
+    pub effects: Vec<EffectRequest>,
+}
+
+/// Host-owned visibility policy for arguments written to public events,
+/// persistence, and ordinary observability sinks. It does not alter the full
+/// arguments delivered to the tool or returned to the model conversation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolArgumentVisibility {
+    #[default]
+    Full,
+    DigestOnly,
+}
+
+/// Origin of one binding in a run-scoped tool-set snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolBindingKind {
+    Static,
+    AdfManagement,
+    AgentDefined,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolBinding {
+    pub name: String,
+    pub kind: ToolBindingKind,
+    pub argument_visibility: ToolArgumentVisibility,
+}
+
+/// Immutable tool view used for exactly one model step. Calls from that model
+/// response must be validated and dispatched against the same revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSetSnapshot {
+    pub revision: u64,
+    pub digest: String,
+    pub definitions: Vec<ToolDefinition>,
+    pub bindings: Vec<ToolBinding>,
+}
+
+impl ToolSetSnapshot {
+    pub fn new(
+        revision: u64,
+        mut definitions: Vec<ToolDefinition>,
+        mut bindings: Vec<ToolBinding>,
+    ) -> Result<Self, ToolError> {
+        definitions.sort_by(|left, right| left.name.cmp(&right.name));
+        bindings.sort_by(|left, right| left.name.cmp(&right.name));
+        let definition_names = definitions
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let binding_names = bindings
+            .iter()
+            .map(|binding| binding.name.as_str())
+            .collect::<BTreeSet<_>>();
+        if definitions.len() != definition_names.len()
+            || bindings.len() != binding_names.len()
+            || definition_names != binding_names
+        {
+            return Err(ToolError::new(
+                "tool_set_invalid",
+                "tool-set definitions and bindings must be unique and have matching names",
+                false,
+            ));
+        }
+        let bytes = serde_json::to_vec(&(&definitions, &bindings)).map_err(|_| {
+            ToolError::new(
+                "tool_set_digest_failed",
+                "tool-set metadata could not be encoded",
+                false,
+            )
+        })?;
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        Ok(Self {
+            revision,
+            digest: format!("sha256:{:x}", hasher.finalize()),
+            definitions,
+            bindings,
+        })
+    }
+
+    #[must_use]
+    pub fn binding(&self, name: &str) -> Option<&ToolBinding> {
+        self.bindings.iter().find(|binding| binding.name == name)
+    }
+
+    pub fn retain(
+        mut self,
+        mut predicate: impl FnMut(&ToolBinding) -> bool,
+    ) -> Result<Self, ToolError> {
+        self.bindings.retain(|binding| predicate(binding));
+        let names = self
+            .bindings
+            .iter()
+            .map(|binding| binding.name.as_str())
+            .collect::<BTreeSet<_>>();
+        self.definitions
+            .retain(|definition| names.contains(definition.name.as_str()));
+        Self::new(self.revision, self.definitions, self.bindings)
+    }
+}
+
+#[must_use]
+pub fn digest_only_arguments(arguments: &Value) -> Value {
+    let encoded = serde_json::to_vec(arguments).unwrap_or_default();
+    digest_only_bytes(&encoded)
+}
+
+#[must_use]
+pub fn digest_only_bytes(bytes: &[u8]) -> Value {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    json!({
+        "redacted": true,
+        "bytes": bytes.len(),
+        "digest": format!("sha256:{:x}", hasher.finalize()),
+    })
 }
 
 /// Safe tool failure. The Agent normally returns this to the model so it can
@@ -132,19 +277,64 @@ pub type ToolCallFuture =
 pub trait ToolPort: Send + Sync + 'static {
     fn definitions(&self) -> Vec<ToolDefinition>;
 
+    /// Returns the immutable binding set for one model step. Static tool ports
+    /// inherit this implementation; dynamic ports override it per run.
+    fn tool_set_snapshot(&self, _run_id: RunId) -> Result<ToolSetSnapshot, ToolError> {
+        let definitions = self.definitions();
+        let bindings = definitions
+            .iter()
+            .map(|definition| ToolBinding {
+                name: definition.name.clone(),
+                kind: ToolBindingKind::Static,
+                argument_visibility: self.argument_visibility(&definition.name),
+            })
+            .collect();
+        ToolSetSnapshot::new(0, definitions, bindings)
+    }
+
+    fn argument_visibility(&self, _name: &str) -> ToolArgumentVisibility {
+        ToolArgumentVisibility::Full
+    }
+
     /// Validate before approval so a user is never asked to approve a call that
     /// the registry would reject immediately afterwards.
     fn validate(&self, _name: &str, _arguments: &Value) -> Result<(), ToolError> {
         Ok(())
     }
 
+    fn validate_at(
+        &self,
+        _run_id: RunId,
+        _tool_set_revision: u64,
+        name: &str,
+        arguments: &Value,
+    ) -> Result<(), ToolError> {
+        self.validate(name, arguments)
+    }
+
     fn call(&self, request: ToolCallRequest) -> ToolCallFuture;
+
+    fn call_at(&self, _tool_set_revision: u64, request: ToolCallRequest) -> ToolCallFuture {
+        self.call(request)
+    }
+
+    fn close_run(&self, _run_id: RunId) {}
 }
+
+/// Marker for a ToolPort that participates in run-scoped snapshot semantics.
+/// Static ports receive the default revision-zero implementation above.
+pub trait RunToolSession: ToolPort {}
+
+impl<T> RunToolSession for T where T: ToolPort + ?Sized {}
 
 /// One executable tool. Registration metadata and execution stay together so
 /// hosts cannot accidentally advertise a tool that they cannot invoke.
 pub trait Tool: Send + Sync + 'static {
     fn definition(&self) -> ToolDefinition;
+
+    fn argument_visibility(&self) -> ToolArgumentVisibility {
+        ToolArgumentVisibility::Full
+    }
 
     fn call(&self, request: ToolCallRequest) -> ToolCallFuture;
 }
@@ -158,6 +348,7 @@ pub struct ToolRegistry {
 
 struct RegisteredTool {
     definition: ToolDefinition,
+    argument_visibility: ToolArgumentVisibility,
     input_validator: JSONSchema,
     tool: Arc<dyn Tool>,
 }
@@ -190,6 +381,12 @@ impl ToolRegistry {
             return Err(ToolRegistrationError::DuplicateName(name));
         }
         definition.name.clone_from(&name);
+        definition.execution.validate().map_err(|error| {
+            ToolRegistrationError::InvalidExecutionPolicy {
+                name: name.clone(),
+                message: error.to_string(),
+            }
+        })?;
 
         let input_validator = JSONSchema::compile(&definition.input_schema).map_err(|error| {
             ToolRegistrationError::InvalidSchema {
@@ -201,6 +398,7 @@ impl ToolRegistry {
             name,
             RegisteredTool {
                 definition,
+                argument_visibility: tool.argument_visibility(),
                 input_validator,
                 tool: Arc::new(tool),
             },
@@ -225,6 +423,14 @@ impl ToolPort for ToolRegistry {
             .values()
             .map(|registered| registered.definition.clone())
             .collect()
+    }
+
+    fn argument_visibility(&self, name: &str) -> ToolArgumentVisibility {
+        self.tools
+            .get(name)
+            .map_or(ToolArgumentVisibility::Full, |registered| {
+                registered.argument_visibility
+            })
     }
 
     fn validate(&self, name: &str, arguments: &Value) -> Result<(), ToolError> {
@@ -274,6 +480,9 @@ pub enum ToolRegistrationError {
 
     #[error("tool `{name}` has an invalid input schema: {message}")]
     InvalidSchema { name: String, message: String },
+
+    #[error("tool `{name}` has an invalid execution policy: {message}")]
+    InvalidExecutionPolicy { name: String, message: String },
 }
 
 #[cfg(test)]
@@ -355,6 +564,39 @@ mod tests {
         assert_eq!(error, ToolRegistrationError::DuplicateName("test".into()));
     }
 
+    #[test]
+    fn rejects_automatic_retries_without_idempotency() {
+        let mut registry = ToolRegistry::new();
+        let error = registry
+            .register(PolicyTestTool {
+                policy: ToolExecutionPolicy::default()
+                    .with_retry(ToolRetryPolicy::bounded(2, 1, 10)),
+            })
+            .expect_err("unknown side effects must not be replayed automatically");
+
+        assert!(matches!(
+            error,
+            ToolRegistrationError::InvalidExecutionPolicy { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_parallel_tools_that_can_suspend() {
+        let mut registry = ToolRegistry::new();
+        let error = registry
+            .register(PolicyTestTool {
+                policy: ToolExecutionPolicy::read_only()
+                    .with_concurrency(ToolConcurrency::ParallelSafe)
+                    .with_completion(ToolCompletion::MaySuspend),
+            })
+            .expect_err("a suspending tool cannot join a parallel batch");
+
+        assert!(matches!(
+            error,
+            ToolRegistrationError::InvalidExecutionPolicy { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn rejects_invalid_arguments_before_dispatch() {
         let mut registry = ToolRegistry::new();
@@ -394,6 +636,25 @@ mod tests {
     }
 
     struct RiskyTestTool;
+
+    struct PolicyTestTool {
+        policy: ToolExecutionPolicy,
+    }
+
+    impl Tool for PolicyTestTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::new(
+                "policy_test",
+                "A tool with a configurable execution policy.",
+                json!({"type": "object"}),
+            )
+            .with_execution_policy(self.policy)
+        }
+
+        fn call(&self, _request: ToolCallRequest) -> ToolCallFuture {
+            Box::pin(async { Ok(ToolOutput::text("ok")) })
+        }
+    }
 
     impl Tool for RiskyTestTool {
         fn definition(&self) -> ToolDefinition {

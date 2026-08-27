@@ -12,7 +12,16 @@
 
 ## 边界
 
-模型只能看到 manifest 中的工具名称、描述和参数 Schema。`risk_level` 是工具作者提供的默认值，宿主仍必须在执行前做参数校验、动态策略判断和用户审批，不能把插件声明当成授权。
+模型只能看到 manifest 中的工具名称、描述和参数 Schema。`risk_level` 和 `execution` 是工具作者提供的声明，宿主仍必须在注册/执行前做参数校验、策略收紧和用户审批，不能把插件声明当成授权。
+
+`execution` 包含：
+
+- `idempotency = unknown | read_only | idempotent`；
+- `concurrency = exclusive | parallel_safe`；
+- `completion = immediate | may_suspend`；
+- `retry = { max_attempts, initial_backoff_ms, max_backoff_ms }`。
+
+省略时使用最保守的 `unknown + exclusive + immediate + 1 attempt`。声明自动重试时必须是 `read_only/idempotent`，最大尝试次数为 5；`parallel_safe + may_suspend` 非法。Host 可以把并发/重试降级得更保守，不能根据插件 manifest 擅自放宽部署策略。V1 `ToolInvokeResult` 没有 durable suspension 信封，因此外部静态插件在 v1 实际应保持 `completion=immediate`；可挂起工具使用进程内 Core ToolPort，或等待后续 ABI 版本扩展。
 
 ABI 只传输 UTF-8 JSON 字节，不传输 Rust 的 `String`、trait object、future 或 allocator。这样可以避免编译器版本和语言运行时进入公共边界。
 

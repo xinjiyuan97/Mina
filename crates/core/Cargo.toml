@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Agent contracts and transport-independent harness runtime"
+description = "Provider-neutral agent contracts and decision runtime"
 
 [dependencies]
 async-stream.workspace = true
@@ -18,8 +18,6 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-toml.workspace = true
-url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

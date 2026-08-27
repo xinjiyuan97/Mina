@@ -3,7 +3,8 @@
 mod contract;
 
 pub use crate::harness::{
-    Tool, ToolCallFuture, ToolCallRequest, ToolError, ToolOutput, ToolPort, ToolRegistrationError,
-    ToolRegistry,
+    RunToolSession, Tool, ToolArgumentVisibility, ToolBinding, ToolBindingKind, ToolCallFuture,
+    ToolCallRequest, ToolError, ToolOutput, ToolPort, ToolRegistrationError, ToolRegistry,
+    ToolSetSnapshot,
 };
 pub use contract::*;

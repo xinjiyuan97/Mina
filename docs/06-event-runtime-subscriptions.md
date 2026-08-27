@@ -1,6 +1,6 @@
 # Mina 独立事件运行时与订阅系统设计
 
-> 状态：设计阶段。本文定义一套独立于 Chat UI、HTTP Gateway、模型供应商和具体 Agent 实现的事件底座。Agent 可以通过 Rust 内置能力或 JS 沙箱绑定发布事件、创建订阅、安排 Timer、启动后台任务并挂起 run。
+> 状态：核心运行时与 SQLite adapter 已落地。本文既记录稳定设计，也标注仍待扩展的外部 adapter。AgentMachine、审批、一次性 Timer、异步 Job、普通 Tool suspend 和 QuickJS Flow 已经通过同一套 wait/inbox/outbox 契约工作。
 >
 > 本文描述事件子系统本身；结合已完成的单次 Run Store 后，项目整体实施顺序以 [下一阶段：Session、上下文编排与可恢复流程框架](./09-next-flow-framework.md) 为准，先完成 Session、Context/Memory/Compression 和 Skill 上层编排，再接 AgentMachine 与 durable wait。
 
@@ -48,13 +48,16 @@
 └──────────────────────────────────────────────────────────────┘
 ```
 
-建议的物理模块划分：
+当前物理模块划分：
 
 ```text
 crates/
-├── core/src/event/          # 协议、dispatcher、run bridge 与状态机
-├── core/src/script/         # 可选 QuickJS runtime contract/实现
-└── extension/src/event/     # SQLite、timer worker 和外部 broker adapter
+├── core/src/event_runtime.rs       # 事件/订阅/Timer 协议与 dispatcher
+├── core/src/harness/machine.rs     # AgentMachine、checkpoint、wait/effect
+├── core/src/script/flow.rs         # QuickJS start/resume Flow Machine
+├── extension/src/store/event.rs    # SQLite event/subscription/timer/flow outbox
+├── extension/src/store/job.rs      # SQLite Job Store
+└── extension/src/tool/job.rs       # async_job Tool adapter
 ```
 
 事件契约不依赖具体 Agent 实现。通用 worker、定时器甚至非 Agent 程序也可以使用同一端口；Harness 只把订阅投递映射为 run 的唤醒输入。
@@ -352,7 +355,7 @@ JS mina.events ────┘
 
 ### 8.2 JS 引擎选型：rquickjs / QuickJS
 
-第一版明确选择 [`rquickjs`](https://crates.io/crates/rquickjs) 嵌入 QuickJS，放在独立且可选的 `mina-js-runtime` crate 中。
+第一版明确选择 [`rquickjs`](https://crates.io/crates/rquickjs) 嵌入 QuickJS。按照当前 `core + harness + extension` 边界，具体实现放在 `agent-harness::script`，通过默认关闭的 `quickjs` feature 启用，不再新增独立 JS crate。完整定位和实施切片见 [QuickJS 便携脚本运行时设计与执行计划](./13-quickjs-portable-script-runtime.md)。
 
 选择原因：
 
@@ -366,20 +369,13 @@ JS mina.events ────┘
 这里的“无依赖”指最终用户不需要 Node.js、npm 或系统级 JS Runtime，不代表 Cargo 零依赖。`rquickjs` 仍包含 Rust binding 和 QuickJS 原生引擎构建；不启用 JS 的 Mina 组件不应编译它。
 
 ```toml
-# crates/mina-js-runtime/Cargo.toml
-[dependencies]
-rquickjs = { version = "...", features = ["futures", "loader"] }
-mina-events = { path = "../mina-events" }
-
-# 其他 crate 不直接依赖 rquickjs。
-```
-
-如果最终将 JS adapter 合并进某个二进制，也必须保持 feature 可选：
-
-```toml
+# crates/core/Cargo.toml
 [features]
 default = []
-js = ["dep:mina-js-runtime"]
+quickjs = ["dep:rquickjs"]
+
+[dependencies]
+rquickjs = { version = "...", optional = true, features = ["futures", "loader"] }
 ```
 
 备选方案：
@@ -406,7 +402,7 @@ js = ["dep:mina-js-runtime"]
   → 清空任务队列并丢弃/回收 Context
 ```
 
-QuickJS Runtime/Context 不在任意 Tokio worker 线程间共享。`mina-js-runtime` 使用固定的专用 worker 线程或有界 worker pool，每个 execution lease 在同一线程内完成；Rust async capability 通过消息和受控 Promise 与外部 runtime 交互。
+QuickJS Runtime/Context 不在任意 Tokio worker 线程间共享。`agent-harness::script` 使用固定的专用 worker 线程或有界 worker pool，每个 execution lease 在同一线程内完成；Rust async capability 通过消息和受控 Promise 与外部 runtime 交互。
 
 建议的默认预算：
 
@@ -615,18 +611,35 @@ pub enum StepOutcome {
 
 现有 `AgentLoop` 可以先作为 `AgentMachine` 的一种实现；Gateway 不需要了解 Rust Agent 还是 JS Agent，也不负责保存 checkpoint。
 
-## 14. MVP 顺序
+## 14. 实现状态与后续顺序
 
-### P0：独立内存事件核心
+截至 2026-08-27 已完成：
 
-- 新增 `mina-events` 和 `mina-event-runtime`；
+- versioned `CheckpointEnvelope`、`AgentMachine::start/resume`、每个 activation 唯一 `StepOutcome`；
+- SQLite EventLog、声明式 subscription、delivery 去重、lease、有限重试和 dead letter；
+- Flow checkpoint/inbox/outbox/effect 的事务提交和 Server 重启恢复；
+- 一次性 Timer worker；
+- 审批 `Suspend → approval.resolved → inbox → resume`；
+- `ToolOutput::suspend`，普通 Tool 可原子提交 waits/effects 后释放 worker；
+- `async_job` 的 `StartJob + job.completed/job.failed`，Job execute-once 与跨 SQLite reopen 恢复；
+- QuickJS `start/resume` Flow Machine：每次 activation 新建 Context，只持久化 JSON checkpoint 和 content-addressed script artifact ref；
+- Timer/Job/审批/Tool suspend 的恢复集成测试。
+
+仍待实现：Cron/周期调度、Webhook ingestion、PostgreSQL/外部 broker、订阅运维 API，以及将 JS host capability 扩展为完整的 `mina.events/timers/jobs/tools` 命令面。当前 QuickJS Flow 使用受校验的声明式返回值表达 waits/effects，不允许保存 Promise、闭包或 VM 状态。
+
+下面 P0–P4 保留为设计演进记录；P0–P2 与 P3 的 `start/resume` 主链已经完成，不能再把它们当作待开始工作。
+
+### P0：独立事件核心（已完成，物理上采用 core + harness + extension）
+
+不新增细粒度 crate；契约在 `agent-core`，SQLite adapter 在 `agent-extension`：
+
 - EventEnvelope、声明式 Filter、Once/Continuous Subscription；
 - Rust `EventClient`；
 - 内存 EventLog、SubscriptionStore、Dispatcher；
 - `publish/subscribe/unsubscribe` 确定性测试；
 - 不接 Chat UI。
 
-### P1：Timer 与 Harness bridge
+### P1：Timer 与 Harness bridge（已完成）
 
 - 一次性 Timer；
 - `WakeRun` delivery；
@@ -635,16 +648,16 @@ pub enum StepOutcome {
 - run 挂起时释放 worker；
 - cancel 清理等待订阅。
 
-### P2：SQLite durability
+### P2：SQLite durability（已完成）
 
 - EventLog、Subscription、Delivery、RunCheckpoint 持久化；
 - transaction + outbox；
 - worker lease、重启恢复、dead letter；
 - 审批和异步 Job 完整链路。
 
-### P3：JS bindings
+### P3：JS bindings（Flow ABI 已完成，完整 Host API 待扩展）
 
-- 独立、可选的 `mina-js-runtime`，使用 `rquickjs`/QuickJS；
+- Harness 中默认关闭的 `quickjs` feature，使用 `rquickjs`/QuickJS；
 - 专用有界 worker pool、内存限制和 interrupt deadline；
 - `mina.events`、`mina.timers`、`mina.jobs`、`mina.tools`、`mina.run.suspend`；
 - JS module capability manifest；
@@ -671,4 +684,4 @@ pub enum StepOutcome {
 8. 周期任务每次创建独立 run，避免永久 run；
 9. Chat UI 只是订阅/审批的一种 adapter，不进入核心协议；
 10. 所有外部输入先经过权限和 schema 验证，再成为可信事件。
-11. JS adapter 默认使用独立可选的 `mina-js-runtime` + `rquickjs`，事件核心不依赖任何 JS 引擎。
+11. JS adapter 默认使用 `agent-core::script` 的可选 `quickjs` feature；Event Runtime contract 和默认 Core 构建不依赖具体 JS 引擎。

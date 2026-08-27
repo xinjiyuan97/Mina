@@ -15,7 +15,7 @@ type RunUsage = {
   source?: "provider_reported" | "estimator_fallback" | "mixed";
 };
 
-type SessionState = {
+export type RunTransportSession = {
   sessionId: string;
   revision: number;
   activeRunId?: string;
@@ -26,9 +26,13 @@ type RunAccepted = {
   run_id: string;
   session_revision: number;
   replayed: boolean;
+  max_steps: number;
 };
 
-const SESSION_STORAGE_KEY = "mina.chat.session.v1";
+type ResumeRunRequest = {
+  runId: string;
+  follow: boolean;
+};
 
 type RunEvent = {
   run_id: string;
@@ -54,42 +58,52 @@ type RunEvent = {
   retryable?: boolean;
 };
 
-export function createRunTransport(options: { onRunFinished?: () => void } = {}): ChatTransport {
-  let sessionState: SessionState | null = null;
+export function createRunTransport(
+  options: {
+    session: RunTransportSession;
+    onRunStarted?: (runId: string) => void;
+    onRunPaused?: (sessionId: string, runId: string) => void;
+    onRunFinished?: (sessionId: string) => void;
+    maxSteps?: number;
+  },
+): ChatTransport {
+  let sessionState = options.session;
 
   return {
     async *send(request, context) {
       let messageStarted = false;
       let activeOutput: "reasoning" | "text" | null = null;
       let finished = false;
+      let suspended = false;
+      let lastSeq = 0;
       let usage: RunUsage | undefined;
-      let activeRunId: string | null = null;
-      let cancellationSent = false;
+      const resume = getResumeRunRequest(request);
+      let runId: string;
 
-      function propagateCancellation() {
-        if (!activeRunId || cancellationSent) return;
-        cancellationSent = true;
-        void fetch(`/api/v1/runs/${encodeURIComponent(activeRunId)}/cancel`, {
-          method: "POST",
-          keepalive: true,
-        }).catch(() => {
-          // The local abort still stops rendering. The server-side run timeout
-          // remains the final safety net if this best-effort request cannot land.
-        });
+      if (resume) {
+        const expectedRunId = sessionState.activeRunId;
+        const refreshed = await refreshSession(sessionState, context.signal);
+        if (expectedRunId !== resume.runId && refreshed.activeRunId !== resume.runId) {
+          throw protocolError("Session 当前没有这个可恢复的 Run");
+        }
+        sessionState = refreshed;
+        runId = resume.runId;
+      } else {
+        const input = getRequestInput(request);
+        const accepted = await submitSessionRun(
+          sessionState,
+          input,
+          options.maxSteps,
+          context.signal,
+        );
+        runId = accepted.run_id;
+        sessionState = {
+          sessionId: accepted.session_id,
+          revision: accepted.session_revision,
+          activeRunId: accepted.run_id,
+        };
       }
-
-      context.signal.addEventListener("abort", propagateCancellation, { once: true });
-
-      const input = getRequestInput(request);
-      sessionState = await ensureSession(sessionState, context.signal);
-      const accepted = await submitSessionRun(sessionState, input, context.signal);
-      activeRunId = accepted.run_id;
-      sessionState = {
-        sessionId: accepted.session_id,
-        revision: accepted.session_revision,
-      };
-      saveSessionState(sessionState);
-      if (context.signal.aborted) propagateCancellation();
+      options.onRunStarted?.(runId);
 
       function closeActiveOutput(): ChatEvent[] {
         if (activeOutput === "reasoning") {
@@ -103,14 +117,12 @@ export function createRunTransport(options: { onRunFinished?: () => void } = {})
         return [];
       }
 
-      const transport = createSSETransport({
-        url: `/api/v1/runs/${encodeURIComponent(accepted.run_id)}/events?after_seq=0`,
-        method: "GET",
-        fetch(input, init) {
-          return globalThis.fetch(input, { ...init, method: "GET", body: undefined });
-        },
-        mapEvent(message) {
+      const mapEvent = (message: SSEMessage): ChatEvent | ChatEvent[] | null => {
+          if (message.event === "run_stream_error") {
+            throw parseStreamError(message);
+          }
           const event = parseRunEvent(message);
+          lastSeq = Math.max(lastSeq, event.seq);
 
           switch (event.type) {
             case "run_started":
@@ -119,11 +131,18 @@ export function createRunTransport(options: { onRunFinished?: () => void } = {})
                 throw protocolError("后端重复发送了 run_started");
               }
               messageStarted = true;
-              activeRunId = event.run_id;
-              if (context.signal.aborted) propagateCancellation();
-              // Keep the optimistic local id while streaming deltas.
-              // message id while deltas are in flight, so keep the local id.
+              suspended = false;
               return { type: "message-start" };
+
+            case "run_resumed":
+              assertRunning(messageStarted, finished);
+              suspended = false;
+              return null;
+
+            case "run_waiting":
+              assertRunning(messageStarted, finished);
+              suspended = true;
+              return closeActiveOutput();
 
             case "output_delta": {
               assertRunning(messageStarted, finished);
@@ -328,31 +347,70 @@ export function createRunTransport(options: { onRunFinished?: () => void } = {})
               // this client does not render, but still require a known terminal.
               return null;
           }
-        },
-      });
+        };
+
+      function eventTransport(afterSeq: number, follow: boolean) {
+        return createSSETransport({
+          url: runEventsUrl(runId, afterSeq, follow),
+          method: "GET",
+          fetch(input, init) {
+            return globalThis.fetch(input, { ...init, method: "GET", body: undefined });
+          },
+          mapEvent,
+        });
+      }
 
       try {
-        for await (const event of transport.send(request, context)) {
+        const initialFollow = resume?.follow ?? true;
+        for await (const event of eventTransport(0, initialFollow).send(request, context)) {
           yield event;
         }
 
-        if (!finished && !context.signal.aborted) {
+        // Hydration first performs a finite replay. If the persisted projection
+        // says the run is currently executing, attach from the replay cursor;
+        // a deliberately suspended run stays idle with its approval card visible.
+        if (resume && !resume.follow && !finished && !suspended && !context.signal.aborted) {
+          for await (const event of eventTransport(lastSeq, true).send(request, context)) {
+            yield event;
+          }
+        }
+
+        if (!finished && !suspended && !context.signal.aborted) {
           throw protocolError("Agent 事件流在终态之前结束");
         }
       } finally {
-        context.signal.removeEventListener("abort", propagateCancellation);
-        if (finished && sessionState) {
+        if (finished) {
           const currentSession = sessionState;
           const refreshed = await refreshFinalizedSession(currentSession).catch(
             () => currentSession,
           );
           sessionState = refreshed;
-          saveSessionState(refreshed);
-          options.onRunFinished?.();
+          options.onRunFinished?.(refreshed.sessionId);
+        } else if (suspended) {
+          const refreshed = await refreshSession(sessionState).catch(() => sessionState);
+          sessionState = refreshed;
+          options.onRunPaused?.(refreshed.sessionId, runId);
         }
       }
     },
   };
+}
+
+function getResumeRunRequest(request: SendRequest): ResumeRunRequest | null {
+  const candidate = request.body?.minaResumeRun;
+  if (!isRecord(candidate)) return null;
+  if (typeof candidate.runId !== "string" || typeof candidate.follow !== "boolean") {
+    throw protocolError("恢复 Run 的请求参数无效");
+  }
+  return { runId: candidate.runId, follow: candidate.follow };
+}
+
+function runEventsUrl(runId: string, afterSeq: number, follow: boolean) {
+  const query = new URLSearchParams({
+    after_seq: String(afterSeq),
+    follow: String(follow),
+  });
+  return `/api/v1/runs/${encodeURIComponent(runId)}/events?${query.toString()}`;
 }
 
 function getRequestInput(request: SendRequest) {
@@ -366,35 +424,10 @@ function getRequestInput(request: SendRequest) {
   return input;
 }
 
-async function ensureSession(
-  current: SessionState | null,
-  signal: AbortSignal,
-): Promise<SessionState> {
-  const stored = current ?? loadSessionState();
-  if (stored) {
-    const refreshed = await refreshSession(stored, signal).catch(() => null);
-    if (refreshed) return refreshed;
-  }
-
-  const response = await fetch("/api/v1/sessions", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ agent_profile: "default" }),
-    signal,
-  });
-  if (!response.ok) throw await responseError(response, "创建会话失败");
-  const session = (await response.json()) as { session_id?: unknown; revision?: unknown };
-  if (typeof session.session_id !== "string" || typeof session.revision !== "number") {
-    throw protocolError("后端返回了无效的 Session");
-  }
-  const created = { sessionId: session.session_id, revision: session.revision };
-  saveSessionState(created);
-  return created;
-}
-
 async function submitSessionRun(
-  session: SessionState,
+  session: RunTransportSession,
   input: string,
+  maxSteps: number | undefined,
   signal: AbortSignal,
 ): Promise<RunAccepted> {
   const response = await fetch(
@@ -406,6 +439,7 @@ async function submitSessionRun(
         input,
         expected_revision: session.revision,
         idempotency_key: crypto.randomUUID(),
+        ...(maxSteps === undefined ? {} : { max_steps: maxSteps }),
       }),
       signal,
     },
@@ -416,7 +450,8 @@ async function submitSessionRun(
     typeof accepted.session_id !== "string" ||
     typeof accepted.run_id !== "string" ||
     typeof accepted.session_revision !== "number" ||
-    typeof accepted.replayed !== "boolean"
+    typeof accepted.replayed !== "boolean" ||
+    typeof accepted.max_steps !== "number"
   ) {
     throw protocolError("后端返回了无效的 RunAccepted");
   }
@@ -424,9 +459,9 @@ async function submitSessionRun(
 }
 
 async function refreshSession(
-  session: SessionState,
+  session: RunTransportSession,
   signal?: AbortSignal,
-): Promise<SessionState> {
+): Promise<RunTransportSession> {
   const response = await fetch(
     `/api/v1/sessions/${encodeURIComponent(session.sessionId)}`,
     { signal },
@@ -448,7 +483,9 @@ async function refreshSession(
   };
 }
 
-async function refreshFinalizedSession(session: SessionState): Promise<SessionState> {
+async function refreshFinalizedSession(
+  session: RunTransportSession,
+): Promise<RunTransportSession> {
   let current = session;
   for (let attempt = 0; attempt < 20; attempt += 1) {
     current = await refreshSession(current);
@@ -456,28 +493,6 @@ async function refreshFinalizedSession(session: SessionState): Promise<SessionSt
     await new Promise<void>((resolve) => setTimeout(resolve, 25));
   }
   return current;
-}
-
-function loadSessionState(): SessionState | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const parsed = JSON.parse(window.localStorage.getItem(SESSION_STORAGE_KEY) ?? "null") as {
-      sessionId?: unknown;
-      revision?: unknown;
-    } | null;
-    return parsed &&
-      typeof parsed.sessionId === "string" &&
-      typeof parsed.revision === "number"
-      ? { sessionId: parsed.sessionId, revision: parsed.revision }
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function saveSessionState(session: SessionState) {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
 }
 
 async function responseError(response: Response, fallback: string) {
@@ -512,6 +527,16 @@ function parseRunEvent(message: SSEMessage): RunEvent {
   }
 
   return parsed as RunEvent;
+}
+
+function parseStreamError(message: SSEMessage) {
+  try {
+    const payload = JSON.parse(message.data) as { message?: unknown };
+    if (typeof payload.message === "string") return new TransportError(payload.message);
+  } catch {
+    // Fall through to the stable error shown by the chat surface.
+  }
+  return new TransportError("Run 事件流读取失败");
 }
 
 function assertRunning(started: boolean, finished: boolean) {

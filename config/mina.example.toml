@@ -11,6 +11,36 @@ max_steps = 8
 run_timeout_seconds = 300
 model_timeout_seconds = 120
 tool_timeout_seconds = 30
+# Only tools explicitly declaring parallel-safe, immediate execution overlap.
+tool_call_strategy = "parallel-safe" # sequential | parallel-safe
+
+# Numeric Tool review filter, analogous to a logging threshold:
+# Low=10, Medium=50, High=90. Use 0 for all Tools or 100 for none.
+[approval]
+review_level = 50
+
+# Embedded, dependency-free-on-the-host JavaScript runtime. Source and input
+# are digest-only in public events and ordinary logs.
+[script.quickjs]
+enabled = true
+max_source_bytes = 262144
+timeout_ms = 2000
+memory_bytes = 33554432
+max_stack_bytes = 1048576
+max_output_bytes = 1048576
+max_concurrent_executions = 2
+
+# Run-scoped Agent Defined Functions. The foundational profile only permits
+# synchronous, capability-free JavaScript functions.
+[adf]
+enabled = true
+max_active_per_run = 8
+
+# Durable background jobs exposed through the medium-risk `async_job` tool.
+# The server only dispatches kinds on this explicit host allowlist.
+[jobs]
+enabled = true
+allowed_kinds = ["builtin.delay"]
 
 # Upper orchestration layer. All concrete implementations are selected here;
 # AgentLoop only consumes the resulting context and allowed tool set.

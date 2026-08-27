@@ -169,6 +169,7 @@ impl ContextEngine {
         let compression = self
             .compressor
             .compress(CompressionRequest {
+                run_id: request.run_id,
                 candidates,
                 source_digest: source_digest.clone(),
                 budget: request.budget.clone(),

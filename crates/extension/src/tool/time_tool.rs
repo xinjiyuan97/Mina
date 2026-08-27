@@ -1,5 +1,6 @@
 use agent_core::harness::{
-    Tool, ToolCallFuture, ToolCallRequest, ToolDefinition, ToolError, ToolOutput,
+    Tool, ToolCallFuture, ToolCallRequest, ToolConcurrency, ToolDefinition, ToolError,
+    ToolExecutionPolicy, ToolOutput, ToolRetryPolicy,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -16,6 +17,11 @@ impl Tool for GetCurrentTimeTool {
                 "properties": {},
                 "additionalProperties": false
             }),
+        )
+        .with_execution_policy(
+            ToolExecutionPolicy::read_only()
+                .with_concurrency(ToolConcurrency::ParallelSafe)
+                .with_retry(ToolRetryPolicy::bounded(2, 25, 100)),
         )
     }
 

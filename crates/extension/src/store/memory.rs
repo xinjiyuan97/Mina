@@ -1,15 +1,17 @@
 use std::{
     collections::HashMap,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use agent_core::memory::{
-    ForgetMemory, MemoryComponentDescriptor, MemoryError, MemoryFuture, MemoryId, MemoryKind,
-    MemoryListQuery, MemoryLocator, MemoryPage, MemoryRecord, MemoryRetrieveRequest,
-    MemoryRetriever, MemoryStore, PutMemory, RankedMemory, SupersedeMemory, content_text,
+    CreateMemoryWriteProposal, ForgetMemory, MemoryApprovalId, MemoryApprovalStatus,
+    MemoryComponentDescriptor, MemoryError, MemoryFuture, MemoryId, MemoryKind, MemoryListQuery,
+    MemoryLocator, MemoryPage, MemoryProposalStore, MemoryRecord, MemoryRetrieveRequest,
+    MemoryRetriever, MemoryStore, MemoryWriteProposal, PutMemory, RankedMemory,
+    ResolveMemoryWriteProposal, SupersedeMemory, content_text,
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 
@@ -25,6 +27,7 @@ struct StoredMemory {
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryMemoryStore {
     records: Arc<Mutex<HashMap<MemoryId, StoredMemory>>>,
+    proposals: Arc<Mutex<HashMap<MemoryApprovalId, MemoryWriteProposal>>>,
 }
 
 impl InMemoryMemoryStore {
@@ -34,6 +37,96 @@ impl InMemoryMemoryStore {
         self.records
             .lock()
             .map_err(|_| MemoryError::backend("in-memory memory store lock was poisoned"))
+    }
+}
+
+impl MemoryProposalStore for InMemoryMemoryStore {
+    fn descriptor(&self) -> MemoryComponentDescriptor {
+        descriptor("memory-proposal:in-memory", "in_memory_proposal_store")
+    }
+
+    fn create(&self, command: CreateMemoryWriteProposal) -> MemoryFuture<'_, MemoryWriteProposal> {
+        Box::pin(async move {
+            let mut proposals = self
+                .proposals
+                .lock()
+                .map_err(|_| MemoryError::backend("in-memory proposal lock was poisoned"))?;
+            let id = command.proposal.approval_id;
+            if let Some(existing) = proposals.get(&id) {
+                if existing == &command.proposal {
+                    return Ok(existing.clone());
+                }
+                return Err(MemoryError::Invalid(
+                    "memory approval id was reused with different content".into(),
+                ));
+            }
+            if command.proposal.status != MemoryApprovalStatus::Pending {
+                return Err(MemoryError::Invalid(
+                    "new memory write proposals must be pending".into(),
+                ));
+            }
+            proposals.insert(id, command.proposal.clone());
+            Ok(command.proposal)
+        })
+    }
+
+    fn get_proposal(
+        &self,
+        approval_id: MemoryApprovalId,
+    ) -> MemoryFuture<'_, Option<MemoryWriteProposal>> {
+        Box::pin(async move {
+            Ok(self
+                .proposals
+                .lock()
+                .map_err(|_| MemoryError::backend("in-memory proposal lock was poisoned"))?
+                .get(&approval_id)
+                .cloned())
+        })
+    }
+
+    fn resolve_proposal(
+        &self,
+        command: ResolveMemoryWriteProposal,
+    ) -> MemoryFuture<'_, MemoryWriteProposal> {
+        Box::pin(async move {
+            validate_resolution(&command)?;
+            let mut proposals = self
+                .proposals
+                .lock()
+                .map_err(|_| MemoryError::backend("in-memory proposal lock was poisoned"))?;
+            let proposal = proposals
+                .get_mut(&command.approval_id)
+                .ok_or(MemoryError::Invalid("memory approval was not found".into()))?;
+            if proposal.status != MemoryApprovalStatus::Pending {
+                if proposal.status == command.decision {
+                    return Ok(proposal.clone());
+                }
+                return Err(MemoryError::Invalid(
+                    "memory approval was already resolved differently".into(),
+                ));
+            }
+            proposal.status = command.decision;
+            proposal.resolved_at_ms = Some(command.resolved_at_ms);
+            proposal.resolution_reason = command.reason;
+            Ok(proposal.clone())
+        })
+    }
+
+    fn pending_proposals(&self, limit: usize) -> MemoryFuture<'_, Vec<MemoryWriteProposal>> {
+        Box::pin(async move {
+            let mut pending = self
+                .proposals
+                .lock()
+                .map_err(|_| MemoryError::backend("in-memory proposal lock was poisoned"))?
+                .values()
+                .filter(|proposal| proposal.status == MemoryApprovalStatus::Pending)
+                .cloned()
+                .collect::<Vec<_>>();
+            pending
+                .sort_by_key(|proposal| (proposal.created_at_ms, proposal.approval_id.to_string()));
+            pending.truncate(limit.clamp(1, MAX_PAGE_SIZE));
+            Ok(pending)
+        })
     }
 }
 
@@ -199,7 +292,7 @@ impl MemoryRetriever for InMemoryMemoryStore {
 
 #[derive(Debug, Clone)]
 pub struct SqliteMemoryStore {
-    path: Arc<PathBuf>,
+    connection: Arc<Mutex<Connection>>,
     identity: String,
 }
 
@@ -217,13 +310,14 @@ impl SqliteMemoryStore {
             })?;
         }
         let migration_path = path.clone();
-        run_blocking(move || {
+        let connection = run_blocking(move || {
             let connection = connect(&migration_path)?;
-            migrate(&connection)
+            migrate(&connection)?;
+            Ok(connection)
         })
         .await?;
         Ok(Self {
-            path: Arc::new(path),
+            connection: Arc::new(Mutex::new(connection)),
             identity: identity.into(),
         })
     }
@@ -235,11 +329,11 @@ impl MemoryStore for SqliteMemoryStore {
     }
 
     fn put(&self, command: PutMemory) -> MemoryFuture<'_, MemoryRecord> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_blocking(move || {
                 validate_record(&command.record)?;
-                let mut connection = connect(&path)?;
+                let mut connection = lock_connection(&connection)?;
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(|error| sql_error("begin memory put", error))?;
@@ -260,10 +354,10 @@ impl MemoryStore for SqliteMemoryStore {
     }
 
     fn get(&self, locator: MemoryLocator) -> MemoryFuture<'_, Option<MemoryRecord>> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_blocking(move || {
-                let connection = connect(&path)?;
+                let connection = lock_connection(&connection)?;
                 Ok(
                     load_record(&connection, locator.memory_id, false)?.filter(|record| {
                         locator
@@ -277,10 +371,10 @@ impl MemoryStore for SqliteMemoryStore {
     }
 
     fn list(&self, query: MemoryListQuery) -> MemoryFuture<'_, MemoryPage> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_blocking(move || {
-                let connection = connect(&path)?;
+                let connection = lock_connection(&connection)?;
                 let mut statement = connection
                     .prepare(
                         "SELECT record_json FROM memory_records
@@ -309,10 +403,10 @@ impl MemoryStore for SqliteMemoryStore {
     }
 
     fn supersede(&self, mut command: SupersedeMemory) -> MemoryFuture<'_, MemoryRecord> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_blocking(move || {
-                let mut connection = connect(&path)?;
+                let mut connection = lock_connection(&connection)?;
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(|error| sql_error("begin memory supersede", error))?;
@@ -350,10 +444,10 @@ impl MemoryStore for SqliteMemoryStore {
     }
 
     fn forget(&self, command: ForgetMemory) -> MemoryFuture<'_, ()> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_blocking(move || {
-                let mut connection = connect(&path)?;
+                let mut connection = lock_connection(&connection)?;
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(|error| sql_error("begin memory forget", error))?;
@@ -389,17 +483,177 @@ impl MemoryStore for SqliteMemoryStore {
     }
 }
 
+impl MemoryProposalStore for SqliteMemoryStore {
+    fn descriptor(&self) -> MemoryComponentDescriptor {
+        descriptor(
+            &format!("{}:proposals", self.identity),
+            "sqlite_memory_proposal_store",
+        )
+    }
+
+    fn create(&self, command: CreateMemoryWriteProposal) -> MemoryFuture<'_, MemoryWriteProposal> {
+        let connection = Arc::clone(&self.connection);
+        Box::pin(async move {
+            run_blocking(move || {
+                if command.proposal.status != MemoryApprovalStatus::Pending {
+                    return Err(MemoryError::Invalid(
+                        "new memory write proposals must be pending".into(),
+                    ));
+                }
+                let connection = lock_connection(&connection)?;
+                let encoded = encode_proposal(&command.proposal)?;
+                if let Some(existing_json) = connection
+                    .query_row(
+                        "SELECT proposal_json FROM memory_write_proposals WHERE approval_id = ?1",
+                        [command.proposal.approval_id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| sql_error("read replayed memory proposal", error))?
+                {
+                    let existing = decode_proposal(&existing_json)?;
+                    if existing == command.proposal {
+                        return Ok(existing);
+                    }
+                    return Err(MemoryError::Invalid(
+                        "memory approval id was reused with different content".into(),
+                    ));
+                }
+                connection
+                    .execute(
+                        "INSERT INTO memory_write_proposals (
+                            approval_id, status, created_at_ms, resolved_at_ms, proposal_json
+                         ) VALUES (?1, 'pending', ?2, NULL, ?3)",
+                        params![
+                            command.proposal.approval_id.to_string(),
+                            command.proposal.created_at_ms,
+                            encoded,
+                        ],
+                    )
+                    .map_err(|error| sql_error("insert memory proposal", error))?;
+                Ok(command.proposal)
+            })
+            .await
+        })
+    }
+
+    fn get_proposal(
+        &self,
+        approval_id: MemoryApprovalId,
+    ) -> MemoryFuture<'_, Option<MemoryWriteProposal>> {
+        let connection = Arc::clone(&self.connection);
+        Box::pin(async move {
+            run_blocking(move || {
+                let connection = lock_connection(&connection)?;
+                connection
+                    .query_row(
+                        "SELECT proposal_json FROM memory_write_proposals WHERE approval_id = ?1",
+                        [approval_id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| sql_error("read memory proposal", error))?
+                    .map(|json| decode_proposal(&json))
+                    .transpose()
+            })
+            .await
+        })
+    }
+
+    fn resolve_proposal(
+        &self,
+        command: ResolveMemoryWriteProposal,
+    ) -> MemoryFuture<'_, MemoryWriteProposal> {
+        let connection = Arc::clone(&self.connection);
+        Box::pin(async move {
+            validate_resolution(&command)?;
+            run_blocking(move || {
+                let mut connection = lock_connection(&connection)?;
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|error| sql_error("begin memory proposal resolution", error))?;
+                let json = transaction
+                    .query_row(
+                        "SELECT proposal_json FROM memory_write_proposals WHERE approval_id = ?1",
+                        [command.approval_id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| sql_error("load memory proposal for resolution", error))?
+                    .ok_or_else(|| MemoryError::Invalid("memory approval was not found".into()))?;
+                let mut proposal = decode_proposal(&json)?;
+                if proposal.status != MemoryApprovalStatus::Pending {
+                    if proposal.status == command.decision {
+                        return Ok(proposal);
+                    }
+                    return Err(MemoryError::Invalid(
+                        "memory approval was already resolved differently".into(),
+                    ));
+                }
+                proposal.status = command.decision;
+                proposal.resolved_at_ms = Some(command.resolved_at_ms);
+                proposal.resolution_reason = command.reason;
+                transaction
+                    .execute(
+                        "UPDATE memory_write_proposals SET status = ?1, resolved_at_ms = ?2,
+                            proposal_json = ?3 WHERE approval_id = ?4",
+                        params![
+                            approval_status_key(proposal.status),
+                            proposal.resolved_at_ms,
+                            encode_proposal(&proposal)?,
+                            proposal.approval_id.to_string(),
+                        ],
+                    )
+                    .map_err(|error| sql_error("resolve memory proposal", error))?;
+                transaction
+                    .commit()
+                    .map_err(|error| sql_error("commit memory proposal resolution", error))?;
+                Ok(proposal)
+            })
+            .await
+        })
+    }
+
+    fn pending_proposals(&self, limit: usize) -> MemoryFuture<'_, Vec<MemoryWriteProposal>> {
+        let connection = Arc::clone(&self.connection);
+        Box::pin(async move {
+            run_blocking(move || {
+                let connection = lock_connection(&connection)?;
+                let mut statement = connection
+                    .prepare(
+                        "SELECT proposal_json FROM memory_write_proposals
+                         WHERE status = 'pending' ORDER BY created_at_ms, approval_id LIMIT ?1",
+                    )
+                    .map_err(|error| sql_error("prepare pending memory proposals", error))?;
+                let rows = statement
+                    .query_map(
+                        [i64::try_from(limit.clamp(1, MAX_PAGE_SIZE)).unwrap_or(i64::MAX)],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(|error| sql_error("query pending memory proposals", error))?;
+                rows.map(|row| {
+                    decode_proposal(
+                        &row.map_err(|error| sql_error("read pending memory proposal", error))?,
+                    )
+                })
+                .collect()
+            })
+            .await
+        })
+    }
+}
+
 impl MemoryRetriever for SqliteMemoryStore {
     fn descriptor(&self) -> MemoryComponentDescriptor {
         descriptor(&format!("{}:fts", self.identity), "sqlite_fts_retriever")
     }
 
     fn retrieve(&self, request: MemoryRetrieveRequest) -> MemoryFuture<'_, Vec<RankedMemory>> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         let strategy = MemoryRetriever::descriptor(self);
         Box::pin(async move {
             run_blocking(move || {
-                let connection = connect(&path)?;
+                let connection = lock_connection(&connection)?;
                 let terms = query_terms(&request.query);
                 let mut candidates = Vec::<(MemoryRecord, f32, String)>::new();
                 if terms.is_empty() {
@@ -551,6 +805,14 @@ fn connect(path: &Path) -> Result<Connection, MemoryError> {
     Ok(connection)
 }
 
+fn lock_connection(
+    connection: &Mutex<Connection>,
+) -> Result<std::sync::MutexGuard<'_, Connection>, MemoryError> {
+    connection
+        .lock()
+        .map_err(|_| MemoryError::backend("SQLite memory connection lock was poisoned"))
+}
+
 fn migrate(connection: &Connection) -> Result<(), MemoryError> {
     connection
         .execute_batch(
@@ -571,9 +833,51 @@ fn migrate(connection: &Connection) -> Result<(), MemoryError> {
              CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
                 content, memory_id UNINDEXED
              );
+             CREATE TABLE IF NOT EXISTS memory_write_proposals (
+                approval_id TEXT PRIMARY KEY NOT NULL,
+                status TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                resolved_at_ms INTEGER,
+                proposal_json TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS memory_write_proposals_pending_idx
+                ON memory_write_proposals(status, created_at_ms);
              COMMIT;",
         )
         .map_err(|error| sql_error("create memory schema", error))
+}
+
+fn validate_resolution(command: &ResolveMemoryWriteProposal) -> Result<(), MemoryError> {
+    if !matches!(
+        command.decision,
+        MemoryApprovalStatus::Approved
+            | MemoryApprovalStatus::Denied
+            | MemoryApprovalStatus::Expired
+    ) {
+        return Err(MemoryError::Invalid(
+            "memory approval resolution must be approved, denied, or expired".into(),
+        ));
+    }
+    Ok(())
+}
+
+const fn approval_status_key(status: MemoryApprovalStatus) -> &'static str {
+    match status {
+        MemoryApprovalStatus::Pending => "pending",
+        MemoryApprovalStatus::Approved => "approved",
+        MemoryApprovalStatus::Denied => "denied",
+        MemoryApprovalStatus::Expired => "expired",
+    }
+}
+
+fn encode_proposal(proposal: &MemoryWriteProposal) -> Result<String, MemoryError> {
+    serde_json::to_string(proposal)
+        .map_err(|error| MemoryError::backend(format!("encode memory proposal: {error}")))
+}
+
+fn decode_proposal(json: &str) -> Result<MemoryWriteProposal, MemoryError> {
+    serde_json::from_str(json)
+        .map_err(|error| MemoryError::backend(format!("decode memory proposal: {error}")))
 }
 
 fn insert_record(connection: &Connection, record: &MemoryRecord) -> Result<(), MemoryError> {
@@ -737,9 +1041,63 @@ mod tests {
         );
     }
 
+    async fn assert_proposal_contract(store: &dyn MemoryProposalStore) {
+        let proposal = MemoryWriteProposal {
+            approval_id: MemoryApprovalId::new(),
+            candidate: agent_core::memory::MemoryCandidate {
+                proposed: record("private preference", 30),
+                sensitivity: agent_core::memory::MemorySensitivity::Private,
+                extraction_reason: "explicit memory phrase".into(),
+            },
+            reason: "private content requires approval".into(),
+            status: MemoryApprovalStatus::Pending,
+            created_at_ms: 30,
+            resolved_at_ms: None,
+            resolution_reason: None,
+        };
+        store
+            .create(CreateMemoryWriteProposal {
+                proposal: proposal.clone(),
+            })
+            .await
+            .expect("proposal should persist");
+        store
+            .create(CreateMemoryWriteProposal {
+                proposal: proposal.clone(),
+            })
+            .await
+            .expect("proposal replay should be idempotent");
+        assert_eq!(
+            store
+                .pending_proposals(10)
+                .await
+                .expect("pending proposals should load"),
+            vec![proposal.clone()]
+        );
+        let resolved = store
+            .resolve_proposal(ResolveMemoryWriteProposal {
+                approval_id: proposal.approval_id,
+                decision: MemoryApprovalStatus::Approved,
+                reason: Some("approved in test".into()),
+                resolved_at_ms: 40,
+            })
+            .await
+            .expect("proposal should resolve");
+        assert_eq!(resolved.status, MemoryApprovalStatus::Approved);
+        assert!(
+            store
+                .pending_proposals(10)
+                .await
+                .expect("pending query should work")
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn in_memory_adapter_obeys_store_contract() {
-        assert_store_contract(&InMemoryMemoryStore::default()).await;
+        let store = InMemoryMemoryStore::default();
+        assert_store_contract(&store).await;
+        assert_proposal_contract(&store).await;
     }
 
     #[tokio::test]
@@ -748,6 +1106,7 @@ mod tests {
         let store = SqliteMemoryStore::open(directory.path().join("state.sqlite3"), "test")
             .await
             .expect("store should open");
+        assert_proposal_contract(&store).await;
         let searchable = record("Mina uses a durable SQLite memory index", 1);
         store
             .put(PutMemory {

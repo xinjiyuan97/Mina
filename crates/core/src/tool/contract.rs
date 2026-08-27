@@ -20,6 +20,8 @@ pub struct ToolDefinition {
     pub input_schema: Value,
     #[serde(default)]
     pub risk_level: ToolRiskLevel,
+    #[serde(default)]
+    pub execution: ToolExecutionPolicy,
 }
 
 impl ToolDefinition {
@@ -34,6 +36,7 @@ impl ToolDefinition {
             description: description.into(),
             input_schema,
             risk_level: ToolRiskLevel::default(),
+            execution: ToolExecutionPolicy::default(),
         }
     }
 
@@ -41,6 +44,166 @@ impl ToolDefinition {
     pub const fn with_risk_level(mut self, risk_level: ToolRiskLevel) -> Self {
         self.risk_level = risk_level;
         self
+    }
+
+    #[must_use]
+    pub const fn with_execution_policy(mut self, execution: ToolExecutionPolicy) -> Self {
+        self.execution = execution;
+        self
+    }
+}
+
+/// Whether repeating the same logical invocation is safe. A retryable error
+/// is only guidance; automatic replay additionally requires ReadOnly or
+/// Idempotent here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolIdempotency {
+    #[default]
+    Unknown,
+    ReadOnly,
+    Idempotent,
+}
+
+impl ToolIdempotency {
+    #[must_use]
+    pub const fn permits_automatic_retry(self) -> bool {
+        matches!(self, Self::ReadOnly | Self::Idempotent)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolConcurrency {
+    #[default]
+    Exclusive,
+    ParallelSafe,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCompletion {
+    #[default]
+    Immediate,
+    MaySuspend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolRetryPolicy {
+    pub max_attempts: u32,
+    pub initial_backoff_ms: u64,
+    pub max_backoff_ms: u64,
+}
+
+impl Default for ToolRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 1,
+            initial_backoff_ms: 100,
+            max_backoff_ms: 1_000,
+        }
+    }
+}
+
+impl ToolRetryPolicy {
+    #[must_use]
+    pub const fn bounded(max_attempts: u32, initial_backoff_ms: u64, max_backoff_ms: u64) -> Self {
+        Self {
+            max_attempts,
+            initial_backoff_ms,
+            max_backoff_ms,
+        }
+    }
+
+    #[must_use]
+    pub fn delay_for_attempt(self, completed_attempts: u32) -> u64 {
+        let exponent = completed_attempts.saturating_sub(1).min(20);
+        self.initial_backoff_ms
+            .saturating_mul(1_u64 << exponent)
+            .min(self.max_backoff_ms)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExecutionPolicy {
+    #[serde(default)]
+    pub idempotency: ToolIdempotency,
+    #[serde(default)]
+    pub concurrency: ToolConcurrency,
+    #[serde(default)]
+    pub completion: ToolCompletion,
+    #[serde(default)]
+    pub retry: ToolRetryPolicy,
+}
+
+impl ToolExecutionPolicy {
+    #[must_use]
+    pub const fn read_only() -> Self {
+        Self {
+            idempotency: ToolIdempotency::ReadOnly,
+            concurrency: ToolConcurrency::Exclusive,
+            completion: ToolCompletion::Immediate,
+            retry: ToolRetryPolicy {
+                max_attempts: 1,
+                initial_backoff_ms: 100,
+                max_backoff_ms: 1_000,
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn idempotent() -> Self {
+        Self {
+            idempotency: ToolIdempotency::Idempotent,
+            ..Self::read_only()
+        }
+    }
+
+    #[must_use]
+    pub const fn with_concurrency(mut self, concurrency: ToolConcurrency) -> Self {
+        self.concurrency = concurrency;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_completion(mut self, completion: ToolCompletion) -> Self {
+        self.completion = completion;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_retry(mut self, retry: ToolRetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    pub fn validate(self) -> Result<(), ContractError> {
+        if self.retry.max_attempts == 0 || self.retry.max_attempts > 5 {
+            return Err(ContractError::InvalidToolExecutionPolicy(
+                "retry.max_attempts must be between 1 and 5".into(),
+            ));
+        }
+        if self.retry.initial_backoff_ms == 0
+            || self.retry.max_backoff_ms < self.retry.initial_backoff_ms
+            || self.retry.max_backoff_ms > 60_000
+        {
+            return Err(ContractError::InvalidToolExecutionPolicy(
+                "retry backoff must be positive, ordered, and no greater than 60000ms".into(),
+            ));
+        }
+        if self.retry.max_attempts > 1 && !self.idempotency.permits_automatic_retry() {
+            return Err(ContractError::InvalidToolExecutionPolicy(
+                "automatic retries require read_only or idempotent semantics".into(),
+            ));
+        }
+        if self.concurrency == ToolConcurrency::ParallelSafe
+            && self.completion == ToolCompletion::MaySuspend
+        {
+            return Err(ContractError::InvalidToolExecutionPolicy(
+                "a suspending tool cannot be marked parallel_safe".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -55,6 +218,19 @@ pub enum ToolRiskLevel {
 }
 
 impl ToolRiskLevel {
+    /// Stable numeric severity used by host review filters. The public Tool
+    /// contract remains categorical so adding a host threshold does not break
+    /// existing manifests or cross-language adapters.
+    #[must_use]
+    pub const fn review_level(self) -> u8 {
+        match self {
+            Self::Low => 10,
+            Self::Medium => 50,
+            Self::High => 90,
+        }
+    }
+
+    /// Compatibility behavior used when no host policy is supplied.
     #[must_use]
     pub const fn requires_approval(self) -> bool {
         matches!(self, Self::Medium | Self::High)
@@ -109,6 +285,7 @@ impl ToolPluginManifest {
             if !names.insert(name) {
                 return Err(ContractError::DuplicateToolName(name.to_owned()));
             }
+            tool.execution.validate()?;
         }
         Ok(())
     }
@@ -258,6 +435,9 @@ impl ToolErrorCategory {
 pub enum ContractError {
     #[error("unsupported tool protocol version {0}")]
     UnsupportedProtocolVersion(u32),
+
+    #[error("invalid tool execution policy: {0}")]
+    InvalidToolExecutionPolicy(String),
     #[error("plugin name must not be empty")]
     EmptyPluginName,
     #[error("plugin version must not be empty")]

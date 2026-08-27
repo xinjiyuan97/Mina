@@ -104,6 +104,7 @@ impl MemoryWriter {
     ) -> Result<Vec<MemoryWriteOutcome>, MemoryError> {
         let mut outcomes = Vec::with_capacity(candidates.len());
         for candidate in candidates {
+            let pending_candidate = candidate.clone();
             match self.policy.decide(candidate).await? {
                 MemoryWriteDecision::Accept { normalized } => {
                     outcomes.push(MemoryWriteOutcome::Stored(
@@ -114,7 +115,10 @@ impl MemoryWriter {
                     outcomes.push(MemoryWriteOutcome::Rejected(reason));
                 }
                 MemoryWriteDecision::RequireApproval { reason } => {
-                    outcomes.push(MemoryWriteOutcome::ApprovalRequired(reason));
+                    outcomes.push(MemoryWriteOutcome::ApprovalRequired {
+                        candidate: pending_candidate,
+                        reason,
+                    });
                 }
             }
         }
@@ -126,7 +130,10 @@ impl MemoryWriter {
 pub enum MemoryWriteOutcome {
     Stored(MemoryRecord),
     Rejected(String),
-    ApprovalRequired(String),
+    ApprovalRequired {
+        candidate: MemoryCandidate,
+        reason: String,
+    },
 }
 
 fn detect_sensitivity(text: &str) -> MemorySensitivity {

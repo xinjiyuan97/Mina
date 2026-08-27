@@ -99,22 +99,27 @@ mina/
 │   ├── agent-cli/                # CLI composition root
 │   └── web/                      # Next.js 调试工作台
 ├── crates/
-│   ├── core/                     # agent-core：契约、Harness、纯运行逻辑、QuickJS
+│   ├── core/                     # agent-core：契约与 Agent 决策逻辑
+│   ├── harness/                  # agent-harness：宿主运行时、耐久编排、QuickJS
 │   └── extension/                # agent-extension：外部 Provider/Tool/Store/Sandbox/监控
 └── docs/
 ```
 
-细粒度 crate 已物理合并到两个包中；应用只依赖 `agent-core` 和 `agent-extension`。QuickJS 属于 Harness 的可选脚本运行能力，因此放在 Core；脚本能访问的文件、网络、工具和事件仍必须通过显式 Capability port 注入。
+细粒度 crate 已收敛为 `core + harness + extension` 三个产品级包。QuickJS 属于 Harness 的可选脚本运行能力；Core 只保留脚本契约。脚本能访问的文件、网络、工具和事件仍必须通过显式 Capability port 注入。
 
 ## 4. 依赖方向
 
 ```mermaid
 flowchart TD
     Apps[apps/server + apps/agent-cli] --> Core[agent-core]
+    Apps --> Harness[agent-harness]
     Apps --> Extension[agent-extension]
+    Harness --> Core
     Extension --> Core
-    Core --> Harness[Harness / AgentLoop / Run / Session]
+    Extension -. optional host types .-> Harness
+    Core --> Agent[AgentLoop / Run / Session contracts]
     Core --> Contracts[Tool / Sandbox / Memory / Skill / Observability contracts]
+    Harness --> Runtime[Run / Event / Job / Flow / QuickJS runtime]
     Extension --> Provider[OpenAI-compatible Provider]
     Extension --> Tools[Built-in Tools]
     Extension --> Adapters[Sandbox / SQLite / Filesystem / Tracing adapters]
@@ -122,10 +127,11 @@ flowchart TD
 
 必须遵守：
 
-1. `agent-core` 不依赖 `agent-extension`、Web 框架、数据库驱动或 Provider SDK。
-2. `agent-extension` 只能实现 Core 定义的端口，不得重新定义运行状态和公共事件。
-3. `apps/server` 与 `apps/agent-cli` 是 composition root，负责选择并装配具体实现。
-4. transport/provider adapter 可以依赖 Core 端口，Core 端口不能反向依赖 adapter。
+1. `agent-core` 不依赖 `agent-harness`、`agent-extension`、Web 框架、数据库驱动、QuickJS 或 Provider SDK。
+2. `agent-harness` 依赖 Core 契约，不依赖 Extension 的具体 adapter。
+3. `agent-extension` 只能实现 Core/Harness 定义的端口，不得重新定义运行状态和公共事件。
+4. `apps/server` 与 `apps/agent-cli` 是 composition root，负责选择并装配具体实现。
+5. transport/provider adapter 可以依赖 Core 端口，Core 端口不能反向依赖 adapter。
 
 可在 CI 用 `cargo deny`、workspace dependency 约束或简单的依赖图检查守住这些规则。
 

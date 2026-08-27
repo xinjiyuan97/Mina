@@ -22,11 +22,11 @@ Agent -> AgentEvent
             |
          RunEvent
             |
-       Server RunRuntime         负责后台执行、取消、durable-first 广播
+       Server RunRuntime         负责后台执行、取消、实时广播和持久化队列
           |          |
-       RunStore      SSE         Store 成功后才向订阅者广播
+       RunStore      SSE         非终态实时广播，终态通过持久化屏障
           |
-    SQLite adapter
+    SQLite adapter              长连接、批量事务
 ```
 
 `agent-core::harness::RunStore` 是端口，`agent-extension::store` 提供 adapter。Core 不依赖 SQLite，其他宿主可以实现 PostgreSQL、远端 KV 或自定义事件数据库。
@@ -42,17 +42,17 @@ Agent -> AgentEvent
 - 审批请求及其 resolution；
 - 创建和更新时间。
 
-当前 run 状态机：
+兼容执行与 durable Flow 合并后的 run 状态机：
 
 ```text
-Accepted -> Running -> WaitingApproval -> Running
-                   \-> ExecutingTool  -> Running
+Accepted -> Running -> WaitingApproval/WaitingEvent -> Running
+                   \-> ExecutingTool                  -> Running
 
-Accepted | Running | WaitingApproval | ExecutingTool
+Accepted | Running | WaitingApproval | WaitingEvent | ExecutingTool
                    -> Completed | Failed | Cancelled
 ```
 
-`Accepted -> Failed(run_interrupted)` 是有意允许的恢复路径：进程可能在创建持久化记录后、拉取第一个 `RunStarted` 事件前退出。
+`WaitingEvent` 必须同时有 versioned checkpoint、wait subscriptions 和已提交 outbox，启动后可以被匹配事件唤醒。`Accepted/Running/ExecutingTool -> Failed(run_interrupted)` 仍是有意允许的恢复路径：进程可能在没有安全 checkpoint 时退出，运行时不能重放任意模型流或未知副作用 Tool。
 
 `RunSnapshot::apply` 是状态转换的唯一实现，所有 Store adapter 都必须复用它。它校验：
 
@@ -73,6 +73,10 @@ pub trait RunStore: Send + Sync + 'static {
         event: RunEvent,
         observed_at_ms: i64,
     ) -> RunStoreFuture<'_, RunSnapshot>;
+    fn append_events(
+        &self,
+        events: Vec<ObservedRunEvent>,
+    ) -> RunStoreFuture<'_, RunSnapshot>;
     fn events_after(
         &self,
         run_id: RunId,
@@ -86,10 +90,11 @@ pub trait RunStore: Send + Sync + 'static {
 adapter 必须保证：
 
 1. event 插入和 snapshot 更新处于同一事务；
-2. 相同 `(run_id, seq)` 和相同内容可以幂等重放；
-3. 相同 key、不同内容返回 `EventConflict`；
-4. 缺号、跳号和终态后追加由统一投影拒绝；
-5. `events_after` 严格按 `seq` 升序返回。
+2. `append_events` 按输入顺序原子提交一个非空、连续的事件批次，只在批次末尾写一次最终 snapshot；
+3. 相同 `(run_id, seq)` 和相同内容可以幂等重放；
+4. 相同 key、不同内容返回 `EventConflict`；
+5. 缺号、跳号和终态后追加由统一投影拒绝；
+6. `events_after` 严格按 `seq` 升序返回。
 
 ## 5. SQLite adapter
 
@@ -105,7 +110,7 @@ data/runs.sqlite3
 MINA_RUN_STORE_PATH=/absolute/path/to/runs.sqlite3 pnpm dev:server
 ```
 
-SQLite 开启 WAL、foreign key 和 busy timeout。逻辑表为：
+SQLite 开启 WAL、foreign key 和 busy timeout。Run、Session 与 Context 共用一个进程级长生命周期连接，Memory 使用另一个长生命周期连接；PRAGMA 只在 adapter 启动时配置，不再为每次 Store 操作重新打开和关闭同一个文件。逻辑表为：
 
 ```text
 runs
@@ -124,7 +129,11 @@ JSON 保存版本化契约，索引列只服务查询和并发校验。Store 还
 
 - SSE 断开不会隐式取消 run；
 - 客户端停止操作仍通过显式 cancel API；
-- 每个事件先写 Store，成功后才广播；
+- 非终态事件先实时广播，再进入容量受限的后台持久化队列，SQLite 延迟不会直接阻断模型事件消费和 SSE；
+- writer 在最多 40ms 或 128 条事件内聚合写入；`output_delta` 和 `tool_call_arguments_delta` 可以等待短窗口，工具、审批、usage 和生命周期边界会立即刷新当前批次；
+- 聚合不会删除事件或改变 `seq`：批次中的事件仍可逐条精确重放，但只使用一个事务并只更新一次最终 snapshot；
+- `run_completed`、`run_failed` 和 `run_cancelled` 在后台 writer 清空并成功提交后才广播，形成终态持久化屏障；
+- 单次批量写入有 10 秒上限；队列有界，积压超过容量时向 Agent event stream 传播背压而不是无限占用内存；
 - 广播 receiver lagged 时从 Store 补齐缺失 seq；
 - 重连时先订阅活动广播，再读取历史，最后按 seq 去重，避免查询与订阅之间丢事件。
 

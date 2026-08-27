@@ -16,6 +16,37 @@ impl MemoryId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MemoryApprovalId(Uuid);
+
+impl MemoryApprovalId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for MemoryApprovalId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for MemoryApprovalId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::str::FromStr for MemoryApprovalId {
+    type Err = uuid::Error;
+
+    fn from_str(source: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(source).map(Self)
+    }
+}
+
 impl Default for MemoryId {
     fn default() -> Self {
         Self::new()
@@ -142,14 +173,15 @@ pub struct MemoryExtractionRequest {
     pub now_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryCandidate {
     pub proposed: MemoryRecord,
     pub sensitivity: MemorySensitivity,
     pub extraction_reason: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MemorySensitivity {
     Public,
     Private,
@@ -161,6 +193,39 @@ pub enum MemoryWriteDecision {
     Accept { normalized: PutMemory },
     Reject { reason: String },
     RequireApproval { reason: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryApprovalStatus {
+    Pending,
+    Approved,
+    Denied,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryWriteProposal {
+    pub approval_id: MemoryApprovalId,
+    pub candidate: MemoryCandidate,
+    pub reason: String,
+    pub status: MemoryApprovalStatus,
+    pub created_at_ms: i64,
+    pub resolved_at_ms: Option<i64>,
+    pub resolution_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateMemoryWriteProposal {
+    pub proposal: MemoryWriteProposal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveMemoryWriteProposal {
+    pub approval_id: MemoryApprovalId,
+    pub decision: MemoryApprovalStatus,
+    pub reason: Option<String>,
+    pub resolved_at_ms: i64,
 }
 
 pub type MemoryFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, MemoryError>> + Send + 'a>>;
@@ -187,6 +252,20 @@ pub trait MemoryExtractor: Send + Sync + 'static {
 pub trait MemoryWritePolicy: Send + Sync + 'static {
     fn descriptor(&self) -> MemoryComponentDescriptor;
     fn decide(&self, candidate: MemoryCandidate) -> MemoryFuture<'_, MemoryWriteDecision>;
+}
+
+pub trait MemoryProposalStore: Send + Sync + 'static {
+    fn descriptor(&self) -> MemoryComponentDescriptor;
+    fn create(&self, command: CreateMemoryWriteProposal) -> MemoryFuture<'_, MemoryWriteProposal>;
+    fn get_proposal(
+        &self,
+        approval_id: MemoryApprovalId,
+    ) -> MemoryFuture<'_, Option<MemoryWriteProposal>>;
+    fn resolve_proposal(
+        &self,
+        command: ResolveMemoryWriteProposal,
+    ) -> MemoryFuture<'_, MemoryWriteProposal>;
+    fn pending_proposals(&self, limit: usize) -> MemoryFuture<'_, Vec<MemoryWriteProposal>>;
 }
 
 #[derive(Debug, Error)]

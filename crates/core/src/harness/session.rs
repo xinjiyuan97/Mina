@@ -6,6 +6,8 @@ use uuid::Uuid;
 
 use crate::harness::{RunId, RunSnapshot};
 
+pub const MAX_SESSION_PAGE_SIZE: usize = 1_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(Uuid);
@@ -195,6 +197,12 @@ pub type SessionStoreFuture<'a, T> =
 
 pub trait SessionStore: Send + Sync + 'static {
     fn create_session(&self, command: CreateSession) -> SessionStoreFuture<'_, SessionSnapshot>;
+
+    fn list_sessions(
+        &self,
+        status: Option<SessionStatus>,
+        limit: usize,
+    ) -> SessionStoreFuture<'_, Vec<SessionSnapshot>>;
 
     fn begin_run(
         &self,

@@ -7,10 +7,10 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use agent_core::context::{TokenEstimateRequest, TokenEstimator, TokenSegment};
 use agent_core::harness::{
-    ConfigError, FinishReason, ModelConfig, ModelError, ModelErrorKind, ModelEvent,
-    ModelEventStream, ModelMessage, ModelPort, ModelRequest, ModelRole, ProviderConfig,
-    SecretString, TokenUsage, TokenUsageSource, ToolDefinition,
+    FinishReason, ModelError, ModelErrorKind, ModelEvent, ModelEventStream, ModelMessage,
+    ModelPort, ModelRequest, ModelRole, TokenUsage, TokenUsageSource, ToolDefinition,
 };
+use agent_harness::{ConfigError, ModelConfig, ProviderConfig, SecretString};
 use async_stream::stream;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -679,7 +679,8 @@ mod tests {
     use std::convert::Infallible;
 
     use super::*;
-    use agent_core::harness::{HarnessConfig, RunId};
+    use agent_core::harness::RunId;
+    use agent_harness::HarnessConfig;
     use axum::{
         Json, Router,
         http::HeaderMap,

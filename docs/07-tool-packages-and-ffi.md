@@ -32,7 +32,7 @@ external C/C++/Swift static library
 | `edit` | Medium | 精确文本替换，默认要求唯一匹配，拒绝 symlink 和受保护路径 |
 | `shell_command/exec_command/write_stdin` | High | 显式 opt-in、经 `ProcessSandbox`、受管会话、输出上限 |
 
-`BuiltinToolCatalog::new(workspace)` 默认装载时钟、文件和 workspace search 工具。宿主调用 `enable_terminal_tools()` 后启用 `shell_command/exec_command/write_stdin/apply_patch`；这一步只代表能力可用，不代表调用获批。Agent Loop 对 Medium/High 风险仍触发用户审批。宿主可以通过 `with_search_backend` 和 `with_process_sandbox` 替换具体实现。
+`BuiltinToolCatalog::new(workspace)` 默认装载时钟、文件和 workspace search 工具。宿主调用 `enable_terminal_tools()` 后启用 `shell_command/exec_command/write_stdin/apply_patch`；这一步只代表能力可用，不代表调用获批。Agent Loop 根据 Host 的数值审核阈值决定是否触发用户审批：Low=10、Medium=50、High=90，仅当 `tool_level >= review_level` 时审核；默认阈值 50 保持 Medium/High 需要审批。宿主可以通过 `with_search_backend` 和 `with_process_sandbox` 替换具体实现。
 
 风险声明是默认提示，不是权限证明。未来参数级 `ToolPolicy` 可以把同一工具的不同调用重新分类，宿主限制永远可以比插件声明更严格。
 

@@ -15,9 +15,9 @@ use agent_core::context::{
 };
 use agent_core::harness::{
     ArchiveSession, BeginRunResult, BeginSessionRun, ContentPart, ConversationRole, CreateSession,
-    FinalizeSessionRun, MessageId, RunEvent, RunId, RunSnapshot, RunStatus, RunStore,
-    RunStoreError, RunStoreFuture, SessionId, SessionMessage, SessionSnapshot, SessionStatus,
-    SessionStore, SessionStoreError, SessionStoreFuture,
+    FinalizeSessionRun, MAX_SESSION_PAGE_SIZE, MessageId, ObservedRunEvent, RunEvent, RunId,
+    RunSnapshot, RunStatus, RunStore, RunStoreError, RunStoreFuture, SessionId, SessionMessage,
+    SessionSnapshot, SessionStatus, SessionStore, SessionStoreError, SessionStoreFuture,
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 
@@ -187,6 +187,34 @@ impl SessionStore for InMemoryRunStore {
                 },
             );
             Ok(snapshot)
+        })
+    }
+
+    fn list_sessions(
+        &self,
+        status: Option<SessionStatus>,
+        limit: usize,
+    ) -> SessionStoreFuture<'_, Vec<SessionSnapshot>> {
+        Box::pin(async move {
+            let sessions = self.lock_sessions()?;
+            let mut snapshots: Vec<_> = sessions
+                .values()
+                .map(|session| session.snapshot.clone())
+                .filter(|session| status.is_none_or(|status| session.status == status))
+                .collect();
+            snapshots.sort_by(|left, right| {
+                right
+                    .updated_at_ms
+                    .cmp(&left.updated_at_ms)
+                    .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+                    .then_with(|| {
+                        left.session_id
+                            .to_string()
+                            .cmp(&right.session_id.to_string())
+                    })
+            });
+            snapshots.truncate(limit.clamp(1, MAX_SESSION_PAGE_SIZE));
+            Ok(snapshots)
         })
     }
 
@@ -414,11 +442,13 @@ impl SessionStore for InMemoryRunStore {
 
 /// A durable store backed by a local SQLite database.
 ///
-/// Connections are short lived. Every trait operation runs on Tokio's blocking
-/// pool, while SQLite serializes writers using WAL and immediate transactions.
+/// All contracts owned by this adapter share one process-long connection.
+/// Operations still run on Tokio's blocking pool, while the connection mutex
+/// prevents concurrent access without repeatedly opening and closing SQLite.
 #[derive(Debug, Clone)]
 pub struct SqliteRunStore {
     path: Arc<PathBuf>,
+    connection: Arc<Mutex<Connection>>,
 }
 
 impl SqliteRunStore {
@@ -436,14 +466,16 @@ impl SqliteRunStore {
         }
 
         let migration_path = path.clone();
-        run_blocking(move || {
+        let connection = run_blocking(move || {
             let connection = connect(&migration_path)?;
-            migrate(&connection)
+            migrate(&connection)?;
+            Ok(connection)
         })
         .await?;
 
         Ok(Self {
             path: Arc::new(path),
+            connection: Arc::new(Mutex::new(connection)),
         })
     }
 
@@ -455,10 +487,10 @@ impl SqliteRunStore {
 
 impl RunStore for SqliteRunStore {
     fn create_run(&self, snapshot: RunSnapshot) -> RunStoreFuture<'_, RunSnapshot> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_blocking(move || {
-                let connection = connect(&path)?;
+                let connection = lock_run_connection(&connection)?;
                 let snapshot_json = encode(&snapshot, "run snapshot")?;
                 let result = connection.execute(
                     "INSERT INTO runs (
@@ -487,10 +519,10 @@ impl RunStore for SqliteRunStore {
     }
 
     fn get_run(&self, run_id: RunId) -> RunStoreFuture<'_, Option<RunSnapshot>> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_blocking(move || {
-                let connection = connect(&path)?;
+                let connection = lock_run_connection(&connection)?;
                 load_snapshot(&connection, run_id)
             })
             .await
@@ -502,10 +534,10 @@ impl RunStore for SqliteRunStore {
         run_id: RunId,
         manifest: serde_json::Value,
     ) -> RunStoreFuture<'_, RunSnapshot> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_blocking(move || {
-                let mut connection = connect(&path)?;
+                let mut connection = lock_run_connection(&connection)?;
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(|error| sql_error("begin execution manifest update", error))?;
@@ -537,81 +569,96 @@ impl RunStore for SqliteRunStore {
         event: RunEvent,
         observed_at_ms: i64,
     ) -> RunStoreFuture<'_, RunSnapshot> {
-        let path = Arc::clone(&self.path);
+        self.append_events(vec![ObservedRunEvent::new(event, observed_at_ms)])
+    }
+
+    fn append_events(&self, events: Vec<ObservedRunEvent>) -> RunStoreFuture<'_, RunSnapshot> {
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_blocking(move || {
-                let mut connection = connect(&path)?;
-                let transaction = connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .map_err(|error| sql_error("begin append transaction", error))?;
-
-                let existing_json: Option<String> = transaction
-                    .query_row(
-                        "SELECT event_json FROM run_events WHERE run_id = ?1 AND seq = ?2",
-                        params![event.run_id.to_string(), to_sql_u64(event.seq, "seq")?],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(|error| sql_error("read existing event", error))?;
-
-                if let Some(existing_json) = existing_json {
-                    let existing: RunEvent = decode(&existing_json, "run event")?;
-                    if existing != event {
-                        return Err(RunStoreError::EventConflict {
-                            run_id: event.run_id,
-                            seq: event.seq,
-                        });
-                    }
-                    let snapshot = load_snapshot(&transaction, event.run_id)?
-                        .ok_or(RunStoreError::NotFound(event.run_id))?;
-                    transaction
-                        .commit()
-                        .map_err(|error| sql_error("commit idempotent append", error))?;
-                    return Ok(snapshot);
+                let first = events
+                    .first()
+                    .ok_or_else(|| RunStoreError::backend("cannot append an empty event batch"))?;
+                let run_id = first.event.run_id;
+                if events.iter().any(|item| item.event.run_id != run_id) {
+                    return Err(RunStoreError::backend(
+                        "one event batch cannot contain multiple runs",
+                    ));
                 }
 
-                let mut snapshot = load_snapshot(&transaction, event.run_id)?
-                    .ok_or(RunStoreError::NotFound(event.run_id))?;
+                let mut connection = lock_run_connection(&connection)?;
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|error| sql_error("begin event batch transaction", error))?;
+                let mut snapshot =
+                    load_snapshot(&transaction, run_id)?.ok_or(RunStoreError::NotFound(run_id))?;
                 let previous_seq = snapshot.last_seq;
-                snapshot.apply(&event, observed_at_ms)?;
+                let mut inserted = false;
 
-                transaction
-                    .execute(
-                        "INSERT INTO run_events (run_id, seq, observed_at_ms, event_json)
-                         VALUES (?1, ?2, ?3, ?4)",
-                        params![
-                            event.run_id.to_string(),
-                            to_sql_u64(event.seq, "seq")?,
-                            observed_at_ms,
-                            encode(&event, "run event")?,
-                        ],
-                    )
-                    .map_err(|error| sql_error("insert run event", error))?;
+                for observed in events {
+                    let event = observed.event;
+                    let existing_json: Option<String> = transaction
+                        .query_row(
+                            "SELECT event_json FROM run_events WHERE run_id = ?1 AND seq = ?2",
+                            params![event.run_id.to_string(), to_sql_u64(event.seq, "seq")?],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(|error| sql_error("read existing event", error))?;
 
-                let updated = transaction
-                    .execute(
-                        "UPDATE runs
-                         SET status = ?1, last_seq = ?2, updated_at_ms = ?3, snapshot_json = ?4
-                         WHERE run_id = ?5 AND last_seq = ?6",
-                        params![
-                            status_key(snapshot.status),
-                            to_sql_u64(snapshot.last_seq, "last_seq")?,
-                            snapshot.updated_at_ms,
-                            encode(&snapshot, "run snapshot")?,
-                            snapshot.run_id.to_string(),
-                            to_sql_u64(previous_seq, "last_seq")?,
-                        ],
-                    )
-                    .map_err(|error| sql_error("update run snapshot", error))?;
-                if updated != 1 {
-                    return Err(RunStoreError::backend(
-                        "run snapshot changed during append transaction",
-                    ));
+                    if let Some(existing_json) = existing_json {
+                        let existing: RunEvent = decode(&existing_json, "run event")?;
+                        if existing != event {
+                            return Err(RunStoreError::EventConflict {
+                                run_id: event.run_id,
+                                seq: event.seq,
+                            });
+                        }
+                        continue;
+                    }
+
+                    snapshot.apply(&event, observed.observed_at_ms)?;
+                    transaction
+                        .execute(
+                            "INSERT INTO run_events (run_id, seq, observed_at_ms, event_json)
+                             VALUES (?1, ?2, ?3, ?4)",
+                            params![
+                                event.run_id.to_string(),
+                                to_sql_u64(event.seq, "seq")?,
+                                observed.observed_at_ms,
+                                encode(&event, "run event")?,
+                            ],
+                        )
+                        .map_err(|error| sql_error("insert run event", error))?;
+                    inserted = true;
+                }
+
+                if inserted {
+                    let updated = transaction
+                        .execute(
+                            "UPDATE runs
+                             SET status = ?1, last_seq = ?2, updated_at_ms = ?3, snapshot_json = ?4
+                             WHERE run_id = ?5 AND last_seq = ?6",
+                            params![
+                                status_key(snapshot.status),
+                                to_sql_u64(snapshot.last_seq, "last_seq")?,
+                                snapshot.updated_at_ms,
+                                encode(&snapshot, "run snapshot")?,
+                                snapshot.run_id.to_string(),
+                                to_sql_u64(previous_seq, "last_seq")?,
+                            ],
+                        )
+                        .map_err(|error| sql_error("update run snapshot", error))?;
+                    if updated != 1 {
+                        return Err(RunStoreError::backend(
+                            "run snapshot changed during event batch transaction",
+                        ));
+                    }
                 }
 
                 transaction
                     .commit()
-                    .map_err(|error| sql_error("commit event append", error))?;
+                    .map_err(|error| sql_error("commit event batch", error))?;
                 Ok(snapshot)
             })
             .await
@@ -624,10 +671,10 @@ impl RunStore for SqliteRunStore {
         after_seq: u64,
         limit: usize,
     ) -> RunStoreFuture<'_, Vec<RunEvent>> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_blocking(move || {
-                let connection = connect(&path)?;
+                let connection = lock_run_connection(&connection)?;
                 if load_snapshot(&connection, run_id)?.is_none() {
                     return Err(RunStoreError::NotFound(run_id));
                 }
@@ -661,10 +708,10 @@ impl RunStore for SqliteRunStore {
     }
 
     fn unfinished_runs(&self) -> RunStoreFuture<'_, Vec<RunSnapshot>> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_blocking(move || {
-                let connection = connect(&path)?;
+                let connection = lock_run_connection(&connection)?;
                 let mut statement = connection
                     .prepare(
                         "SELECT snapshot_json FROM runs
@@ -689,10 +736,10 @@ impl RunStore for SqliteRunStore {
 
 impl SessionStore for SqliteRunStore {
     fn create_session(&self, command: CreateSession) -> SessionStoreFuture<'_, SessionSnapshot> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_session_blocking(move || {
-                let connection = session_connect(&path)?;
+                let connection = lock_session_connection(&connection)?;
                 let snapshot = SessionSnapshot::new(&command);
                 let result = connection.execute(
                     "INSERT INTO sessions (
@@ -721,12 +768,52 @@ impl SessionStore for SqliteRunStore {
         })
     }
 
+    fn list_sessions(
+        &self,
+        status: Option<SessionStatus>,
+        limit: usize,
+    ) -> SessionStoreFuture<'_, Vec<SessionSnapshot>> {
+        let connection = Arc::clone(&self.connection);
+        Box::pin(async move {
+            run_session_blocking(move || {
+                let connection = lock_session_connection(&connection)?;
+                let status = status.map(session_status_key);
+                let mut statement = connection
+                    .prepare(
+                        "SELECT snapshot_json FROM sessions
+                         WHERE (?1 IS NULL OR status = ?1)
+                         ORDER BY updated_at_ms DESC, created_at_ms DESC, session_id ASC
+                         LIMIT ?2",
+                    )
+                    .map_err(|error| session_sql_error("prepare session list", error))?;
+                let rows = statement
+                    .query_map(
+                        params![
+                            status,
+                            i64::try_from(limit.clamp(1, MAX_SESSION_PAGE_SIZE))
+                                .unwrap_or(i64::MAX),
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(|error| session_sql_error("query session list", error))?;
+                let mut sessions = Vec::new();
+                for row in rows {
+                    let json =
+                        row.map_err(|error| session_sql_error("read session list row", error))?;
+                    sessions.push(session_decode(&json, "session snapshot")?);
+                }
+                Ok(sessions)
+            })
+            .await
+        })
+    }
+
     fn begin_run(
         &self,
         command: BeginSessionRun,
         initial_run: RunSnapshot,
     ) -> SessionStoreFuture<'_, BeginRunResult> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_session_blocking(move || {
                 if initial_run.run_id != command.run_id {
@@ -734,7 +821,7 @@ impl SessionStore for SqliteRunStore {
                         "initial run id does not match begin command",
                     ));
                 }
-                let mut connection = session_connect(&path)?;
+                let mut connection = lock_session_connection(&connection)?;
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(|error| session_sql_error("begin session run transaction", error))?;
@@ -874,13 +961,13 @@ impl SessionStore for SqliteRunStore {
     }
 
     fn finalize_run(&self, command: FinalizeSessionRun) -> SessionStoreFuture<'_, SessionSnapshot> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_session_blocking(move || {
                 if !command.run.is_terminal() {
                     return Err(SessionStoreError::RunNotTerminal);
                 }
-                let mut connection = session_connect(&path)?;
+                let mut connection = lock_session_connection(&connection)?;
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(|error| session_sql_error("begin finalize transaction", error))?;
@@ -983,10 +1070,10 @@ impl SessionStore for SqliteRunStore {
     }
 
     fn archive_session(&self, command: ArchiveSession) -> SessionStoreFuture<'_, SessionSnapshot> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_session_blocking(move || {
-                let mut connection = session_connect(&path)?;
+                let mut connection = lock_session_connection(&connection)?;
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(|error| session_sql_error("begin archive transaction", error))?;
@@ -1018,10 +1105,10 @@ impl SessionStore for SqliteRunStore {
         &self,
         session_id: SessionId,
     ) -> SessionStoreFuture<'_, Option<SessionSnapshot>> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_session_blocking(move || {
-                let connection = session_connect(&path)?;
+                let connection = lock_session_connection(&connection)?;
                 load_session_for_contract(&connection, session_id)
             })
             .await
@@ -1034,10 +1121,10 @@ impl SessionStore for SqliteRunStore {
         before: Option<u64>,
         limit: usize,
     ) -> SessionStoreFuture<'_, Vec<SessionMessage>> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_session_blocking(move || {
-                let connection = session_connect(&path)?;
+                let connection = lock_session_connection(&connection)?;
                 if load_session_for_contract(&connection, session_id)?.is_none() {
                     return Err(SessionStoreError::NotFound(session_id));
                 }
@@ -1073,10 +1160,10 @@ impl SessionStore for SqliteRunStore {
     }
 
     fn pending_finalizations(&self) -> SessionStoreFuture<'_, Vec<(SessionId, RunSnapshot)>> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_session_blocking(move || {
-                let connection = session_connect(&path)?;
+                let connection = lock_session_connection(&connection)?;
                 let mut statement = connection
                     .prepare(
                         "SELECT sr.session_id, r.snapshot_json
@@ -1121,10 +1208,10 @@ impl ContextArtifactStore for SqliteRunStore {
         &self,
         query: ReusableArtifactQuery,
     ) -> ContextFuture<'_, Vec<ContextArtifactRef>> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_context_blocking(move || {
-                let connection = context_connect(&path)?;
+                let connection = lock_context_connection(&connection)?;
                 let mut statement = connection
                     .prepare(
                         "SELECT artifact_json FROM context_artifacts
@@ -1157,10 +1244,10 @@ impl ContextArtifactStore for SqliteRunStore {
     }
 
     fn get(&self, reference: ContextArtifactRef) -> ContextFuture<'_, Option<ContextArtifact>> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_context_blocking(move || {
-                let connection = context_connect(&path)?;
+                let connection = lock_context_connection(&connection)?;
                 let json: Option<String> = connection
                     .query_row(
                         "SELECT artifact_json FROM context_artifacts
@@ -1177,10 +1264,10 @@ impl ContextArtifactStore for SqliteRunStore {
     }
 
     fn put(&self, command: PutContextArtifact) -> ContextFuture<'_, ContextArtifactRef> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_context_blocking(move || {
-                let connection = context_connect(&path)?;
+                let connection = lock_context_connection(&connection)?;
                 let existing: Option<(String, String)> = connection
                     .query_row(
                         "SELECT artifact_id, content_digest FROM context_artifacts
@@ -1248,10 +1335,10 @@ impl ContextArtifactStore for SqliteRunStore {
     }
 
     fn invalidate(&self, command: InvalidateContextArtifacts) -> ContextFuture<'_, u64> {
-        let path = Arc::clone(&self.path);
+        let connection = Arc::clone(&self.connection);
         Box::pin(async move {
             run_context_blocking(move || {
-                let connection = context_connect(&path)?;
+                let connection = lock_context_connection(&connection)?;
                 let count = connection
                     .execute(
                         "UPDATE context_artifacts SET invalidated = 1
@@ -1275,6 +1362,14 @@ fn connect(path: &Path) -> Result<Connection, RunStoreError> {
         .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
         .map_err(|error| sql_error("configure database", error))?;
     Ok(connection)
+}
+
+fn lock_run_connection(
+    connection: &Mutex<Connection>,
+) -> Result<std::sync::MutexGuard<'_, Connection>, RunStoreError> {
+    connection
+        .lock()
+        .map_err(|_| RunStoreError::backend("SQLite run connection lock was poisoned"))
 }
 
 fn migrate(connection: &Connection) -> Result<(), RunStoreError> {
@@ -1382,8 +1477,12 @@ fn migrate(connection: &Connection) -> Result<(), RunStoreError> {
     Ok(())
 }
 
-fn context_connect(path: &Path) -> Result<Connection, ContextError> {
-    connect(path).map_err(|error| ContextError::Component(error.to_string()))
+fn lock_context_connection(
+    connection: &Mutex<Connection>,
+) -> Result<std::sync::MutexGuard<'_, Connection>, ContextError> {
+    connection
+        .lock()
+        .map_err(|_| ContextError::Component("SQLite context connection lock was poisoned".into()))
 }
 
 fn context_encode(value: &ContextArtifact) -> Result<String, ContextError> {
@@ -1408,8 +1507,12 @@ async fn run_context_blocking<T: Send + 'static>(
         .map_err(|error| ContextError::Component(format!("context store worker failed: {error}")))?
 }
 
-fn session_connect(path: &Path) -> Result<Connection, SessionStoreError> {
-    connect(path).map_err(|error| SessionStoreError::backend(error.to_string()))
+fn lock_session_connection(
+    connection: &Mutex<Connection>,
+) -> Result<std::sync::MutexGuard<'_, Connection>, SessionStoreError> {
+    connection
+        .lock()
+        .map_err(|_| SessionStoreError::backend("SQLite session connection lock was poisoned"))
 }
 
 fn load_session_for_contract(
@@ -1522,8 +1625,10 @@ fn load_snapshot(
 fn status_key(status: RunStatus) -> &'static str {
     match status {
         RunStatus::Accepted => "accepted",
+        RunStatus::Runnable => "runnable",
         RunStatus::Running => "running",
         RunStatus::WaitingApproval => "waiting_approval",
+        RunStatus::WaitingEvent => "waiting_event",
         RunStatus::ExecutingTool => "executing_tool",
         RunStatus::Completed => "completed",
         RunStatus::Failed => "failed",
@@ -1572,6 +1677,64 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[tokio::test]
+    async fn lists_durable_sessions_by_activity_and_status() {
+        let directory = tempdir().expect("temp directory should be created");
+        let path = directory.path().join("runs.sqlite3");
+        let store = SqliteRunStore::open(&path)
+            .await
+            .expect("store should open");
+        let oldest = SessionId::new();
+        let archived = SessionId::new();
+        let newest = SessionId::new();
+
+        for (session_id, title, created_at_ms) in [
+            (oldest, "oldest", 10),
+            (archived, "archived", 20),
+            (newest, "newest", 25),
+        ] {
+            store
+                .create_session(CreateSession {
+                    session_id,
+                    agent_profile: "default".into(),
+                    title: Some(title.into()),
+                    created_at_ms,
+                })
+                .await
+                .expect("session should be created");
+        }
+        store
+            .archive_session(ArchiveSession {
+                session_id: archived,
+                expected_revision: 0,
+                archived_at_ms: 30,
+            })
+            .await
+            .expect("session should archive");
+        drop(store);
+
+        let reopened = SqliteRunStore::open(&path)
+            .await
+            .expect("store should reopen");
+        let active = reopened
+            .list_sessions(Some(SessionStatus::Active), 100)
+            .await
+            .expect("active sessions should list");
+        let all = reopened
+            .list_sessions(None, 100)
+            .await
+            .expect("all sessions should list");
+
+        assert_eq!(
+            active
+                .iter()
+                .map(|session| session.session_id)
+                .collect::<Vec<_>>(),
+            vec![newest, oldest]
+        );
+        assert_eq!(all[0].session_id, archived);
+    }
 
     #[tokio::test]
     async fn persists_snapshots_and_events_across_reopen() {
@@ -1685,6 +1848,109 @@ mod tests {
         ));
         assert_eq!(snapshot.status, RunStatus::Accepted);
         assert_eq!(snapshot.last_seq, 0);
+    }
+
+    #[tokio::test]
+    async fn event_batch_commits_one_complete_projection() {
+        let directory = tempdir().expect("temp directory should be created");
+        let store = SqliteRunStore::open(directory.path().join("runs.sqlite3"))
+            .await
+            .expect("store should open");
+        let run_id = RunId::new();
+        store
+            .create_run(RunSnapshot::new(run_id, "hello", 10))
+            .await
+            .expect("run should be created");
+
+        let snapshot = store
+            .append_events(vec![
+                ObservedRunEvent::new(RunEvent::new(run_id, 1, RunEventKind::RunStarted), 11),
+                ObservedRunEvent::new(
+                    RunEvent::new(
+                        run_id,
+                        2,
+                        RunEventKind::OutputDelta {
+                            channel: OutputChannel::AssistantText,
+                            delta: "batched".into(),
+                        },
+                    ),
+                    12,
+                ),
+                ObservedRunEvent::new(
+                    RunEvent::new(
+                        run_id,
+                        3,
+                        RunEventKind::RunCompleted {
+                            finish_reason: FinishReason::Stop,
+                        },
+                    ),
+                    13,
+                ),
+            ])
+            .await
+            .expect("batch should append");
+
+        assert_eq!(snapshot.status, RunStatus::Completed);
+        assert_eq!(snapshot.output, "batched");
+        assert_eq!(snapshot.last_seq, 3);
+        assert_eq!(snapshot.revision, 3);
+        assert_eq!(
+            store
+                .events_after(run_id, 0, 10)
+                .await
+                .expect("events should load")
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_event_batch_rolls_back_every_event() {
+        let directory = tempdir().expect("temp directory should be created");
+        let store = SqliteRunStore::open(directory.path().join("runs.sqlite3"))
+            .await
+            .expect("store should open");
+        let run_id = RunId::new();
+        store
+            .create_run(RunSnapshot::new(run_id, "hello", 10))
+            .await
+            .expect("run should be created");
+
+        let error = store
+            .append_events(vec![
+                ObservedRunEvent::new(RunEvent::new(run_id, 1, RunEventKind::RunStarted), 11),
+                ObservedRunEvent::new(
+                    RunEvent::new(
+                        run_id,
+                        3,
+                        RunEventKind::RunCompleted {
+                            finish_reason: FinishReason::Stop,
+                        },
+                    ),
+                    12,
+                ),
+            ])
+            .await
+            .expect_err("sequence gap should reject the batch");
+
+        assert!(matches!(
+            error,
+            RunStoreError::State(RunStateError::SequenceConflict { .. })
+        ));
+        let snapshot = store
+            .get_run(run_id)
+            .await
+            .expect("snapshot should load")
+            .expect("snapshot should exist");
+        assert_eq!(snapshot.status, RunStatus::Accepted);
+        assert_eq!(snapshot.last_seq, 0);
+        assert!(
+            store
+                .events_after(run_id, 0, 10)
+                .await
+                .expect("events should load")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

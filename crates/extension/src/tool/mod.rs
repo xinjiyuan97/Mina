@@ -5,6 +5,8 @@
 
 mod catalog;
 mod filesystem;
+mod javascript;
+mod job;
 mod patch;
 mod search;
 mod terminal;
@@ -13,6 +15,8 @@ mod workspace;
 
 pub use catalog::{BuiltinToolCatalog, BuiltinToolCatalogError};
 pub use filesystem::{EditTool, ListDirectoryTool, ReadTool, WriteTool};
+pub use javascript::JavaScriptEvalTool;
+pub use job::AsyncJobTool;
 pub use patch::ApplyPatchTool;
 pub use search::{
     SearchBackend, SearchBackendDescriptor, SearchFuture, SearchHit, SearchRequest, SearchTool,

@@ -1,9 +1,18 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { RegenerateIcon, ThinkingIcon, ToolIcon } from "@xinjiyuan97/chat-ui";
+import { ConversationSidebar } from "@xinjiyuan97/chat-ui";
 
 import { Chat } from "./chat";
+import {
+  createSession,
+  listActiveSessions,
+  loadSessionMessages,
+  toConversation,
+  type SessionSnapshot,
+} from "./session-client";
+import type { ChatMessage } from "@xinjiyuan97/chat-core";
 
 type AgentMetadata = {
   name: string;
@@ -56,6 +65,18 @@ type MemoryRecord = {
   source_refs: Array<Record<string, unknown>>;
 };
 
+type MemoryWriteProposal = {
+  approval_id: string;
+  candidate: {
+    proposed: MemoryRecord;
+    sensitivity: "public" | "private" | "secret";
+    extraction_reason: string;
+  };
+  reason: string;
+  status: "pending" | "approved" | "denied" | "expired";
+  created_at_ms: number;
+};
+
 type AgentInspection = {
   service: string;
   version: string;
@@ -100,6 +121,7 @@ type AgentInspection = {
       version: string;
     };
     records: MemoryRecord[];
+    pending_approvals: MemoryWriteProposal[];
     has_more: boolean;
   };
 };
@@ -113,12 +135,23 @@ const tabs: Array<{ id: InspectorTab; label: string }> = [
   { id: "tools", label: "Tools" },
 ];
 
+const ACTIVE_SESSION_STORAGE_KEY = "mina.active-session-id";
+
 export function AgentWorkbench() {
   const [inspection, setInspection] = useState<AgentInspection | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(true);
   const [activeTab, setActiveTab] = useState<InspectorTab>("skills");
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [sessions, setSessions] = useState<SessionSnapshot[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [sessionMessages, setSessionMessages] = useState<ChatMessage[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState(true);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const [chatBusy, setChatBusy] = useState(false);
+  const [sessionsCollapsed, setSessionsCollapsed] = useState(false);
+  const [sessionsOpen, setSessionsOpen] = useState(false);
+  const sessionSwitchGeneration = useRef(0);
 
   const refresh = useCallback(async (quiet = false) => {
     if (!quiet) setRefreshing(true);
@@ -154,18 +187,139 @@ export function AgentWorkbench() {
     };
   }, []);
 
+  useEffect(() => {
+    const controller = new AbortController();
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        let available = await listActiveSessions(controller.signal);
+        if (available.length === 0) {
+          available = [await createSession(controller.signal)];
+        }
+        const remembered = window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY);
+        const active = available.find((session) => session.session_id === remembered) ?? available[0];
+        const messages = await loadSessionMessages(active.session_id, controller.signal);
+        if (cancelled) return;
+        setSessions(available);
+        setActiveSessionId(active.session_id);
+        setSessionMessages(messages);
+        setSessionError(null);
+        window.localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, active.session_id);
+      } catch (cause) {
+        if (cancelled || controller.signal.aborted) return;
+        setSessionError(cause instanceof Error ? cause.message : "读取会话失败");
+      } finally {
+        if (!cancelled) setSessionsLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, []);
+
   function openInspector(tab: InspectorTab) {
     setActiveTab(tab);
     setInspectorOpen(true);
+    setSessionsOpen(false);
   }
 
+  const selectSession = useCallback(
+    async (sessionId: string) => {
+      setSessionsOpen(false);
+      if (sessionId === activeSessionId) return;
+      if (chatBusy) {
+        setSessionError("当前任务执行中，请停止后再切换 Session");
+        return;
+      }
+      const generation = sessionSwitchGeneration.current + 1;
+      sessionSwitchGeneration.current = generation;
+      setActiveSessionId(sessionId);
+      setSessionMessages([]);
+      setSessionsLoading(true);
+      setSessionError(null);
+      window.localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, sessionId);
+      try {
+        const messages = await loadSessionMessages(sessionId);
+        if (sessionSwitchGeneration.current === generation) {
+          setSessionMessages(messages);
+        }
+      } catch (cause) {
+        if (sessionSwitchGeneration.current === generation) {
+          setSessionError(cause instanceof Error ? cause.message : "读取会话历史失败");
+        }
+      } finally {
+        if (sessionSwitchGeneration.current === generation) setSessionsLoading(false);
+      }
+    },
+    [activeSessionId, chatBusy],
+  );
+
+  const newSession = useCallback(async () => {
+    if (chatBusy) {
+      setSessionError("当前任务执行中，请停止后再新建 Session");
+      return;
+    }
+    const generation = sessionSwitchGeneration.current + 1;
+    sessionSwitchGeneration.current = generation;
+    setSessionsLoading(true);
+    setSessionError(null);
+    try {
+      const created = await createSession();
+      if (sessionSwitchGeneration.current !== generation) return;
+      setSessions((current) => [
+        created,
+        ...current.filter((session) => session.session_id !== created.session_id),
+      ]);
+      setActiveSessionId(created.session_id);
+      setSessionMessages([]);
+      setSessionsOpen(false);
+      window.localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, created.session_id);
+    } catch (cause) {
+      if (sessionSwitchGeneration.current === generation) {
+        setSessionError(cause instanceof Error ? cause.message : "创建会话失败");
+      }
+    } finally {
+      if (sessionSwitchGeneration.current === generation) setSessionsLoading(false);
+    }
+  }, [chatBusy]);
+
+  const handleRunFinished = useCallback(
+    (sessionId: string) => {
+      void refresh(true);
+      void listActiveSessions()
+        .then((available) => {
+          setSessions(available);
+          if (!available.some((session) => session.session_id === sessionId)) {
+            setSessionError("完成的 Session 未出现在会话列表中");
+          }
+        })
+        .catch((cause: unknown) => {
+          setSessionError(cause instanceof Error ? cause.message : "刷新会话列表失败");
+        });
+    },
+    [refresh],
+  );
+
   const modelLabel = inspection?.model?.model ?? "No model";
-  const memoryCount = inspection?.memory.records.length ?? 0;
+  const memoryCount = inspection
+    ? inspection.memory.records.length + inspection.memory.pending_approvals.length
+    : 0;
   const skillCount = inspection?.skills.packages.length ?? 0;
   const toolCount = inspection?.tools.length ?? 0;
+  const activeSession = sessions.find((session) => session.session_id === activeSessionId) ?? null;
+  const conversations = useMemo(() => sessions.map(toConversation), [sessions]);
+  const activeConversationTitle = activeSession
+    ? toConversation(activeSession).title
+    : "Conversation";
 
   return (
-    <main className="workbench-shell">
+    <main
+      className="workbench-shell"
+      data-session-sidebar-collapsed={sessionsCollapsed || undefined}
+    >
       <header className="workbench-header">
         <div className="brand-lockup">
           <span className="brand-mark" aria-hidden="true">M</span>
@@ -183,6 +337,19 @@ export function AgentWorkbench() {
         </div>
 
         <div className="header-actions">
+          <button
+            className="mobile-session-trigger"
+            type="button"
+            onClick={() => {
+              setSessionsCollapsed(false);
+              setSessionsOpen((open) => !open);
+              setInspectorOpen(false);
+            }}
+            aria-expanded={sessionsOpen}
+          >
+            Sessions
+            <span>{sessions.length}</span>
+          </button>
           <button
             className="mobile-inspector-trigger"
             type="button"
@@ -206,77 +373,88 @@ export function AgentWorkbench() {
       </header>
 
       <div className="workbench-body">
-        <aside className="agent-rail" aria-label="Agent 概览">
-          <section className="rail-section agent-identity">
-            <p className="eyebrow">ACTIVE AGENT</p>
-            <div className="agent-glyph" aria-hidden="true">
-              <ThinkingIcon size={20} />
-            </div>
-            <h2>{inspection?.agent.name ?? "Loading…"}</h2>
-            <p className="agent-version">
-              v{inspection?.agent.version ?? "—"} · protocol {inspection?.agent.protocol_version ?? "—"}
-            </p>
-          </section>
-
-          <section className="rail-section">
-            <p className="eyebrow">MODEL</p>
-            <dl className="runtime-facts">
-              <div>
-                <dt>Profile</dt>
-                <dd>{inspection?.model?.profile ?? "—"}</dd>
+        <ConversationSidebar
+          className={`agent-rail session-sidebar${sessionsOpen ? " is-open" : ""}`}
+          conversations={conversations}
+          activeId={activeSessionId ?? undefined}
+          loading={sessionsLoading && sessions.length === 0}
+          collapsed={sessionsCollapsed}
+          onCollapsedChange={setSessionsCollapsed}
+          onNewChat={() => void newSession()}
+          onSelect={(sessionId) => void selectSession(sessionId)}
+          footer={
+            sessionsCollapsed ? (
+              <button
+                className="collapsed-context-button"
+                type="button"
+                onClick={() => openInspector("skills")}
+                title="Agent Context"
+                aria-label="打开 Agent Context"
+              >
+                <ThinkingIcon size={16} />
+              </button>
+            ) : (
+              <div className="session-sidebar-footer">
+                <div className="session-agent-summary">
+                  <span className="status-dot" aria-hidden="true" />
+                  <span>{inspection?.agent.name ?? "connecting"}</span>
+                  <small>{modelLabel}</small>
+                </div>
+                <nav className="sidebar-context-nav" aria-label="Agent 上下文面板">
+                  <button type="button" onClick={() => openInspector("system")}>
+                    System <strong>{inspection?.system.content ? "1" : "0"}</strong>
+                  </button>
+                  <button type="button" onClick={() => openInspector("memory")}>
+                    Memory <strong>{memoryCount}</strong>
+                  </button>
+                  <button type="button" onClick={() => openInspector("skills")}>
+                    Skills <strong>{skillCount}</strong>
+                  </button>
+                  <button type="button" onClick={() => openInspector("tools")}>
+                    Tools <strong>{toolCount}</strong>
+                  </button>
+                </nav>
+                {(error || sessionError) && (
+                  <p className="session-sidebar-error" role="alert">
+                    {sessionError ?? error}
+                  </p>
+                )}
               </div>
-              <div>
-                <dt>Provider</dt>
-                <dd>{inspection?.model?.provider ?? "—"}</dd>
-              </div>
-              <div>
-                <dt>Model</dt>
-                <dd title={modelLabel}>{modelLabel}</dd>
-              </div>
-            </dl>
-          </section>
-
-          <nav className="rail-section context-nav" aria-label="上下文面板">
-            <p className="eyebrow">CONTEXT</p>
-            <button type="button" onClick={() => openInspector("system")}>
-              <span>System</span>
-              <strong>{inspection?.system.content ? "1" : "0"}</strong>
-            </button>
-            <button type="button" onClick={() => openInspector("memory")}>
-              <span>Memory</span>
-              <strong>{memoryCount}</strong>
-            </button>
-            <button type="button" onClick={() => openInspector("skills")}>
-              <span>Skills</span>
-              <strong>{skillCount}</strong>
-            </button>
-            <button type="button" onClick={() => openInspector("tools")}>
-              <span>Tools</span>
-              <strong>{toolCount}</strong>
-            </button>
-          </nav>
-
-          <section className="rail-section capability-section">
-            <p className="eyebrow">CAPABILITIES</p>
-            <ul>
-              {(inspection?.agent.capabilities ?? []).map((capability) => (
-                <li key={capability}>{formatLabel(capability)}</li>
-              ))}
-            </ul>
-          </section>
-
-          {error && <p className="inspection-error" role="alert">{error}</p>}
-        </aside>
+            )
+          }
+        />
 
         <section className="playground-pane" aria-label="Agent 对话">
           <div className="pane-header">
             <div>
               <p className="eyebrow">PLAYGROUND</p>
-              <h2>Conversation</h2>
+              <h2>{activeConversationTitle}</h2>
             </div>
-            <span className="pane-status">Session persistent</span>
+            <span className="pane-status">
+              {chatBusy ? "Running" : activeSession ? "SQLite persistent" : "Loading Session"}
+            </span>
           </div>
-          <Chat onRunFinished={refresh} />
+          {activeSession && !sessionsLoading ? (
+            <Chat
+              key={activeSession.session_id}
+              session={activeSession}
+              initialMessages={sessionMessages}
+              onRunFinished={handleRunFinished}
+              onBusyChange={setChatBusy}
+              maxSteps={100}
+            />
+          ) : (
+            <div className="session-loading-state" role="status">
+              <ThinkingIcon size={20} />
+              <strong>{sessionError ? "Session unavailable" : "Loading conversation"}</strong>
+              <p>{sessionError ?? "正在从 SQLite 读取会话与消息…"}</p>
+              {sessionError && (
+                <button type="button" onClick={() => void newSession()}>
+                  新建 Session
+                </button>
+              )}
+            </div>
+          )}
         </section>
 
         <aside
@@ -319,7 +497,7 @@ export function AgentWorkbench() {
             ) : activeTab === "system" ? (
               <SystemPanel inspection={inspection} />
             ) : activeTab === "memory" ? (
-              <MemoryPanel inspection={inspection} />
+              <MemoryPanel inspection={inspection} onResolved={() => refresh(true)} />
             ) : activeTab === "skills" ? (
               <SkillsPanel inspection={inspection} />
             ) : (
@@ -345,7 +523,15 @@ function SystemPanel({ inspection }: { inspection: AgentInspection }) {
   );
 }
 
-function MemoryPanel({ inspection }: { inspection: AgentInspection }) {
+function MemoryPanel({
+  inspection,
+  onResolved,
+}: {
+  inspection: AgentInspection;
+  onResolved: () => Promise<void>;
+}) {
+  const [resolving, setResolving] = useState<string | null>(null);
+  const [approvalError, setApprovalError] = useState<string | null>(null);
   if (!inspection.memory.enabled) {
     return <EmptyInspector title="Memory is disabled" detail="在 orchestration 配置中启用后会显示持久化记忆。" />;
   }
@@ -358,6 +544,41 @@ function MemoryPanel({ inspection }: { inspection: AgentInspection }) {
         <span>Scope</span>
         <code>{inspection.memory.scopes.join(", ") || "—"}</code>
       </div>
+      {inspection.memory.pending_approvals.length > 0 && (
+        <div className="memory-approval-list">
+          <p className="eyebrow">PENDING APPROVAL</p>
+          {inspection.memory.pending_approvals.map((proposal) => (
+            <article className="memory-item memory-approval-item" key={proposal.approval_id}>
+              <header>
+                <span className="memory-kind is-episodic">{proposal.candidate.sensitivity}</span>
+                <time dateTime={new Date(proposal.created_at_ms).toISOString()}>
+                  {formatTime(proposal.created_at_ms)}
+                </time>
+              </header>
+              <p>{memoryText(proposal.candidate.proposed.content)}</p>
+              <small>{proposal.reason}</small>
+              <div className="memory-approval-actions">
+                <button
+                  type="button"
+                  disabled={resolving === proposal.approval_id}
+                  onClick={() => void resolveMemoryApproval(proposal.approval_id, "deny")}
+                >
+                  拒绝
+                </button>
+                <button
+                  type="button"
+                  className="is-primary"
+                  disabled={resolving === proposal.approval_id}
+                  onClick={() => void resolveMemoryApproval(proposal.approval_id, "approve")}
+                >
+                  允许写入
+                </button>
+              </div>
+            </article>
+          ))}
+          {approvalError && <p className="memory-approval-error">{approvalError}</p>}
+        </div>
+      )}
       {inspection.memory.records.length === 0 ? (
         <EmptyInspector title="No memories yet" detail="完成对话后，符合写入策略的内容会出现在这里。" />
       ) : (
@@ -383,6 +604,25 @@ function MemoryPanel({ inspection }: { inspection: AgentInspection }) {
       )}
     </section>
   );
+
+  async function resolveMemoryApproval(approvalId: string, decision: "approve" | "deny") {
+    setResolving(approvalId);
+    setApprovalError(null);
+    try {
+      const response = await fetch(`/api/v1/memories/approvals/${approvalId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ decision }),
+      });
+      if (!response.ok) throw new Error(`Memory approval 返回 ${response.status}`);
+      await new Promise((resolve) => window.setTimeout(resolve, 300));
+      await onResolved();
+    } catch (cause) {
+      setApprovalError(cause instanceof Error ? cause.message : "Memory 审批失败");
+    } finally {
+      setResolving(null);
+    }
+  }
 }
 
 function SkillsPanel({ inspection }: { inspection: AgentInspection }) {
@@ -501,13 +741,11 @@ function EmptyInspector({ title, detail }: { title: string; detail: string }) {
 function tabCount(tab: InspectorTab, inspection: AgentInspection | null) {
   if (!inspection) return "—";
   if (tab === "system") return inspection.system.content ? 1 : 0;
-  if (tab === "memory") return inspection.memory.records.length;
+  if (tab === "memory") {
+    return inspection.memory.records.length + inspection.memory.pending_approvals.length;
+  }
   if (tab === "skills") return inspection.skills.packages.length;
   return inspection.tools.length;
-}
-
-function formatLabel(value: string) {
-  return value.replaceAll("_", " ");
 }
 
 function memoryText(parts: ContentPart[]) {

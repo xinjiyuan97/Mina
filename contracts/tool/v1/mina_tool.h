@@ -52,7 +52,9 @@ typedef void (*MinaToolDropFnV1)(void *plugin_context);
 
 /*
  * One plugin can expose multiple tools. manifest_json must conform to
- * manifest.schema.json and remain valid until `drop` returns.
+ * manifest.schema.json and remain valid until `drop` returns. Execution
+ * policy is declared inside that JSON manifest and remains subject to Host
+ * validation and policy tightening.
  *
  * struct_size allows a host to ignore fields appended by a future compatible
  * revision. V1 hosts require at least sizeof(MinaToolPluginV1).

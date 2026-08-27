@@ -9,7 +9,9 @@ description = "Small runnable Mina agent with an OpenAI-compatible provider and 
 
 [dependencies]
 agent-core.workspace = true
+agent-harness = { workspace = true, features = ["quickjs"] }
 agent-extension = { workspace = true, features = [
+    "adf",
     "openai",
     "builtin-tools",
     "host-sandbox",

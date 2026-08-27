@@ -1,0 +1,36 @@
+[package]
+name = "agent-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host runtime, durable orchestration and portable script execution for agents"
+
+[features]
+default = []
+quickjs = ["dep:rquickjs"]
+full = ["quickjs"]
+
+[dependencies]
+agent-core.workspace = true
+async-stream.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+jsonschema.workspace = true
+rquickjs = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+toml.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+agent-extension = { workspace = true, features = ["sqlite"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

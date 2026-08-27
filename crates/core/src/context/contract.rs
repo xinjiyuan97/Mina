@@ -1,6 +1,6 @@
 use std::{future::Future, pin::Pin};
 
-use crate::harness::{ModelMessage, ModelRole};
+use crate::harness::{ModelMessage, ModelRole, RunId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -97,6 +97,7 @@ impl ContextBudget {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompressionRequest {
+    pub run_id: RunId,
     pub candidates: Vec<ContextItem>,
     pub source_digest: String,
     pub budget: ContextBudget,
@@ -211,6 +212,7 @@ pub struct InvalidateContextArtifacts {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SummaryRequest {
+    pub run_id: RunId,
     pub model_profile: String,
     pub items: Vec<ContextItem>,
     pub maximum_tokens: u64,

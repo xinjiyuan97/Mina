@@ -9,7 +9,9 @@ description = "External providers, tools, stores, sandboxes and observability ad
 
 [features]
 default = []
+adf = ["dep:agent-harness", "dep:jsonschema", "dep:sha2", "dep:tokio"]
 openai = [
+    "dep:agent-harness",
     "dep:async-stream",
     "dep:eventsource-stream",
     "dep:futures-util",
@@ -19,22 +21,27 @@ builtin-tools = ["host-sandbox", "dep:time"]
 host-sandbox = ["dep:tokio", "dep:tokio-util"]
 sqlite = ["dep:rusqlite", "dep:tokio"]
 filesystem = ["dep:sha2", "dep:tokio", "dep:toml"]
-observability-tracing = ["dep:async-stream", "dep:futures-util", "dep:tracing"]
+observability-tracing = ["dep:async-stream", "dep:futures-util", "dep:tokio", "dep:tracing"]
+context-model = ["dep:futures-util", "dep:sha2", "dep:tokio"]
 full = [
+    "adf",
     "openai",
     "builtin-tools",
     "host-sandbox",
     "sqlite",
     "filesystem",
     "observability-tracing",
+    "context-model",
 ]
 
 [dependencies]
 agent-core.workspace = true
+agent-harness = { workspace = true, optional = true }
 async-stream = { workspace = true, optional = true }
 eventsource-stream = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+jsonschema = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -48,12 +55,32 @@ tracing = { workspace = true, optional = true }
 url.workspace = true
 
 [dev-dependencies]
+agent-core.workspace = true
+agent-harness = { workspace = true, features = ["quickjs"] }
 axum.workspace = true
+futures-util.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 
 [[test]]
 name = "context_engine"
+required-features = ["sqlite"]
+
+[[test]]
+name = "adf_agent_loop"
+required-features = ["adf"]
+
+[[test]]
+name = "javascript_agent_loop"
+required-features = ["builtin-tools"]
+
+[[test]]
+name = "async_job_agent_loop"
+required-features = ["builtin-tools", "sqlite"]
+
+[[test]]
+name = "quickjs_flow"
 required-features = ["sqlite"]
 
 [lints]

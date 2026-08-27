@@ -1,5 +1,6 @@
 use agent_core::harness::{
-    Tool, ToolCallFuture, ToolCallRequest, ToolDefinition, ToolError, ToolOutput, ToolRiskLevel,
+    Tool, ToolCallFuture, ToolCallRequest, ToolConcurrency, ToolDefinition, ToolError,
+    ToolExecutionPolicy, ToolOutput, ToolRetryPolicy, ToolRiskLevel,
 };
 use std::path::Path;
 
@@ -45,6 +46,7 @@ impl Tool for ReadTool {
                 "additionalProperties": false
             }),
         )
+        .with_execution_policy(read_only_policy())
     }
 
     fn call(&self, request: ToolCallRequest) -> ToolCallFuture {
@@ -339,6 +341,7 @@ impl Tool for ListDirectoryTool {
                 "additionalProperties": false
             }),
         )
+        .with_execution_policy(read_only_policy())
     }
 
     fn call(&self, request: ToolCallRequest) -> ToolCallFuture {
@@ -438,6 +441,12 @@ where
             false,
         )
     })
+}
+
+const fn read_only_policy() -> ToolExecutionPolicy {
+    ToolExecutionPolicy::read_only()
+        .with_concurrency(ToolConcurrency::ParallelSafe)
+        .with_retry(ToolRetryPolicy::bounded(2, 25, 250))
 }
 
 fn unavailable_path() -> ToolError {

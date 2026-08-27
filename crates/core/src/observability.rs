@@ -17,10 +17,15 @@ pub enum ObservationKind {
         message_count: usize,
         tool_count: usize,
     },
+    ModelFirstToken {
+        model: String,
+        ttft_ms: u64,
+    },
     ModelFinished {
         model: String,
         status: ObservationStatus,
         duration_ms: u64,
+        ttft_ms: Option<u64>,
         finish_reason: Option<String>,
         error_code: Option<String>,
         retryable: Option<bool>,
@@ -40,6 +45,33 @@ pub enum ObservationKind {
         error_category: Option<String>,
         retryable: Option<bool>,
         retry_after_ms: Option<u64>,
+    },
+    FlowActivationStarted {
+        agent_kind: String,
+        activation_id: Option<String>,
+        resumed: bool,
+        inbox_count: usize,
+    },
+    FlowActivationFinished {
+        agent_kind: String,
+        activation_id: Option<String>,
+        outcome: String,
+        duration_ms: u64,
+        wait_count: usize,
+        effect_count: usize,
+        error_code: Option<String>,
+        retryable: Option<bool>,
+    },
+    ApprovalRequested {
+        approval_id: String,
+        call_id: String,
+        tool_name: String,
+        risk_level: String,
+    },
+    ApprovalResolved {
+        approval_id: String,
+        call_id: String,
+        decision: String,
     },
 }
 

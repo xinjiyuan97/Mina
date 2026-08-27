@@ -205,7 +205,7 @@ sequenceDiagram
     G-->>C: terminal SSE event
 ```
 
-流是按需轮询的，天然形成背压。客户端断开后，Axum response 被丢弃，活动 run guard 传播取消并释放底层模型响应流。当前尚未实现跨进程取消确认或断线续传。
+Provider/Agent 流仍按需轮询并形成背压，但 HTTP SSE 已不是 run owner。客户端断开只结束该订阅，后台 run 继续执行并把聚合后的事件异步写入 SQLite；客户端可以带 `after_seq` 重连并先重放历史、再接实时广播。取消必须显式调用 run cancel API。已经 checkpoint 到 `WaitingEvent` 的 run 可跨 Server 重启恢复；正在模型或同步 Tool 内执行而没有安全 checkpoint 的 activation 会标记为 `run_interrupted`。
 
 ## 7. OpenAI-compatible adapter
 
