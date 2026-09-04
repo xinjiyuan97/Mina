@@ -178,6 +178,7 @@ mod tests {
                     item_id: "history:1".into(),
                     role: ModelRole::User,
                     content: "Keep it short.".into(),
+                    attachments: Vec::new(),
                     priority: ContextPriority::Normal,
                     source: ContextSourceRef {
                         kind: "session_message".into(),

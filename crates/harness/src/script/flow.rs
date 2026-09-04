@@ -1116,6 +1116,7 @@ mod tests {
         let (events, outcome) = collect(machine.start(MachineStartRequest {
             run_id,
             input: "hello".into(),
+            attachments: Vec::new(),
             prior_messages: Vec::new(),
             allowed_tools: None,
             allow_run_adf: false,
@@ -1215,6 +1216,7 @@ mod tests {
         let (_, outcome) = collect(machine.start(MachineStartRequest {
             run_id: RunId::new(),
             input: json!({"kind": "test.echo"}).to_string(),
+            attachments: Vec::new(),
             prior_messages: Vec::new(),
             allowed_tools: None,
             allow_run_adf: false,

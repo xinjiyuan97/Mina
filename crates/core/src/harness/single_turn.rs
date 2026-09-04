@@ -64,7 +64,10 @@ where
             messages.push(ModelMessage::system(self.system_prompt.clone()));
         }
         messages.extend(request.prior_messages);
-        messages.push(ModelMessage::user(request.input));
+        messages.push(ModelMessage::user_with_attachments(
+            request.input,
+            request.attachments,
+        ));
 
         let mut model_events = self.provider.stream(ModelRequest {
             run_id: request.run_id,

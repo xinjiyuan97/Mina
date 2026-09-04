@@ -1,4 +1,4 @@
-import type { ChatMessage, Conversation } from "@xinjiyuan97/chat-core";
+import type { ChatMessage, Conversation, MessagePart } from "@xinjiyuan97/chat-core";
 
 export type SessionSnapshot = {
   session_id: string;
@@ -14,7 +14,44 @@ export type SessionSnapshot = {
 
 type SessionContentPart =
   | { type: "text"; text: string }
-  | { type: "blob_ref"; blob_id: string; media_type: string };
+  | { type: "reasoning"; text: string; duration_ms?: number }
+  | {
+      type: "tool_call";
+      tool_call_id: string;
+      name: string;
+      state:
+        | "input_streaming"
+        | "input_available"
+        | "executing"
+        | "output_available"
+        | "output_error";
+      input?: unknown;
+      input_text?: string;
+      output?: string;
+      error?: string;
+      duration_ms?: number;
+    }
+  | {
+      type: "permission";
+      approval_id: string;
+      call_id: string;
+      tool_name: string;
+      risk_level: "low" | "medium" | "high";
+      arguments: unknown;
+      requested_at_ms: number;
+      resolution?: {
+        decision: "allow-once" | "deny";
+        reason?: string;
+      };
+      resolved_at_ms?: number;
+    }
+  | {
+      type: "blob_ref";
+      blob_id: string;
+      media_type: string;
+      name?: string;
+      size_bytes?: number;
+    };
 
 type SessionMessage = {
   message_id: string;
@@ -84,13 +121,7 @@ export function toConversation(session: SessionSnapshot): Conversation {
 }
 
 function toChatMessage(message: SessionMessage): ChatMessage {
-  const parts = message.content.map((part) => {
-    if (part.type === "text") return { type: "text" as const, text: part.text };
-    return {
-      type: "text" as const,
-      text: `[附件 ${part.media_type} · ${part.blob_id}]`,
-    };
-  });
+  const parts = message.content.map((part) => toChatPart(part, message));
   return {
     id: message.message_id,
     role: message.role === "system_note" ? "system" : message.role,
@@ -103,6 +134,95 @@ function toChatMessage(message: SessionMessage): ChatMessage {
       sourceRunId: message.source_run_id,
     },
   };
+}
+
+function toChatPart(part: SessionContentPart, message: SessionMessage): MessagePart {
+  switch (part.type) {
+    case "text":
+      return { type: "text", text: part.text };
+    case "reasoning":
+      return {
+        type: "reasoning",
+        text: part.text,
+        durationMs: part.duration_ms,
+      };
+    case "tool_call":
+      return {
+        type: "tool",
+        toolCallId: part.tool_call_id,
+        name: part.name,
+        state: sessionToolState(part.state),
+        input: part.input,
+        inputText: part.input_text,
+        output:
+          part.output === undefined ? undefined : parseStoredToolOutput(part.output),
+        error: part.error,
+        durationMs: part.duration_ms,
+      };
+    case "permission": {
+      const decision = part.resolution?.decision;
+      return {
+        type: "permission",
+        request: {
+          id: part.approval_id,
+          toolName: part.tool_name,
+          toolCallId: part.call_id,
+          title: `允许 ${part.tool_name} 执行？`,
+          detail: JSON.stringify(part.arguments, null, 2),
+          detailLanguage: "json",
+          risk: part.risk_level,
+          options: [
+            { value: "allow-once", decision: "allow-once" },
+            {
+              value: "deny",
+              decision: "deny",
+              promptForReason: true,
+              requiresReason: false,
+            },
+          ],
+          createdAt: part.requested_at_ms,
+          metadata: { runId: message.source_run_id },
+        },
+        resolution:
+          decision === undefined
+            ? undefined
+            : {
+                requestId: part.approval_id,
+                option: decision,
+                decision,
+                reason: part.resolution?.reason,
+                decidedAt: part.resolved_at_ms,
+              },
+      };
+    }
+    case "blob_ref":
+      return {
+        type: "file",
+        id: part.blob_id,
+        url: `/api/v1/blobs/${encodeURIComponent(part.blob_id)}`,
+        mediaType: part.media_type,
+        name: part.name,
+        size: part.size_bytes,
+        status: "ready",
+      };
+  }
+}
+
+function sessionToolState(state: Extract<SessionContentPart, { type: "tool_call" }>["state"]) {
+  return state.replaceAll("_", "-") as
+    | "input-streaming"
+    | "input-available"
+    | "executing"
+    | "output-available"
+    | "output-error";
+}
+
+function parseStoredToolOutput(output: string): unknown {
+  try {
+    return JSON.parse(output) as unknown;
+  } catch {
+    return output;
+  }
 }
 
 function newSessionTitle() {
@@ -147,11 +267,70 @@ function isSessionMessage(value: unknown): value is SessionMessage {
 
 function isSessionContentPart(value: unknown): value is SessionContentPart {
   if (!isRecord(value) || typeof value.type !== "string") return false;
-  if (value.type === "text") return typeof value.text === "string";
+  switch (value.type) {
+    case "text":
+      return typeof value.text === "string";
+    case "reasoning":
+      return (
+        typeof value.text === "string" &&
+        (value.duration_ms === undefined || typeof value.duration_ms === "number")
+      );
+    case "tool_call":
+      return (
+        typeof value.tool_call_id === "string" &&
+        typeof value.name === "string" &&
+        isSessionToolState(value.state) &&
+        (value.input_text === undefined || typeof value.input_text === "string") &&
+        (value.output === undefined || typeof value.output === "string") &&
+        (value.error === undefined || typeof value.error === "string") &&
+        (value.duration_ms === undefined || typeof value.duration_ms === "number")
+      );
+    case "permission":
+      return (
+        typeof value.approval_id === "string" &&
+        typeof value.call_id === "string" &&
+        typeof value.tool_name === "string" &&
+        isPermissionRisk(value.risk_level) &&
+        "arguments" in value &&
+        typeof value.requested_at_ms === "number" &&
+        (value.resolution === undefined || isApprovalResolution(value.resolution)) &&
+        (value.resolved_at_ms === undefined || typeof value.resolved_at_ms === "number")
+      );
+    case "blob_ref":
+      return (
+        typeof value.blob_id === "string" &&
+        typeof value.media_type === "string" &&
+        (value.name === undefined || typeof value.name === "string") &&
+        (value.size_bytes === undefined || typeof value.size_bytes === "number")
+      );
+    default:
+      return false;
+  }
+}
+
+function isSessionToolState(
+  value: unknown,
+): value is Extract<SessionContentPart, { type: "tool_call" }>["state"] {
   return (
-    value.type === "blob_ref" &&
-    typeof value.blob_id === "string" &&
-    typeof value.media_type === "string"
+    value === "input_streaming" ||
+    value === "input_available" ||
+    value === "executing" ||
+    value === "output_available" ||
+    value === "output_error"
+  );
+}
+
+function isPermissionRisk(value: unknown): value is "low" | "medium" | "high" {
+  return value === "low" || value === "medium" || value === "high";
+}
+
+function isApprovalResolution(
+  value: unknown,
+): value is { decision: "allow-once" | "deny"; reason?: string } {
+  return (
+    isRecord(value) &&
+    (value.decision === "allow-once" || value.decision === "deny") &&
+    (value.reason === undefined || typeof value.reason === "string")
   );
 }
 

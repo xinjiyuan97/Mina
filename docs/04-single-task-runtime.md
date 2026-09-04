@@ -1,6 +1,6 @@
 # Mina Agent Framework：单次任务与流式事件引擎
 
-> 状态：MVP 已实现。本文描述当前可运行的纵向切片，以及事件边界如何支持后续工具调用、审批、会话与恢复。
+> 状态：历史设计记录。当前 Server 已统一为 reducer 驱动的原生 `AgentMachine`；本文保留早期单轮事件边界的设计背景，不代表仍可选择 `single-turn` 或 `echo` 服务端模式。
 
 ## 1. 单次任务的边界
 
@@ -207,9 +207,17 @@ sequenceDiagram
 
 Provider/Agent 流仍按需轮询并形成背压，但 HTTP SSE 已不是 run owner。客户端断开只结束该订阅，后台 run 继续执行并把聚合后的事件异步写入 SQLite；客户端可以带 `after_seq` 重连并先重放历史、再接实时广播。取消必须显式调用 run cancel API。已经 checkpoint 到 `WaitingEvent` 的 run 可跨 Server 重启恢复；正在模型或同步 Tool 内执行而没有安全 checkpoint 的 activation 会标记为 `run_interrupted`。
 
-## 7. OpenAI-compatible adapter
+## 7. Provider adapters 与多模态
 
-adapter 使用流式 Chat Completions：
+Core 只定义 provider-neutral 的 `ModelPort`、`ModelMessage`、`ModelAttachment` 与
+`ModelEvent`。`agent-extension::provider::ConfiguredModelProvider` 根据 TOML 在框架层选择
+三种实现，Server、CLI、AgentLoop 和上下文压缩不包含协议分支：
+
+- OpenAI-compatible Chat Completions：`POST {base_url}/chat/completions`；
+- OpenAI Responses API：`POST {base_url}/responses`；
+- Anthropic Messages API：`POST {base_url}/messages`。
+
+Chat Completions adapter 使用：
 
 ```text
 POST {base_url}/chat/completions
@@ -220,21 +228,21 @@ stream = true
 stream_options.include_usage = true
 ```
 
-adapter 将内部 `ModelRequest` 映射为 `model`、`messages`、`max_tokens`，从 `choices[].delta.reasoning_content`（也兼容 `reasoning`）产生思考增量，从 `choices[].delta.content` 产生最终文本增量，从 `finish_reason` 产生标准终止原因，并从最后的 usage chunk 产生 token 用量。
+adapter 将内部 `ModelRequest` 映射为 `model`、`messages`、`max_tokens`，从 `choices[].delta.reasoning_content`（也兼容 `reasoning`）产生思考增量，从 `choices[].delta.content` 产生最终文本增量，从 `finish_reason` 产生标准终止原因，并从最后的 usage chunk 产生 token 用量。Responses 的 `output_text`、reasoning summary、function call 和 usage 事件，以及 Messages 的 text/thinking/tool_use/usage 事件都归一化为同一组 `ModelEvent`。
 
 标准服务以 `[DONE]` 结束；部分兼容服务会在含 `finish_reason` 的 chunk 后直接断开，adapter 也接受这种形式。若流在已产生文本后中断，错误标记为不可自动重试，避免重放造成重复输出；若尚未产生文本，则可标记为可重试。当前只暴露能力边界，尚未在 Agent 内实现自动重试策略。
 
-选择 Chat Completions 是为了覆盖更多兼容服务。以后可以增加 Responses 或其他 provider adapter，但它们仍需映射为同一 `ModelEvent`，不能把私有协议泄漏到 `ModelPort`。
+Composer 附件先上传到 `POST /api/v1/blobs`。文件系统 BlobStore 保存二进制和 metadata，Session 消息、Run、checkpoint 与上下文历史只携带 `BlobId`；provider adapter 在请求即将发出时读取并转换为 data URL 或 base64 source。因此 SQLite 不会按 token/chunk 重复保存图片，刷新后的附件也能回放。当前每个文件上限 10 MiB、每次 Run 上限 8 个，Server 还会依据模型 profile 的 `modalities.input` 拒绝不支持的 image/audio/video/document。
 
 协议依据：[OpenAI Chat Completions Streaming Events](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)。
 
 ## 8. 配置和运行模式
 
-真实单次任务：
+当前服务端配置：
 
 ```toml
 [agent]
-kind = "single-turn"
+kind = "agent-loop"
 system_prompt = "You are Mina, a helpful agent."
 
 [models.primary]
@@ -244,17 +252,21 @@ max_output_tokens = 4096
 [models.primary.provider]
 type = "openai-compatible"
 base_url = "https://api.openai.com/v1/"
+protocol = "responses" # 或 chat-completions
 api_key = "replace-with-real-key"
 ```
 
-不调用上游的本地开发：
+Anthropic Messages 使用独立 provider variant：
 
 ```toml
-[agent]
-kind = "echo"
+[models.primary.provider]
+type = "anthropic"
+base_url = "https://api.anthropic.com/v1/"
+api_key = "replace-with-real-key"
+version = "2023-06-01"
 ```
 
-两种模式都使用 `/api/v1/runs` 和相同事件协议，所以前端无需分支。
+不调用上游的本地开发应配置 mock Responses 或 Messages provider；Server 不再提供 `echo` 模式。
 
 ## 9. 下一阶段
 

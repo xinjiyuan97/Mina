@@ -1,6 +1,6 @@
 use std::{future::Future, pin::Pin};
 
-use crate::harness::{ModelMessage, ModelRole, RunId};
+use crate::harness::{ModelAttachment, ModelMessage, ModelRole, RunId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -34,6 +34,8 @@ pub struct ContextItem {
     pub item_id: String,
     pub role: ModelRole,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ModelAttachment>,
     pub priority: ContextPriority,
     pub source: ContextSourceRef,
 }
@@ -43,10 +45,11 @@ impl ContextItem {
     pub fn into_model_message(self) -> ModelMessage {
         match self.role {
             ModelRole::System => ModelMessage::system(self.content),
-            ModelRole::User => ModelMessage::user(self.content),
+            ModelRole::User => ModelMessage::user_with_attachments(self.content, self.attachments),
             ModelRole::Assistant => ModelMessage {
                 role: ModelRole::Assistant,
                 content: self.content,
+                attachments: self.attachments,
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,

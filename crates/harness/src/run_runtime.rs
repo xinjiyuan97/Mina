@@ -7,8 +7,9 @@ use std::{
 use agent_core::harness::{
     Agent, AgentMachine, AgentMetadata, ClaimedActivation, CompleteFlowRun, ContinueFlowRun,
     FlowError, FlowRunState, FlowRunStatus, FlowStore, MachineOutput, MachineResumeRequest,
-    MachineStartRequest, ModelMessage, ObservedRunEvent, RunCancellation, RunEvent, RunEventKind,
-    RunId, RunSnapshot, RunStore, RunStoreError, StepOutcome, SuspendFlowRun,
+    MachineStartRequest, ModelAttachment, ModelMessage, ObservedRunEvent, RenewFlowLease,
+    RunCancellation, RunEvent, RunEventKind, RunId, RunSnapshot, RunStore, RunStoreError,
+    StepOutcome, SuspendFlowRun,
 };
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -23,7 +24,8 @@ const PERSISTENCE_BATCH_MAX_EVENTS: usize = 128;
 const PERSISTENCE_BATCH_WINDOW: Duration = Duration::from_millis(40);
 const PERSISTENCE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const FLOW_WORKER_INTERVAL: Duration = Duration::from_millis(100);
-const FLOW_ACTIVATION_LEASE_MS: i64 = 120_000;
+const FLOW_ACTIVATION_LEASE: Duration = Duration::from_secs(120);
+const FLOW_ACTIVATION_HEARTBEAT: Duration = Duration::from_secs(30);
 const FLOW_CLAIM_LIMIT: usize = 16;
 
 #[derive(Debug, Clone)]
@@ -43,6 +45,7 @@ pub struct StartedRun {
 pub struct PlannedRun {
     pub run_id: RunId,
     pub input: String,
+    pub attachments: Vec<ModelAttachment>,
     pub prior_messages: Vec<ModelMessage>,
     pub allowed_tools: Option<Vec<String>>,
     pub allow_run_adf: bool,
@@ -54,6 +57,8 @@ pub struct PlannedRun {
 struct DurableRuntime {
     machine: Arc<dyn AgentMachine>,
     flows: Arc<dyn FlowStore>,
+    activation_lease: Duration,
+    activation_heartbeat: Duration,
 }
 
 pub struct RunRuntime<A> {
@@ -109,8 +114,28 @@ where
             store,
             active_runs: ActiveRuns::default(),
             on_finished: Arc::new(on_finished),
-            durable: Some(Arc::new(DurableRuntime { machine, flows })),
+            durable: Some(Arc::new(DurableRuntime {
+                machine,
+                flows,
+                activation_lease: FLOW_ACTIVATION_LEASE,
+                activation_heartbeat: FLOW_ACTIVATION_HEARTBEAT,
+            })),
         }
+    }
+
+    #[cfg(test)]
+    fn with_flow_activation_timing(mut self, lease: Duration, heartbeat: Duration) -> Self {
+        assert!(!lease.is_zero());
+        assert!(!heartbeat.is_zero() && heartbeat < lease);
+        let durable = Arc::get_mut(
+            self.durable
+                .as_mut()
+                .expect("flow timing requires a durable runtime"),
+        )
+        .expect("flow timing must be configured before cloning the runtime");
+        durable.activation_lease = lease;
+        durable.activation_heartbeat = heartbeat;
+        self
     }
 
     #[must_use]
@@ -122,6 +147,7 @@ where
         self.start_planned(PlannedRun {
             run_id: RunId::new(),
             input,
+            attachments: Vec::new(),
             prior_messages: Vec::new(),
             allowed_tools: None,
             allow_run_adf: false,
@@ -136,9 +162,10 @@ where
         if self.durable.is_some() {
             return self.start_machine(plan, true).await;
         }
-        let execution = self.harness.start_with_options(
+        let execution = self.harness.start_with_options_and_attachments(
             plan.run_id,
             plan.input.clone(),
+            plan.attachments,
             plan.prior_messages,
             RunOptions {
                 allowed_tools: plan.allowed_tools,
@@ -168,9 +195,10 @@ where
                 .set_execution_manifest(plan.run_id, manifest)
                 .await?;
         }
-        let execution = self.harness.start_with_options(
+        let execution = self.harness.start_with_options_and_attachments(
             plan.run_id,
             plan.input,
+            plan.attachments,
             plan.prior_messages,
             RunOptions {
                 allowed_tools: plan.allowed_tools,
@@ -196,6 +224,7 @@ where
         let start_request = MachineStartRequest {
             run_id: plan.run_id,
             input: plan.input.clone(),
+            attachments: plan.attachments,
             prior_messages: plan.prior_messages,
             allowed_tools: plan.allowed_tools,
             allow_run_adf: plan.allow_run_adf,
@@ -303,7 +332,7 @@ where
             .claim_runnable(
                 worker_id.to_owned(),
                 now_ms,
-                now_ms.saturating_add(FLOW_ACTIVATION_LEASE_MS),
+                deadline_after(now_ms, durable.activation_lease),
                 FLOW_CLAIM_LIMIT,
             )
             .await?;
@@ -332,6 +361,11 @@ where
             .state
             .activation_id
             .ok_or_else(|| RunRuntimeError::machine_message("claimed flow has no activation id"))?;
+        let worker_id =
+            activation.state.lease_owner.clone().ok_or_else(|| {
+                RunRuntimeError::machine_message("claimed flow has no lease owner")
+            })?;
+        let expected_revision = activation.state.revision;
         let (cancellation, sender) = self.machine_activation_context(run_id);
         let snapshot = self
             .store
@@ -374,7 +408,40 @@ where
             failure_tx,
         ));
         let mut outcome = None;
-        while let Some(output) = outputs.next().await {
+        let mut lease_error = None;
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + durable.activation_heartbeat,
+            durable.activation_heartbeat,
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let output = tokio::select! {
+                biased;
+                _ = heartbeat.tick() => {
+                    let renewed_at_ms = unix_time_ms();
+                    match durable.flows.renew_lease(RenewFlowLease {
+                        run_id,
+                        activation_id,
+                        expected_revision,
+                        worker_id: worker_id.clone(),
+                        renewed_at_ms,
+                        lease_until_ms: deadline_after(
+                            renewed_at_ms,
+                            durable.activation_lease,
+                        ),
+                    }).await {
+                        Ok(_) => continue,
+                        Err(error) => {
+                            lease_error = Some(error);
+                            None
+                        }
+                    }
+                },
+                output = outputs.next() => output,
+            };
+            let Some(output) = output else {
+                break;
+            };
             match output {
                 MachineOutput::Event(agent_event) => {
                     if outcome.is_some() {
@@ -442,6 +509,7 @@ where
                 }
             }
         }
+        drop(outputs);
         drop(persistence_tx);
         match persistence.await {
             Ok(Ok(())) => {}
@@ -455,6 +523,9 @@ where
                     "run persistence worker failed: {error}"
                 )));
             }
+        }
+        if let Some(error) = lease_error {
+            return Err(RunRuntimeError::Flow(error));
         }
         let outcome = outcome.unwrap_or_else(|| StepOutcome::Failed {
             error: agent_core::harness::MachineError {
@@ -1037,6 +1108,10 @@ pub fn unix_time_ms() -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
+fn deadline_after(now_ms: i64, duration: Duration) -> i64 {
+    now_ms.saturating_add(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1215,6 +1290,62 @@ mod tests {
                 request.inbox,
                 request.activated_at_ms,
             )
+        }
+    }
+
+    #[derive(Debug)]
+    struct SlowLeaseMachine {
+        activations: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    impl Agent for SlowLeaseMachine {
+        fn metadata(&self) -> AgentMetadata {
+            AgentMetadata::new("slow-lease", "test")
+        }
+
+        fn run(&self, _request: RunRequest) -> AgentEventStream {
+            Box::pin(stream::pending())
+        }
+    }
+
+    impl AgentMachine for SlowLeaseMachine {
+        fn metadata(&self) -> AgentMetadata {
+            Agent::metadata(self)
+        }
+
+        fn initial_checkpoint(
+            &self,
+            _request: &MachineStartRequest,
+        ) -> Result<CheckpointEnvelope, MachineError> {
+            Ok(CheckpointEnvelope {
+                agent_kind: "slow-lease".into(),
+                schema_version: 1,
+                codec: CheckpointCodec::Json,
+                payload: json!({}),
+            })
+        }
+
+        fn start(&self, request: MachineStartRequest) -> MachineStream {
+            self.activation_stream(request.run_id)
+        }
+
+        fn resume(&self, request: MachineResumeRequest) -> MachineStream {
+            self.activation_stream(request.run_id)
+        }
+    }
+
+    impl SlowLeaseMachine {
+        fn activation_stream(&self, _run_id: RunId) -> MachineStream {
+            self.activations.fetch_add(1, Ordering::SeqCst);
+            let delay = self.delay;
+            Box::pin(async_stream! {
+                tokio::time::sleep(delay).await;
+                yield MachineOutput::Event(AgentEvent::text_delta("completed once"));
+                yield MachineOutput::Yield(StepOutcome::Complete {
+                    finish_reason: FinishReason::Stop,
+                });
+            })
         }
     }
 
@@ -1511,6 +1642,7 @@ mod tests {
             .start_planned(PlannedRun {
                 run_id,
                 input: "wait durably".into(),
+                attachments: Vec::new(),
                 prior_messages: Vec::new(),
                 allowed_tools: None,
                 allow_run_adf: false,
@@ -1634,6 +1766,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_prevents_reclaim_during_a_long_activation() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let adapter = Arc::new(
+            SqliteEventStore::open(directory.path().join("lease.sqlite3"), "flows:test")
+                .await
+                .expect("flow store should open"),
+        );
+        let flows: Arc<dyn FlowStore> = adapter;
+        let runs = Arc::new(InMemoryRunStore::default());
+        let run_store: Arc<dyn RunStore> = runs;
+        let activations = Arc::new(AtomicUsize::new(0));
+        let runtime = RunRuntime::new_durable(
+            Harness::new(SlowLeaseMachine {
+                activations: Arc::clone(&activations),
+                delay: Duration::from_millis(600),
+            }),
+            Arc::clone(&run_store),
+            Arc::clone(&flows),
+            |_| {},
+        )
+        .with_flow_activation_timing(Duration::from_millis(200), Duration::from_millis(40));
+        let run_id = RunId::new();
+        let started = runtime
+            .start_planned(PlannedRun {
+                run_id,
+                input: "stay active beyond the original lease".into(),
+                attachments: Vec::new(),
+                prior_messages: Vec::new(),
+                allowed_tools: None,
+                allow_run_adf: false,
+                max_steps: None,
+                context_fingerprint: None,
+                execution_manifest: None,
+            })
+            .await
+            .expect("durable run should start");
+        drop(started.events);
+        runtime
+            .drive_flows_once("worker-1")
+            .await
+            .expect("first activation should claim");
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        runtime
+            .drive_flows_once("worker-2")
+            .await
+            .expect("reclaim check should succeed");
+        assert_eq!(
+            activations.load(Ordering::SeqCst),
+            1,
+            "a heartbeat-protected activation must not be reclaimed"
+        );
+
+        wait_for_status(&run_store, run_id, RunStatus::Completed).await;
+        let events = run_store
+            .events_after(run_id, 0, 100)
+            .await
+            .expect("run events should load");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, RunEventKind::RunStarted))
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event.kind, RunEventKind::RunResumed { .. }))
+        );
+    }
+
+    #[tokio::test]
     async fn real_agent_loop_approval_resumes_after_runtime_restart() {
         let directory = tempdir().expect("temporary directory should exist");
         let path = directory.path().join("agent-loop.sqlite3");
@@ -1667,6 +1872,7 @@ mod tests {
             .start_planned(PlannedRun {
                 run_id,
                 input: "run a risky tool".into(),
+                attachments: Vec::new(),
                 prior_messages: Vec::new(),
                 allowed_tools: None,
                 allow_run_adf: false,

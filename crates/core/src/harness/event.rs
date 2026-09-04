@@ -19,7 +19,8 @@ pub type RunEventStream = Pin<Box<dyn Stream<Item = RunEvent> + Send + 'static>>
 
 /// Semantic events produced by an Agent. Run identity, sequence numbers, and
 /// terminal validation are owned by the Harness event engine.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AgentEvent {
     OutputDelta {

@@ -166,6 +166,7 @@ async fn persist_initial_suspension(
     let request = MachineStartRequest {
         run_id,
         input: "start".into(),
+        attachments: Vec::new(),
         prior_messages: Vec::new(),
         allowed_tools: None,
         allow_run_adf: false,

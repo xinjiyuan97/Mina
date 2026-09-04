@@ -16,8 +16,8 @@ use agent_core::event_runtime::{
 use agent_core::harness::{
     ActivationId, ClaimedActivation, CompleteFlowEffect, CompleteFlowRun, ContinueFlowRun,
     EffectRequest, FlowEffect, FlowEffectId, FlowEffectStatus, FlowError, FlowFuture,
-    FlowInboxItem, FlowRunState, FlowRunStatus, FlowStore, RetryFlowEffect, RunId, SuspendFlowRun,
-    WakeFlowRun,
+    FlowInboxItem, FlowRunState, FlowRunStatus, FlowStore, RenewFlowLease, RetryFlowEffect, RunId,
+    SuspendFlowRun, WakeFlowRun,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
@@ -458,6 +458,18 @@ impl FlowStore for SqliteEventStore {
         })
     }
 
+    fn renew_lease(&self, command: RenewFlowLease) -> FlowFuture<'_, FlowRunState> {
+        let connection = Arc::clone(&self.connection);
+        Box::pin(async move {
+            validate_flow_claim(
+                &command.worker_id,
+                command.renewed_at_ms,
+                command.lease_until_ms,
+            )?;
+            run_flow_blocking(move || renew_flow_lease_blocking(&connection, command)).await
+        })
+    }
+
     fn claim_effects(
         &self,
         worker_id: String,
@@ -739,6 +751,40 @@ fn claim_flows_blocking(
         .commit()
         .map_err(|error| flow_sql_error("commit flow claim", error))?;
     Ok(claimed)
+}
+
+fn renew_flow_lease_blocking(
+    connection: &Mutex<Connection>,
+    command: RenewFlowLease,
+) -> Result<FlowRunState, FlowError> {
+    let mut connection = lock_flow_connection(connection)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| flow_sql_error("begin flow lease renewal", error))?;
+    let mut state = load_flow(&transaction, command.run_id)?;
+    require_flow_activation(&state, command.activation_id, command.expected_revision)?;
+    if state.lease_owner.as_deref() != Some(command.worker_id.as_str()) {
+        return Err(FlowError::Conflict(
+            "flow activation lease is owned by another worker".into(),
+        ));
+    }
+    let current_lease_until = state.lease_until_ms.ok_or_else(|| {
+        FlowError::Conflict("flow activation no longer has an active lease".into())
+    })?;
+    if current_lease_until <= command.renewed_at_ms {
+        return Err(FlowError::Conflict(
+            "flow activation lease expired before it could be renewed".into(),
+        ));
+    }
+    if command.lease_until_ms > current_lease_until {
+        state.lease_until_ms = Some(command.lease_until_ms);
+        state.updated_at_ms = command.renewed_at_ms;
+        persist_flow(&transaction, &state)?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| flow_sql_error("commit flow lease renewal", error))?;
+    Ok(state)
 }
 
 fn complete_flow_blocking(
@@ -2228,7 +2274,7 @@ mod tests {
     };
     use agent_core::harness::{
         CheckpointCodec, CheckpointEnvelope, CompleteFlowRun, FlowRunState, FlowRunStatus,
-        FlowStore, SuspendFlowRun, WaitSpec, WakeFlowRun,
+        FlowStore, RenewFlowLease, SuspendFlowRun, WaitSpec, WakeFlowRun,
     };
     use serde_json::json;
     use tempfile::tempdir;
@@ -2542,6 +2588,101 @@ mod tests {
                 .expect("terminal flow query should succeed")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn flow_activation_lease_renewal_is_owned_and_fenced() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let store = SqliteEventStore::open(directory.path().join("events.sqlite3"), "events:test")
+            .await
+            .expect("store should open");
+        let run_id = RunId::new();
+        store
+            .create(FlowRunState {
+                run_id,
+                revision: 0,
+                status: FlowRunStatus::Runnable,
+                activation_id: None,
+                checkpoint: CheckpointEnvelope {
+                    agent_kind: "lease-test".into(),
+                    schema_version: 1,
+                    codec: CheckpointCodec::Json,
+                    payload: json!({}),
+                },
+                wait_subscription_ids: Vec::new(),
+                lease_owner: None,
+                lease_until_ms: None,
+                updated_at_ms: 1,
+            })
+            .await
+            .expect("flow should persist");
+        let claimed = store
+            .claim_runnable("worker-1".into(), 2, 102, 1)
+            .await
+            .expect("flow should claim")
+            .into_iter()
+            .next()
+            .expect("one flow should claim");
+        let activation_id = claimed
+            .state
+            .activation_id
+            .expect("claimed flow should have an activation");
+
+        let renewed = store
+            .renew_lease(RenewFlowLease {
+                run_id,
+                activation_id,
+                expected_revision: claimed.state.revision,
+                worker_id: "worker-1".into(),
+                renewed_at_ms: 50,
+                lease_until_ms: 150,
+            })
+            .await
+            .expect("lease owner should renew");
+        assert_eq!(renewed.revision, claimed.state.revision);
+        assert_eq!(renewed.activation_id, Some(activation_id));
+        assert_eq!(renewed.lease_until_ms, Some(150));
+        assert!(
+            store
+                .claim_runnable("worker-2".into(), 120, 220, 1)
+                .await
+                .expect("unexpired flow query should succeed")
+                .is_empty()
+        );
+
+        let wrong_owner = store
+            .renew_lease(RenewFlowLease {
+                run_id,
+                activation_id,
+                expected_revision: claimed.state.revision,
+                worker_id: "worker-2".into(),
+                renewed_at_ms: 60,
+                lease_until_ms: 160,
+            })
+            .await;
+        assert!(matches!(wrong_owner, Err(FlowError::Conflict(_))));
+
+        let reclaimed = store
+            .claim_runnable("worker-2".into(), 150, 250, 1)
+            .await
+            .expect("expired flow should reclaim")
+            .into_iter()
+            .next()
+            .expect("expired flow should be claimed");
+        assert_ne!(reclaimed.state.activation_id, Some(activation_id));
+        assert_eq!(reclaimed.state.revision, claimed.state.revision + 1);
+
+        let stale_activation = store
+            .renew_lease(RenewFlowLease {
+                run_id,
+                activation_id,
+                expected_revision: claimed.state.revision,
+                worker_id: "worker-1".into(),
+                renewed_at_ms: 151,
+                lease_until_ms: 251,
+            })
+            .await;
+        assert!(matches!(stale_activation, Err(FlowError::Conflict(_))));
     }
 
     #[tokio::test]

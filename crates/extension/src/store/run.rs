@@ -18,16 +18,17 @@ use agent_core::harness::{
     FinalizeSessionRun, MAX_SESSION_PAGE_SIZE, MessageId, ObservedRunEvent, RunEvent, RunId,
     RunSnapshot, RunStatus, RunStore, RunStoreError, RunStoreFuture, SessionId, SessionMessage,
     SessionSnapshot, SessionStatus, SessionStore, SessionStoreError, SessionStoreFuture,
+    project_run_content, project_run_output,
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 5;
 const MAX_EVENT_PAGE_SIZE: usize = 10_000;
 
 #[derive(Debug, Clone)]
 struct MemoryRun {
     snapshot: RunSnapshot,
-    events: BTreeMap<u64, RunEvent>,
+    events: BTreeMap<u64, ObservedRunEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,7 +107,7 @@ impl RunStore for InMemoryRunStore {
                 .get_mut(&event.run_id)
                 .ok_or(RunStoreError::NotFound(event.run_id))?;
             if let Some(existing) = run.events.get(&event.seq) {
-                return if existing == &event {
+                return if existing.event == event {
                     Ok(run.snapshot.clone())
                 } else {
                     Err(RunStoreError::EventConflict {
@@ -116,7 +117,8 @@ impl RunStore for InMemoryRunStore {
                 };
             }
             run.snapshot.apply(&event, observed_at_ms)?;
-            run.events.insert(event.seq, event);
+            run.events
+                .insert(event.seq, ObservedRunEvent::new(event, observed_at_ms));
             Ok(run.snapshot.clone())
         })
     }
@@ -134,7 +136,7 @@ impl RunStore for InMemoryRunStore {
                 .events
                 .range((after_seq.saturating_add(1))..)
                 .take(limit.clamp(1, MAX_EVENT_PAGE_SIZE))
-                .map(|(_, event)| event.clone())
+                .map(|(_, observed)| observed.event.clone())
                 .collect())
         })
     }
@@ -315,6 +317,17 @@ impl SessionStore for InMemoryRunStore {
             if !command.run.is_terminal() {
                 return Err(SessionStoreError::RunNotTerminal);
             }
+            let projected_content = if command.run.status == RunStatus::Completed {
+                let runs = self.runs.lock().map_err(|_| {
+                    SessionStoreError::backend("in-memory run store lock was poisoned")
+                })?;
+                let run = runs
+                    .get(&command.run.run_id)
+                    .ok_or(SessionStoreError::RunMismatch(command.run.run_id))?;
+                project_run_content(&run.events.values().cloned().collect::<Vec<_>>())
+            } else {
+                Vec::new()
+            };
             let mut sessions = self.lock_sessions()?;
             let session = sessions
                 .get_mut(&command.session_id)
@@ -342,7 +355,7 @@ impl SessionStore for InMemoryRunStore {
                         session_id: command.session_id,
                         ordinal,
                         role: ConversationRole::Assistant,
-                        content: vec![ContentPart::text(command.run.output.clone())],
+                        content: projected_content,
                         source_run_id: Some(command.run.run_id),
                         created_at_ms: command.finalized_at_ms,
                     },
@@ -467,8 +480,8 @@ impl SqliteRunStore {
 
         let migration_path = path.clone();
         let connection = run_blocking(move || {
-            let connection = connect(&migration_path)?;
-            migrate(&connection)?;
+            let mut connection = connect(&migration_path)?;
+            migrate(&mut connection)?;
             Ok(connection)
         })
         .await?;
@@ -1014,13 +1027,16 @@ impl SessionStore for SqliteRunStore {
                 }
 
                 if stored_run.status == RunStatus::Completed {
+                    let events =
+                        load_observed_run_events(&transaction, &stored_run.run_id.to_string())
+                            .map_err(|error| SessionStoreError::backend(error.to_string()))?;
                     let ordinal = session.next_message_ordinal;
                     let message = SessionMessage {
                         message_id: MessageId::new(),
                         session_id: command.session_id,
                         ordinal,
                         role: ConversationRole::Assistant,
-                        content: vec![ContentPart::text(stored_run.output)],
+                        content: project_run_content(&events),
                         source_run_id: Some(stored_run.run_id),
                         created_at_ms: command.finalized_at_ms,
                     };
@@ -1372,7 +1388,7 @@ fn lock_run_connection(
         .map_err(|_| RunStoreError::backend("SQLite run connection lock was poisoned"))
 }
 
-fn migrate(connection: &Connection) -> Result<(), RunStoreError> {
+fn migrate(connection: &mut Connection) -> Result<(), RunStoreError> {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|error| sql_error("read schema version", error))?;
@@ -1474,6 +1490,189 @@ fn migrate(connection: &Connection) -> Result<(), RunStoreError> {
             )
             .map_err(|error| sql_error("create context artifact schema", error))?;
     }
+    if version < 4 {
+        migrate_output_round_boundaries(connection)?;
+    }
+    if version < 5 {
+        migrate_structured_session_content(connection)?;
+    }
+    Ok(())
+}
+
+/// Version 4 rebuilds the flattened output materialization from the event log. Earlier
+/// versions concatenated text from separate model/tool rounds without a delimiter, so a
+/// refreshed session rendered all progress updates as one paragraph.
+fn migrate_output_round_boundaries(connection: &mut Connection) -> Result<(), RunStoreError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| sql_error("begin output projection migration", error))?;
+    let runs = {
+        let mut statement = transaction
+            .prepare("SELECT run_id, snapshot_json FROM runs")
+            .map_err(|error| sql_error("prepare output projection migration", error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| sql_error("query runs for output projection migration", error))?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(
+                row.map_err(|error| sql_error("read run for output projection migration", error))?,
+            );
+        }
+        runs
+    };
+
+    for (run_id, snapshot_json) in runs {
+        let mut snapshot: RunSnapshot = decode(&snapshot_json, "run snapshot")?;
+        let events = {
+            let mut statement = transaction
+                .prepare("SELECT event_json FROM run_events WHERE run_id = ?1 ORDER BY seq ASC")
+                .map_err(|error| {
+                    sql_error("prepare run events for output projection migration", error)
+                })?;
+            let rows = statement
+                .query_map([&run_id], |row| row.get::<_, String>(0))
+                .map_err(|error| {
+                    sql_error("query run events for output projection migration", error)
+                })?;
+            let mut events = Vec::new();
+            for row in rows {
+                let json = row.map_err(|error| {
+                    sql_error("read run event for output projection migration", error)
+                })?;
+                events.push(decode(&json, "run event")?);
+            }
+            events
+        };
+        let output = project_run_output(&events);
+        if output == snapshot.output {
+            continue;
+        }
+
+        snapshot.output.clone_from(&output);
+        transaction
+            .execute(
+                "UPDATE runs SET snapshot_json = ?1 WHERE run_id = ?2",
+                params![encode(&snapshot, "run snapshot")?, run_id],
+            )
+            .map_err(|error| sql_error("update migrated run output", error))?;
+
+        let messages = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT session_id, ordinal, message_json FROM session_messages
+                     WHERE source_run_id = ?1 AND role = 'assistant'",
+                )
+                .map_err(|error| sql_error("prepare session output migration", error))?;
+            let rows = statement
+                .query_map([&run_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|error| sql_error("query session output migration", error))?;
+            let mut messages = Vec::new();
+            for row in rows {
+                messages
+                    .push(row.map_err(|error| sql_error("read session output migration", error))?);
+            }
+            messages
+        };
+        for (session_id, ordinal, message_json) in messages {
+            let mut message: SessionMessage = session_decode(&message_json, "session message")
+                .map_err(|error| RunStoreError::backend(error.to_string()))?;
+            message.content = vec![ContentPart::text(output.clone())];
+            transaction
+                .execute(
+                    "UPDATE session_messages SET message_json = ?1
+                     WHERE session_id = ?2 AND ordinal = ?3",
+                    params![
+                        session_encode(&message, "session message")
+                            .map_err(|error| RunStoreError::backend(error.to_string()))?,
+                        session_id,
+                        ordinal,
+                    ],
+                )
+                .map_err(|error| sql_error("update migrated session output", error))?;
+        }
+    }
+
+    transaction
+        .pragma_update(None, "user_version", 4)
+        .map_err(|error| sql_error("set output projection schema version", error))?;
+    transaction
+        .commit()
+        .map_err(|error| sql_error("commit output projection migration", error))?;
+    Ok(())
+}
+
+/// Version 5 replaces the flattened assistant Session message with a compact,
+/// ordered projection of the authoritative run event log. Existing token events
+/// stay in `run_events`; clients receive reasoning, tools and approvals directly.
+fn migrate_structured_session_content(connection: &mut Connection) -> Result<(), RunStoreError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| sql_error("begin structured session content migration", error))?;
+    let messages = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT session_id, ordinal, source_run_id, message_json
+                 FROM session_messages
+                 WHERE role = 'assistant' AND source_run_id IS NOT NULL",
+            )
+            .map_err(|error| sql_error("prepare structured session content migration", error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|error| sql_error("query structured session content migration", error))?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(
+                row.map_err(|error| sql_error("read structured session content migration", error))?,
+            );
+        }
+        messages
+    };
+
+    for (session_id, ordinal, run_id, message_json) in messages {
+        let events = load_observed_run_events(&transaction, &run_id)?;
+        if events.is_empty() {
+            continue;
+        }
+        let mut message: SessionMessage = serde_json::from_str(&message_json)
+            .map_err(|error| RunStoreError::backend(format!("decode session message: {error}")))?;
+        message.content = project_run_content(&events);
+        transaction
+            .execute(
+                "UPDATE session_messages SET message_json = ?1
+                 WHERE session_id = ?2 AND ordinal = ?3",
+                params![
+                    serde_json::to_string(&message).map_err(|error| {
+                        RunStoreError::backend(format!("encode session message: {error}"))
+                    })?,
+                    session_id,
+                    ordinal,
+                ],
+            )
+            .map_err(|error| sql_error("update structured session content", error))?;
+    }
+
+    transaction
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|error| sql_error("set structured session content schema version", error))?;
+    transaction
+        .commit()
+        .map_err(|error| sql_error("commit structured session content migration", error))?;
     Ok(())
 }
 
@@ -1607,6 +1806,33 @@ async fn run_session_blocking<T: Send + 'static>(
         .map_err(|error| SessionStoreError::backend(format!("store worker failed: {error}")))?
 }
 
+fn load_observed_run_events(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Vec<ObservedRunEvent>, RunStoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT event_json, observed_at_ms FROM run_events
+             WHERE run_id = ?1 ORDER BY seq ASC",
+        )
+        .map_err(|error| sql_error("prepare observed run event query", error))?;
+    let rows = statement
+        .query_map([run_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| sql_error("query observed run events", error))?;
+    let mut events = Vec::new();
+    for row in rows {
+        let (event_json, observed_at_ms) =
+            row.map_err(|error| sql_error("read observed run event", error))?;
+        events.push(ObservedRunEvent::new(
+            decode(&event_json, "run event")?,
+            observed_at_ms,
+        ));
+    }
+    Ok(events)
+}
+
 fn load_snapshot(
     connection: &Connection,
     run_id: RunId,
@@ -1673,7 +1899,10 @@ async fn run_blocking<T: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use agent_core::harness::{FinishReason, OutputChannel, RunEventKind, RunStateError};
+    use agent_core::harness::{
+        ApprovalId, ApprovalResolution, FinishReason, OutputChannel, RunEventKind, RunStateError,
+        SessionToolCallState, ToolRiskLevel,
+    };
     use tempfile::tempdir;
 
     use super::*;
@@ -2077,5 +2306,260 @@ mod tests {
                 .expect("pending query should work")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn version_five_migration_restores_structured_session_content() {
+        let directory = tempdir().expect("temp directory should be created");
+        let path = directory.path().join("state.sqlite3");
+        let store = SqliteRunStore::open(&path)
+            .await
+            .expect("store should open");
+        let session_id = SessionId::new();
+        let session = store
+            .create_session(CreateSession {
+                session_id,
+                agent_profile: "default".into(),
+                title: None,
+                created_at_ms: 1,
+            })
+            .await
+            .expect("session should be created");
+        let run_id = RunId::new();
+        let approval_id = ApprovalId::new();
+        store
+            .begin_run(
+                BeginSessionRun {
+                    session_id,
+                    run_id,
+                    expected_revision: session.revision,
+                    idempotency_key: "migration-run".into(),
+                    request_hash: "migration-hash".into(),
+                    input: vec![ContentPart::text("hello")],
+                    created_at_ms: 2,
+                },
+                RunSnapshot::new(run_id, "hello", 2),
+            )
+            .await
+            .expect("session run should begin");
+        let terminal = store
+            .append_events(vec![
+                ObservedRunEvent::new(RunEvent::new(run_id, 1, RunEventKind::RunStarted), 3),
+                ObservedRunEvent::new(
+                    RunEvent::new(
+                        run_id,
+                        2,
+                        RunEventKind::OutputDelta {
+                            channel: OutputChannel::AssistantReasoning,
+                            delta: "thinking".into(),
+                        },
+                    ),
+                    4,
+                ),
+                ObservedRunEvent::new(
+                    RunEvent::new(
+                        run_id,
+                        3,
+                        RunEventKind::OutputDelta {
+                            channel: OutputChannel::AssistantText,
+                            delta: "first round".into(),
+                        },
+                    ),
+                    5,
+                ),
+                ObservedRunEvent::new(
+                    RunEvent::new(
+                        run_id,
+                        4,
+                        RunEventKind::ToolCallStarted {
+                            call_id: "call_1".into(),
+                            name: "read".into(),
+                        },
+                    ),
+                    6,
+                ),
+                ObservedRunEvent::new(
+                    RunEvent::new(
+                        run_id,
+                        5,
+                        RunEventKind::ToolCallArgumentsDelta {
+                            call_id: "call_1".into(),
+                            delta: "{}".into(),
+                        },
+                    ),
+                    7,
+                ),
+                ObservedRunEvent::new(
+                    RunEvent::new(
+                        run_id,
+                        6,
+                        RunEventKind::ApprovalRequested {
+                            approval_id,
+                            call_id: "call_1".into(),
+                            tool_name: "read".into(),
+                            risk_level: ToolRiskLevel::Medium,
+                            arguments: serde_json::json!({}),
+                        },
+                    ),
+                    8,
+                ),
+                ObservedRunEvent::new(
+                    RunEvent::new(
+                        run_id,
+                        7,
+                        RunEventKind::ApprovalResolved {
+                            approval_id,
+                            call_id: "call_1".into(),
+                            resolution: ApprovalResolution::allow_once(),
+                        },
+                    ),
+                    9,
+                ),
+                ObservedRunEvent::new(
+                    RunEvent::new(
+                        run_id,
+                        8,
+                        RunEventKind::ToolExecutionStarted {
+                            call_id: "call_1".into(),
+                            arguments: serde_json::json!({}),
+                        },
+                    ),
+                    10,
+                ),
+                ObservedRunEvent::new(
+                    RunEvent::new(
+                        run_id,
+                        9,
+                        RunEventKind::ToolExecutionCompleted {
+                            call_id: "call_1".into(),
+                            output: "done".into(),
+                        },
+                    ),
+                    15,
+                ),
+                ObservedRunEvent::new(
+                    RunEvent::new(
+                        run_id,
+                        10,
+                        RunEventKind::OutputDelta {
+                            channel: OutputChannel::AssistantText,
+                            delta: "second round".into(),
+                        },
+                    ),
+                    16,
+                ),
+                ObservedRunEvent::new(
+                    RunEvent::new(
+                        run_id,
+                        11,
+                        RunEventKind::RunCompleted {
+                            finish_reason: FinishReason::Stop,
+                        },
+                    ),
+                    17,
+                ),
+            ])
+            .await
+            .expect("run should complete");
+        store
+            .finalize_run(FinalizeSessionRun {
+                session_id,
+                run: terminal,
+                finalized_at_ms: 10,
+            })
+            .await
+            .expect("session should finalize");
+        drop(store);
+
+        // Simulate a v3 database whose Session message was flattened even though
+        // the authoritative event log retained reasoning, tool and approval facts.
+        let connection = Connection::open(&path).expect("raw database should open");
+        let snapshot_json: String = connection
+            .query_row(
+                "SELECT snapshot_json FROM runs WHERE run_id = ?1",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("run snapshot should exist");
+        let mut snapshot: RunSnapshot = decode(&snapshot_json, "run snapshot").expect("valid run");
+        snapshot.output = "first roundsecond round".into();
+        connection
+            .execute(
+                "UPDATE runs SET snapshot_json = ?1 WHERE run_id = ?2",
+                params![
+                    encode(&snapshot, "run snapshot").expect("run should encode"),
+                    run_id.to_string(),
+                ],
+            )
+            .expect("run snapshot should be corrupted for the migration test");
+        let message_json: String = connection
+            .query_row(
+                "SELECT message_json FROM session_messages
+                 WHERE source_run_id = ?1 AND role = 'assistant'",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("assistant message should exist");
+        let mut message: SessionMessage =
+            session_decode(&message_json, "session message").expect("valid session message");
+        message.content = vec![ContentPart::text("first roundsecond round")];
+        connection
+            .execute(
+                "UPDATE session_messages SET message_json = ?1
+                 WHERE source_run_id = ?2 AND role = 'assistant'",
+                params![
+                    session_encode(&message, "session message").expect("message should encode"),
+                    run_id.to_string(),
+                ],
+            )
+            .expect("session message should be corrupted for the migration test");
+        connection
+            .pragma_update(None, "user_version", 3)
+            .expect("schema should be downgraded for the migration test");
+        drop(connection);
+
+        let reopened = SqliteRunStore::open(&path)
+            .await
+            .expect("v3 store should migrate");
+        let repaired_run = reopened
+            .get_run(run_id)
+            .await
+            .expect("run query should work")
+            .expect("run should exist");
+        assert_eq!(repaired_run.output, "first round\n\nsecond round");
+        let messages = reopened
+            .messages(session_id, None, 100)
+            .await
+            .expect("messages should load");
+        assert_eq!(messages[1].content.len(), 5);
+        assert!(matches!(
+            &messages[1].content[0],
+            ContentPart::Reasoning {
+                text,
+                duration_ms: Some(1)
+            } if text == "thinking"
+        ));
+        assert_eq!(messages[1].content[1].as_text(), Some("first round"));
+        assert!(matches!(
+            &messages[1].content[2],
+            ContentPart::ToolCall {
+                tool_call_id,
+                state: SessionToolCallState::OutputAvailable,
+                input_text,
+                output: Some(output),
+                duration_ms: Some(5),
+                ..
+            } if tool_call_id == "call_1" && input_text == "{}" && output == "done"
+        ));
+        assert!(matches!(
+            &messages[1].content[3],
+            ContentPart::Permission {
+                approval_id: stored_approval_id,
+                resolution: Some(_),
+                resolved_at_ms: Some(9),
+                ..
+            } if *stored_approval_id == approval_id
+        ));
+        assert_eq!(messages[1].content[4].as_text(), Some("second round"));
     }
 }

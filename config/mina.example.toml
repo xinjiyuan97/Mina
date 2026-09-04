@@ -1,15 +1,14 @@
 # The profile selected when a run does not name a model explicitly.
 default_model = "primary"
 
-# `agent-loop` can call registered tools; `single-turn` invokes the model once.
-# Use `echo` when developing the UI without calling an upstream service.
+# The server has one native reducer-backed Agent implementation.
 [agent]
 kind = "agent-loop"
 system_prompt = "You are Mina, a helpful agent. Complete the user's task accurately and concisely."
 max_steps = 8
 # Hard limits for a complete run, each model round, and each tool execution.
-run_timeout_seconds = 300
-model_timeout_seconds = 120
+run_timeout_seconds = 900
+model_timeout_seconds = 600
 tool_timeout_seconds = 30
 # Only tools explicitly declaring parallel-safe, immediate execution overlap.
 tool_call_strategy = "parallel-safe" # sequential | parallel-safe
@@ -70,6 +69,7 @@ output = ["text"]
 [models.primary.provider]
 type = "openai-compatible"
 base_url = "https://api.openai.com/v1"
+protocol = "chat-completions" # chat-completions | responses
 # `config/mina.toml` is ignored by Git; replace this value in your local copy.
 api_key = "replace-with-your-api-key"
 # organization = "org-example"
@@ -83,3 +83,19 @@ api_key = "replace-with-your-api-key"
 # type = "openai-compatible"
 # base_url = "http://127.0.0.1:11434/v1"
 # api_key = "not-required"
+
+# Anthropic Messages API uses the same provider-neutral ModelPort in Core.
+# [models.claude]
+# model = "claude-sonnet-4-5"
+# context_window = 200000
+# max_output_tokens = 16384
+#
+# [models.claude.modalities]
+# input = ["text", "image", "document"]
+# output = ["text"]
+#
+# [models.claude.provider]
+# type = "anthropic"
+# base_url = "https://api.anthropic.com/v1"
+# api_key = "replace-with-your-api-key"
+# version = "2023-06-01"

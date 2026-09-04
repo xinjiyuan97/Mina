@@ -218,7 +218,7 @@ POST /api/v1/runs/{run_id}/approvals/{approval_id}
 { "decision": "allow-once" | "deny", "reason"?: "..." }
 ```
 
-同一决定可以幂等重放，不同决定返回冲突。耐久 `AgentMachine` 会把待审批调用写入 versioned checkpoint，并在同一提交中创建 once subscription/outbox；run 进入 `WaitingEvent` 后释放 worker。Server 重启后，HTTP 审批产生 `tool.approval.resolved`，事件写入 run inbox 并恢复原调用。拒绝不会执行工具，而是把 `tool_rejected` 和可选原因送回模型。兼容的 `Agent::run` 仍使用进程内 `ApprovalPort`，不承诺跨重启等待。
+同一决定可以幂等重放，不同决定返回冲突。原生 reducer `AgentMachine` 会把待审批调用写入 versioned checkpoint，并在同一提交中创建 once subscription/outbox；run 进入 `WaitingEvent` 后释放 worker。Server 重启后，HTTP 审批产生 `tool.approval.resolved`，事件写入 run inbox 并恢复原调用。拒绝不会执行工具，而是把 `tool_rejected` 和可选原因送回模型。Server 不再提供基于进程内 `ApprovalPort` 的兼容执行路径。
 
 普通 Tool 也可以声明 `completion=may_suspend` 并返回 `ToolOutput::suspend(waits, effects)`。Harness 校验 wait/effect 数量、Run ownership、subscription 和 effect 契约，保存 `pending_tool` checkpoint；匹配事件到达后把 inbox 投影为 Tool result，产生 `tool_execution_completed` 并继续模型循环。同一模型轮中尚未执行的其余调用会收到 `tool_deferred_by_suspension`，避免在挂起边界后意外产生副作用。
 

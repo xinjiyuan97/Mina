@@ -59,15 +59,15 @@ MINA_CONFIG=config/mina.toml pnpm dev
 
 `api_key` 直接保存在本地 TOML 配置中。`config/mina.toml` 已被 Git 忽略，配置对象的调试输出也会隐藏密钥。仍可选用 `{ env = "ENV_NAME" }` 引用环境变量。配置加载会校验默认模型、URL、模态、上下文窗口等字段，并自动把 `base_url` 规范化为以 `/` 结尾。
 
-Agent 模式由同一份配置选择：
+服务端只提供原生 reducer 驱动的 `agent-loop`：
 
 ```toml
 [agent]
 kind = "agent-loop" # 模型可以在一个 run 内调用工具并继续执行
 system_prompt = "You are Mina, a helpful agent."
 max_steps = 8
-run_timeout_seconds = 300
-model_timeout_seconds = 120
+run_timeout_seconds = 900
+model_timeout_seconds = 600
 tool_timeout_seconds = 30
 tool_call_strategy = "parallel-safe" # sequential | parallel-safe
 
@@ -110,7 +110,7 @@ context_policy_version = 1
 
 `agent.max_steps` 是 Host 上限；`POST /api/v1/runs` 和 `POST /api/v1/sessions/{session_id}/runs` 可为单次 Run 传入更小的 `max_steps`。预算耗尽时，未执行的 tool call 会以结构化 `agent_step_limit_exceeded` 工具错误返回模型，并额外执行一次禁用工具的最终总结，而不是直接终止 Run。
 
-开发前端但不希望调用模型时使用 `kind = "echo"`；只允许一次模型调用时使用 `kind = "single-turn"`。要启用带工具循环的真实 Agent，将本地 `config/mina.toml` 的 `api_key` 换成真实值，并使用 `kind = "agent-loop"` 后重启后端。
+`kind` 目前只接受 `agent-loop`；旧的 `echo` 与 `single-turn` 服务端兼容入口已经移除。需要不调用真实模型的前端测试时，应使用实现 Responses 或 Messages 协议的 mock provider。
 
 ## 当前调用链
 
@@ -122,18 +122,17 @@ Next.js -> Session submit -> SkillOrchestrator -> ContextEngine
                                       └-> SkillStore    ├-> MemoryRetriever
                                                        └-> ContextCompressor
                                                 -> agent-harness::Harness
-                                              -> EchoAgent
-                                              -> SingleTurnAgent -> ModelPort -> Extension Provider
-                                              -> AgentLoop -> ApprovalPort
-                                                           -> RunToolSession(revision)
-                                                                ├-> ToolRegistry -> Extension Tools
-                                                                └-> Run ADF overlay -> QuickJS
-                                                           -> ModelPort -> Extension Provider
-                                             <-> AgentMachine checkpoint
+                                              -> AgentLoopReducer
+                                                   -> Native Effect Runner
+                                                        ├-> RunToolSession(revision)
+                                                        │    ├-> ToolRegistry -> Extension Tools
+                                                        │    └-> Run ADF overlay -> QuickJS
+                                                        └-> ModelPort -> Extension Provider
+                                             <-> AgentLoopReducerState checkpoint
                                                    <-> Harness Event/Timer/Job Runtime -> Extension SQLite
 ```
 
-`EchoAgent` 用于本地 UI 开发；`SingleTurnAgent` 只调用模型一次；`AgentLoop` 可以消费流式 tool call、校验 JSON Schema，并在执行中高风险工具前等待用户审批。拒绝结果会返回模型且不会执行工具。三者使用同一个 HTTP API，切换时不需要修改前端。前端停止按钮会调用 `POST /api/v1/runs/{run_id}/cancel`，取消信号贯穿 run、审批、模型和工具执行。
+服务端直接组合 `AgentLoop` 的原生 `AgentMachine` 实现。所有决策由 `AgentLoopReducer` 产生，Native Effect Runner 只负责模型、工具、计时与取消等异步效果。前端停止按钮会调用 `POST /api/v1/runs/{run_id}/cancel`，取消信号贯穿 run、审批、模型和工具执行。
 
 `agent-extension::tool` 当前提供 `get_current_time`、`read`、`list_directory`、`search`、`write`、`edit`、`apply_patch`、`shell_command`、`exec_command`、`write_stdin`、`javascript_eval` 和 `async_job`；ADF overlay 另外提供 `adf_define/list/remove` 及动态生成的工具。`read/list/search/javascript_eval` 默认 Low，`write/edit/apply_patch/async_job` 默认 Medium，terminal process tools 始终 High。文件工具限制在 workspace 内并拒绝密钥配置、`.env`、私钥和 `.git` 路径；`search` 通过可替换的 `SearchBackend` 工作，默认 adapter 是不联网的 workspace text search。
 

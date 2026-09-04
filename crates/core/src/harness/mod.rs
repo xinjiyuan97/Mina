@@ -14,6 +14,7 @@ use thiserror::Error;
 
 mod agent_loop;
 mod approval;
+mod blob;
 mod control;
 mod event;
 mod job;
@@ -22,12 +23,22 @@ mod model;
 mod run_state;
 mod session;
 mod single_turn;
+mod title;
 mod tool;
 
-pub use agent_loop::{AgentLoop, ToolCallStrategy};
+pub use agent_loop::{
+    AGENT_LOOP_CHECKPOINT_SCHEMA_VERSION, AGENT_LOOP_REDUCER_PROTOCOL_VERSION, AgentLoop,
+    AgentLoopDispatch, AgentLoopEffect, AgentLoopEffectKind, AgentLoopInput, AgentLoopOutcome,
+    AgentLoopReducer, AgentLoopReducerConfig, AgentLoopReducerState, AgentLoopStart,
+    AgentLoopStartDispatch, AgentLoopTransition, ModelInvocationPurpose, PortableToolError,
+    ToolCallStrategy, ToolInvocation, ToolInvocationResult, ToolValidation, ToolValidationRequest,
+};
 pub use approval::{
     ApprovalDecision, ApprovalError, ApprovalFuture, ApprovalId, ApprovalPort, ApprovalRequest,
     ApprovalResolution, RejectAllApprovals, ToolApprovalPolicy,
+};
+pub use blob::{
+    BlobId, BlobMetadata, BlobObject, BlobStore, BlobStoreError, BlobStoreFuture, PutBlob,
 };
 pub use control::RunCancellation;
 pub use event::{
@@ -44,24 +55,30 @@ pub use machine::{
     CompleteFlowEffect, CompleteFlowRun, ContinueFlowRun, EffectRequest, FlowEffect, FlowEffectId,
     FlowEffectRouter, FlowEffectStatus, FlowError, FlowFuture, FlowInboxItem, FlowRunState,
     FlowRunStatus, FlowStore, JobId, MachineError, MachineOutput, MachineResumeRequest,
-    MachineStartRequest, MachineStream, RetryFlowEffect, StartJob, StepOutcome, SuspendFlowRun,
-    WaitSpec, WakeFlowRun,
+    MachineStartRequest, MachineStream, RenewFlowLease, RetryFlowEffect, StartJob, StepOutcome,
+    SuspendFlowRun, WaitSpec, WakeFlowRun,
 };
 pub use model::{
-    FinishReason, ModelError, ModelErrorKind, ModelEvent, ModelEventStream, ModelMessage,
-    ModelPort, ModelRequest, ModelRole, ModelToolCall, TokenUsage, TokenUsageSource,
+    FinishReason, ModelAttachment, ModelError, ModelErrorKind, ModelEvent, ModelEventStream,
+    ModelMessage, ModelPort, ModelRequest, ModelRole, ModelToolCall, TokenUsage, TokenUsageSource,
 };
 pub use run_state::{
     ObservedRunEvent, RUN_STATE_SCHEMA_VERSION, RunApprovalState, RunFailure, RunSnapshot,
     RunStateError, RunStatus, RunStore, RunStoreError, RunStoreFuture, RunToolFailure,
-    RunToolSetState, RunToolState, RunToolStatus,
+    RunToolSetState, RunToolState, RunToolStatus, project_run_output,
 };
 pub use session::{
     ArchiveSession, BeginRunResult, BeginSessionRun, ContentPart, ConversationRole, CreateSession,
     FinalizeSessionRun, MAX_SESSION_PAGE_SIZE, MessageId, SessionId, SessionMessage,
     SessionSnapshot, SessionStatus, SessionStore, SessionStoreError, SessionStoreFuture,
+    SessionToolCallState, project_run_content,
 };
 pub use single_turn::SingleTurnAgent;
+pub use title::{
+    TITLE_REDUCER_PROTOCOL_VERSION, TitleGenerationDispatch, TitleGenerationInput,
+    TitleGenerationOutcome, TitleGenerationReducer, TitleGenerationStart,
+    TitleGenerationStartDispatch, TitleGenerationState, TitleGenerationTransition,
+};
 pub use tool::{
     RunToolSession, Tool, ToolArgumentVisibility, ToolBinding, ToolBindingKind, ToolCallFuture,
     ToolCallRequest, ToolCompletion, ToolConcurrency, ToolDefinition, ToolError, ToolErrorCategory,
@@ -81,6 +98,13 @@ impl RunId {
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    /// Builds a deterministic run id for replayable auxiliary model effects.
+    #[must_use]
+    pub fn stable(namespace: &str, key: &str) -> Self {
+        let name = format!("RunId:{namespace}:{key}");
+        Self(Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()))
     }
 }
 
@@ -136,6 +160,7 @@ impl AgentMetadata {
 pub struct RunRequest {
     pub run_id: RunId,
     pub input: String,
+    pub attachments: Vec<ModelAttachment>,
     pub prior_messages: Vec<ModelMessage>,
     /// `None` exposes all host-registered tools; `Some` is the per-run
     /// capability intersection produced by orchestration.
@@ -344,6 +369,7 @@ where
         let events = self.agent.run(RunRequest {
             run_id,
             input,
+            attachments: Vec::new(),
             prior_messages,
             allowed_tools: options.allowed_tools,
             allow_run_adf: options.allow_run_adf,

@@ -11,8 +11,8 @@
     "check": "pnpm lint && pnpm typecheck"
   },
   "dependencies": {
-    "@xinjiyuan97/chat-core": "0.2.0",
-    "@xinjiyuan97/chat-ui": "0.2.0",
+    "@xinjiyuan97/chat-core": "file:vendor/xinjiyuan97-chat-core-0.2.0.tgz",
+    "@xinjiyuan97/chat-ui": "file:vendor/xinjiyuan97-chat-ui-0.2.0.tgz",
     "next": "16.3.2",
     "react": "19.2.8",
     "react-dom": "19.2.8"

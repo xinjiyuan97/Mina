@@ -20,6 +20,21 @@ use crate::harness::{
 };
 
 mod machine;
+mod native_reducer;
+mod reducer;
+
+pub use reducer::{
+    AGENT_LOOP_REDUCER_PROTOCOL_VERSION, AgentLoopDispatch, AgentLoopEffect, AgentLoopEffectKind,
+    AgentLoopInput, AgentLoopOutcome, AgentLoopReducer, AgentLoopReducerConfig,
+    AgentLoopReducerState, AgentLoopStart, AgentLoopStartDispatch, AgentLoopTransition,
+    ModelInvocationPurpose, PortableToolError, ToolInvocation, ToolInvocationResult,
+    ToolValidation, ToolValidationRequest,
+};
+
+/// Schema version of the native durable checkpoint envelope that contains an
+/// [`AgentLoopReducerState`]. Hosts can expose this alongside the reducer JSON
+/// protocol version so deployments can verify which execution path is active.
+pub const AGENT_LOOP_CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 
 /// A bounded model/tool loop for one independent run.
 ///
@@ -146,7 +161,10 @@ where
             messages.push(ModelMessage::system(self.system_prompt.clone()));
         }
         messages.extend(request.prior_messages);
-        messages.push(ModelMessage::user(request.input));
+        messages.push(ModelMessage::user_with_attachments(
+            request.input,
+            request.attachments,
+        ));
 
         Box::pin(stream! {
             let _tool_session_guard = RunToolSessionGuard {

@@ -98,6 +98,7 @@ impl CheckpointEnvelope {
 pub struct MachineStartRequest {
     pub run_id: RunId,
     pub input: String,
+    pub attachments: Vec<crate::harness::ModelAttachment>,
     pub prior_messages: Vec<ModelMessage>,
     pub allowed_tools: Option<Vec<String>>,
     pub allow_run_adf: bool,
@@ -296,6 +297,16 @@ pub struct ClaimedActivation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenewFlowLease {
+    pub run_id: RunId,
+    pub activation_id: ActivationId,
+    pub expected_revision: u64,
+    pub worker_id: String,
+    pub renewed_at_ms: i64,
+    pub lease_until_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompleteFlowRun {
     pub run_id: RunId,
     pub activation_id: ActivationId,
@@ -376,6 +387,7 @@ pub trait FlowStore: Send + Sync + 'static {
         lease_until_ms: i64,
         limit: usize,
     ) -> FlowFuture<'_, Vec<ClaimedActivation>>;
+    fn renew_lease(&self, command: RenewFlowLease) -> FlowFuture<'_, FlowRunState>;
     fn claim_effects(
         &self,
         worker_id: String,

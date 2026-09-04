@@ -569,9 +569,7 @@ impl Default for AgentConfig {
 
 impl AgentConfig {
     fn normalize_and_validate(&self, field: &str) -> Result<(), ConfigError> {
-        if matches!(self.kind, AgentKind::SingleTurn | AgentKind::AgentLoop) {
-            validate_non_empty(&format!("{field}.system_prompt"), &self.system_prompt)?;
-        }
+        validate_non_empty(&format!("{field}.system_prompt"), &self.system_prompt)?;
         if self.max_steps == 0 {
             return Err(ConfigError::validation(
                 format!("{field}.max_steps"),
@@ -600,14 +598,11 @@ impl AgentConfig {
     }
 }
 
-/// The echo implementation is a development fallback; `single-turn` invokes
-/// the model once, while `agent-loop` can continue across bounded tool calls.
+/// The runtime has one native reducer-backed Agent implementation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentKind {
     #[default]
-    Echo,
-    SingleTurn,
     AgentLoop,
 }
 
@@ -620,11 +615,11 @@ const fn default_max_steps() -> u32 {
 }
 
 const fn default_run_timeout_seconds() -> u64 {
-    300
+    900
 }
 
 const fn default_model_timeout_seconds() -> u64 {
-    120
+    600
 }
 
 const fn default_tool_timeout_seconds() -> u64 {
@@ -733,6 +728,15 @@ pub enum Modality {
     Document,
 }
 
+/// OpenAI-compatible wire protocol selected independently from the model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OpenAiProtocol {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
+
 /// Provider-specific settings. New providers are added as new variants while
 /// `ModelConfig` and the rest of the harness keep using provider-neutral data.
 #[derive(Debug, Clone, Deserialize)]
@@ -743,11 +747,19 @@ pub enum ProviderConfig {
     OpenAiCompatible {
         base_url: Url,
         #[serde(default)]
+        protocol: OpenAiProtocol,
+        #[serde(default)]
         api_key: Option<SecretSource>,
         #[serde(default)]
         organization: Option<String>,
         #[serde(default)]
         project: Option<String>,
+    },
+    Anthropic {
+        base_url: Url,
+        api_key: SecretSource,
+        #[serde(default = "default_anthropic_version")]
+        version: String,
     },
 }
 
@@ -756,6 +768,22 @@ impl ProviderConfig {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::OpenAiCompatible { .. } => "openai-compatible",
+            Self::Anthropic { .. } => "anthropic",
+        }
+    }
+
+    #[must_use]
+    pub const fn protocol(&self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible {
+                protocol: OpenAiProtocol::ChatCompletions,
+                ..
+            } => "chat-completions",
+            Self::OpenAiCompatible {
+                protocol: OpenAiProtocol::Responses,
+                ..
+            } => "responses",
+            Self::Anthropic { .. } => "messages",
         }
     }
 
@@ -763,6 +791,7 @@ impl ProviderConfig {
     pub fn base_url(&self) -> &Url {
         match self {
             Self::OpenAiCompatible { base_url, .. } => base_url,
+            Self::Anthropic { base_url, .. } => base_url,
         }
     }
 
@@ -770,6 +799,7 @@ impl ProviderConfig {
     pub fn api_key(&self) -> Option<&SecretSource> {
         match self {
             Self::OpenAiCompatible { api_key, .. } => api_key.as_ref(),
+            Self::Anthropic { api_key, .. } => Some(api_key),
         }
     }
 
@@ -777,6 +807,7 @@ impl ProviderConfig {
         match self {
             Self::OpenAiCompatible {
                 base_url,
+                protocol: _,
                 api_key,
                 organization,
                 project,
@@ -790,10 +821,24 @@ impl ProviderConfig {
                 validate_optional_non_empty(&format!("{field}.organization"), organization)?;
                 validate_optional_non_empty(&format!("{field}.project"), project)?;
             }
+            Self::Anthropic {
+                base_url,
+                api_key,
+                version,
+            } => {
+                validate_base_url(&format!("{field}.base_url"), base_url)?;
+                normalize_base_url(base_url);
+                api_key.validate(&format!("{field}.api_key"))?;
+                validate_non_empty(&format!("{field}.version"), version)?;
+            }
         }
 
         Ok(())
     }
+}
+
+fn default_anthropic_version() -> String {
+    "2023-06-01".into()
 }
 
 /// A secret can be read from an environment variable or supplied literally.
@@ -1053,28 +1098,29 @@ organization = "org-example"
     }
 
     #[test]
-    fn maps_single_turn_agent_configuration() {
-        let source = VALID_CONFIG.replacen(
-            "default_model = \"primary\"",
-            r#"default_model = "primary"
+    fn defaults_to_the_native_agent_loop_and_rejects_removed_kinds() {
+        let defaults = HarnessConfig::from_toml_str(VALID_CONFIG).expect("config should parse");
+        assert_eq!(defaults.agent().kind, AgentKind::AgentLoop);
+
+        for removed in ["single-turn", "echo"] {
+            let source = VALID_CONFIG.replacen(
+                "default_model = \"primary\"",
+                &format!(
+                    r#"default_model = "primary"
 
 [agent]
-kind = "single-turn"
-system_prompt = "Complete one task.""#,
-            1,
-        );
-        let config = HarnessConfig::from_toml_str(&source).expect("config should parse");
-
-        assert_eq!(config.agent().kind, AgentKind::SingleTurn);
-        assert_eq!(config.agent().system_prompt, "Complete one task.");
-        assert_eq!(config.agent().max_steps, 8);
-        assert_eq!(config.agent().run_timeout_seconds, 300);
-        assert_eq!(config.agent().model_timeout_seconds, 120);
-        assert_eq!(config.agent().tool_timeout_seconds, 30);
-        assert_eq!(
-            config.agent().tool_call_strategy,
-            ToolCallStrategy::Sequential
-        );
+kind = "{removed}"
+system_prompt = "Complete one task.""#
+                ),
+                1,
+            );
+            let error = HarnessConfig::from_toml_str(&source).expect_err("removed kind must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown variant `{removed}`"))
+            );
+        }
     }
 
     #[test]
@@ -1131,6 +1177,51 @@ base_url = "http://127.0.0.1:11434/v1"
         assert_eq!(model.modalities.input, BTreeSet::from([Modality::Text]));
         assert_eq!(model.modalities.output, BTreeSet::from([Modality::Text]));
         assert!(model.provider.api_key().is_none());
+    }
+
+    #[test]
+    fn selects_responses_and_anthropic_messages_protocols() {
+        let responses = HarnessConfig::from_toml_str(
+            r#"
+default_model = "primary"
+
+[models.primary]
+model = "gpt-5"
+
+[models.primary.provider]
+type = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+protocol = "responses"
+api_key = "test-key"
+"#,
+        )
+        .expect("Responses config should parse");
+        assert!(matches!(
+            responses.default_model().provider,
+            ProviderConfig::OpenAiCompatible {
+                protocol: OpenAiProtocol::Responses,
+                ..
+            }
+        ));
+
+        let anthropic = HarnessConfig::from_toml_str(
+            r#"
+default_model = "primary"
+
+[models.primary]
+model = "claude-sonnet-4-5"
+
+[models.primary.provider]
+type = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+api_key = "test-key"
+"#,
+        )
+        .expect("Anthropic config should parse");
+        assert!(matches!(
+            anthropic.default_model().provider,
+            ProviderConfig::Anthropic { ref version, .. } if version == "2023-06-01"
+        ));
     }
 
     #[test]

@@ -4,7 +4,7 @@ use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::harness::{RunId, ToolDefinition};
+use crate::harness::{BlobId, RunId, ToolDefinition};
 
 /// Provider-neutral role used at the Agent -> model boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,12 +38,24 @@ pub struct ModelToolCall {
     pub arguments: String,
 }
 
+/// Provider-neutral binary input. Bytes live in a host BlobStore so durable
+/// checkpoints and conversation state stay small and restart-safe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelAttachment {
+    pub blob_id: BlobId,
+    pub media_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 /// One normalized conversation message. Provider adapters map this shape to
 /// their own assistant tool-call and tool-result wire formats.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelMessage {
     pub role: ModelRole,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ModelAttachment>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reasoning: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -58,6 +70,7 @@ impl ModelMessage {
         Self {
             role: ModelRole::System,
             content: content.into(),
+            attachments: Vec::new(),
             reasoning: String::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
@@ -69,6 +82,22 @@ impl ModelMessage {
         Self {
             role: ModelRole::User,
             content: content.into(),
+            attachments: Vec::new(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn user_with_attachments(
+        content: impl Into<String>,
+        attachments: Vec<ModelAttachment>,
+    ) -> Self {
+        Self {
+            role: ModelRole::User,
+            content: content.into(),
+            attachments,
             reasoning: String::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
@@ -84,6 +113,7 @@ impl ModelMessage {
         Self {
             role: ModelRole::Assistant,
             content: content.into(),
+            attachments: Vec::new(),
             reasoning: reasoning.into(),
             tool_calls,
             tool_call_id: None,
@@ -95,6 +125,7 @@ impl ModelMessage {
         Self {
             role: ModelRole::Tool,
             content: content.into(),
+            attachments: Vec::new(),
             reasoning: String::new(),
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
@@ -103,7 +134,7 @@ impl ModelMessage {
 }
 
 /// A single normalized model invocation produced by an Agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelRequest {
     pub run_id: RunId,
     pub model: String,
@@ -144,7 +175,8 @@ pub enum TokenUsageSource {
 }
 
 /// Stable model error categories understood by the Agent and Gateway.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ModelErrorKind {
     InvalidRequest,
@@ -159,7 +191,8 @@ pub enum ModelErrorKind {
 
 /// Provider-neutral streaming events. The adapter must emit exactly one
 /// `Completed` or `Failed` event and then end the stream.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ModelEvent {
     Accepted { provider_request_id: Option<String> },
@@ -194,7 +227,7 @@ impl ModelErrorKind {
 
 /// Safe, normalized provider error. Raw response bodies and credentials stay in
 /// the adapter and never cross into Agent events or public HTTP responses.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
 #[error("{message}")]
 pub struct ModelError {
     kind: ModelErrorKind,

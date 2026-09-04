@@ -3,14 +3,14 @@
 //! Provider SSE, JSON, HTTP headers, credentials, and transport errors terminate
 //! in this crate. The Agent only sees `agent_core::harness::ModelEvent` values.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc};
 
 use agent_core::context::{TokenEstimateRequest, TokenEstimator, TokenSegment};
 use agent_core::harness::{
-    FinishReason, ModelError, ModelErrorKind, ModelEvent, ModelEventStream, ModelMessage,
-    ModelPort, ModelRequest, ModelRole, TokenUsage, TokenUsageSource, ToolDefinition,
+    BlobStore, FinishReason, ModelError, ModelErrorKind, ModelEvent, ModelEventStream,
+    ModelMessage, ModelPort, ModelRequest, ModelRole, TokenUsage, TokenUsageSource, ToolDefinition,
 };
-use agent_harness::{ConfigError, ModelConfig, ProviderConfig, SecretString};
+use agent_harness::{ConfigError, ModelConfig, OpenAiProtocol, ProviderConfig, SecretString};
 use async_stream::stream;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+use super::attachment::{base64_data, data_url, load_blob};
 
 /// HTTP/SSE implementation of Mina's provider-neutral model port.
 pub struct OpenAiCompatibleProvider {
@@ -29,12 +29,14 @@ pub struct OpenAiCompatibleProvider {
     organization: Option<String>,
     project: Option<String>,
     token_estimator: Option<Arc<dyn TokenEstimator>>,
+    blob_store: Option<Arc<dyn BlobStore>>,
 }
 
 impl OpenAiCompatibleProvider {
     pub fn from_model_config(model: &ModelConfig) -> Result<Self, AdapterConfigError> {
         let ProviderConfig::OpenAiCompatible {
             base_url,
+            protocol,
             api_key,
             organization,
             project,
@@ -42,12 +44,18 @@ impl OpenAiCompatibleProvider {
         else {
             return Err(AdapterConfigError::UnsupportedProvider);
         };
+        if *protocol != OpenAiProtocol::ChatCompletions {
+            return Err(AdapterConfigError::UnsupportedProtocol);
+        }
 
         let api_key = api_key
             .as_ref()
             .map(|source| source.resolve())
             .transpose()?;
-        let client = Client::builder().timeout(DEFAULT_TIMEOUT).build()?;
+        // Streaming requests are bounded by the Harness model deadline. A
+        // second reqwest total timeout would race that deadline and turn a
+        // legitimate long-running stream into a generic transport failure.
+        let client = Client::builder().build()?;
 
         Ok(Self {
             client,
@@ -56,12 +64,19 @@ impl OpenAiCompatibleProvider {
             organization: organization.clone(),
             project: project.clone(),
             token_estimator: None,
+            blob_store: None,
         })
     }
 
     #[must_use]
     pub fn with_token_estimator(mut self, estimator: Arc<dyn TokenEstimator>) -> Self {
         self.token_estimator = Some(estimator);
+        self
+    }
+
+    #[must_use]
+    pub fn with_blob_store(mut self, blob_store: Arc<dyn BlobStore>) -> Self {
+        self.blob_store = Some(blob_store);
         self
     }
 
@@ -84,6 +99,7 @@ impl ModelPort for OpenAiCompatibleProvider {
         let organization = self.organization.clone();
         let project = self.project.clone();
         let token_estimator = self.token_estimator.clone();
+        let blob_store = self.blob_store.clone();
 
         Box::pin(stream! {
             let endpoint = match endpoint {
@@ -94,7 +110,13 @@ impl ModelPort for OpenAiCompatibleProvider {
                 }
             };
 
-            let body = ChatCompletionRequest::from_model_request(&request);
+            let body = match ChatCompletionRequest::from_model_request(&request, blob_store.as_ref()).await {
+                Ok(body) => body,
+                Err(error) => {
+                    yield ModelEvent::Failed { error };
+                    return;
+                }
+            };
             let mut builder = client.post(endpoint).json(&body);
             if let Some(api_key) = &api_key {
                 builder = builder.bearer_auth(api_key.expose_secret());
@@ -266,6 +288,9 @@ pub enum AdapterConfigError {
     #[error("the configured provider is not OpenAI-compatible")]
     UnsupportedProvider,
 
+    #[error("the configured OpenAI-compatible provider does not use Chat Completions")]
+    UnsupportedProtocol,
+
     #[error(transparent)]
     Secret(#[from] ConfigError),
 
@@ -274,11 +299,11 @@ pub enum AdapterConfigError {
 }
 
 #[derive(Serialize)]
-struct ChatCompletionRequest<'a> {
-    model: &'a str,
-    messages: Vec<ChatMessage<'a>>,
+struct ChatCompletionRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<ChatToolDefinition<'a>>,
+    tools: Vec<ChatToolDefinition>,
     stream: bool,
     stream_options: StreamOptions,
     /// `max_tokens` remains widely implemented by compatible servers. A future
@@ -287,18 +312,25 @@ struct ChatCompletionRequest<'a> {
     max_tokens: Option<u32>,
 }
 
-impl<'a> ChatCompletionRequest<'a> {
-    fn from_model_request(request: &'a ModelRequest) -> Self {
-        Self {
-            model: &request.model,
-            messages: request.messages.iter().map(ChatMessage::from).collect(),
+impl ChatCompletionRequest {
+    async fn from_model_request(
+        request: &ModelRequest,
+        blob_store: Option<&Arc<dyn BlobStore>>,
+    ) -> Result<Self, ModelError> {
+        let mut messages = Vec::with_capacity(request.messages.len());
+        for message in &request.messages {
+            messages.push(ChatMessage::from_model_message(message, blob_store).await?);
+        }
+        Ok(Self {
+            model: request.model.clone(),
+            messages,
             tools: request.tools.iter().map(ChatToolDefinition::from).collect(),
             stream: true,
             stream_options: StreamOptions {
                 include_usage: true,
             },
             max_tokens: request.max_output_tokens,
-        }
+        })
     }
 }
 
@@ -308,93 +340,165 @@ struct StreamOptions {
 }
 
 #[derive(Serialize)]
-struct ChatMessage<'a> {
+struct ChatMessage {
     role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<&'a str>,
+    content: Option<ChatMessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<&'a str>,
+    reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    tool_calls: Vec<ChatMessageToolCall<'a>>,
+    tool_calls: Vec<ChatMessageToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<&'a str>,
+    tool_call_id: Option<String>,
 }
 
-impl<'a> From<&'a ModelMessage> for ChatMessage<'a> {
-    fn from(message: &'a ModelMessage) -> Self {
-        Self {
-            role: message.role.as_str(),
-            content: if message.role == ModelRole::Assistant
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ChatMessageContent {
+    Text(String),
+    Parts(Vec<serde_json::Value>),
+}
+
+impl ChatMessage {
+    async fn from_model_message(
+        message: &ModelMessage,
+        blob_store: Option<&Arc<dyn BlobStore>>,
+    ) -> Result<Self, ModelError> {
+        let content = if message.attachments.is_empty() {
+            if message.role == ModelRole::Assistant
                 && !message.tool_calls.is_empty()
                 && message.content.is_empty()
             {
                 None
             } else {
-                Some(&message.content)
-            },
-            reasoning_content: (!message.reasoning.is_empty()).then_some(&message.reasoning),
+                Some(ChatMessageContent::Text(message.content.clone()))
+            }
+        } else {
+            if message.role != ModelRole::User {
+                return Err(ModelError::new(
+                    ModelErrorKind::InvalidRequest,
+                    "binary input is only supported on user messages",
+                    false,
+                ));
+            }
+            let mut parts = Vec::with_capacity(message.attachments.len() + 1);
+            if !message.content.is_empty() {
+                parts.push(serde_json::json!({"type": "text", "text": message.content}));
+            }
+            for attachment in &message.attachments {
+                let object = load_blob(blob_store, attachment).await?;
+                let media_type = object.metadata.media_type.as_str();
+                if media_type.starts_with("image/") {
+                    parts.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {"url": data_url(media_type, &object.data)}
+                    }));
+                } else if media_type.starts_with("audio/") {
+                    let format = match media_type {
+                        "audio/wav" | "audio/x-wav" => "wav",
+                        "audio/mpeg" | "audio/mp3" => "mp3",
+                        _ => {
+                            return Err(ModelError::new(
+                                ModelErrorKind::InvalidRequest,
+                                "Chat Completions only supports WAV or MP3 audio inputs",
+                                false,
+                            ));
+                        }
+                    };
+                    parts.push(serde_json::json!({
+                        "type": "input_audio",
+                        "input_audio": {"data": base64_data(&object.data), "format": format}
+                    }));
+                } else if media_type.starts_with("video/") {
+                    return Err(ModelError::new(
+                        ModelErrorKind::InvalidRequest,
+                        "Chat Completions does not define a portable video input part",
+                        false,
+                    ));
+                } else {
+                    let filename = attachment
+                        .name
+                        .as_ref()
+                        .or(object.metadata.name.as_ref())
+                        .cloned()
+                        .unwrap_or_else(|| format!("{}.bin", attachment.blob_id));
+                    parts.push(serde_json::json!({
+                        "type": "file",
+                        "file": {
+                            "filename": filename,
+                            "file_data": data_url(media_type, &object.data)
+                        }
+                    }));
+                }
+            }
+            Some(ChatMessageContent::Parts(parts))
+        };
+        Ok(Self {
+            role: message.role.as_str(),
+            content,
+            reasoning_content: (!message.reasoning.is_empty()).then(|| message.reasoning.clone()),
             tool_calls: message
                 .tool_calls
                 .iter()
                 .map(ChatMessageToolCall::from)
                 .collect(),
-            tool_call_id: message.tool_call_id.as_deref(),
-        }
+            tool_call_id: message.tool_call_id.clone(),
+        })
     }
 }
 
 #[derive(Serialize)]
-struct ChatMessageToolCall<'a> {
-    id: &'a str,
+struct ChatMessageToolCall {
+    id: String,
     #[serde(rename = "type")]
     kind: &'static str,
-    function: ChatMessageToolFunction<'a>,
+    function: ChatMessageToolFunction,
 }
 
-impl<'a> From<&'a agent_core::harness::ModelToolCall> for ChatMessageToolCall<'a> {
-    fn from(call: &'a agent_core::harness::ModelToolCall) -> Self {
+impl From<&agent_core::harness::ModelToolCall> for ChatMessageToolCall {
+    fn from(call: &agent_core::harness::ModelToolCall) -> Self {
         Self {
-            id: &call.id,
+            id: call.id.clone(),
             kind: "function",
             function: ChatMessageToolFunction {
-                name: &call.name,
-                arguments: &call.arguments,
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
             },
         }
     }
 }
 
 #[derive(Serialize)]
-struct ChatMessageToolFunction<'a> {
-    name: &'a str,
-    arguments: &'a str,
+struct ChatMessageToolFunction {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Serialize)]
-struct ChatToolDefinition<'a> {
+struct ChatToolDefinition {
     #[serde(rename = "type")]
     kind: &'static str,
-    function: ChatToolFunction<'a>,
+    function: ChatToolFunction,
 }
 
-impl<'a> From<&'a ToolDefinition> for ChatToolDefinition<'a> {
-    fn from(tool: &'a ToolDefinition) -> Self {
+impl From<&ToolDefinition> for ChatToolDefinition {
+    fn from(tool: &ToolDefinition) -> Self {
         Self {
             kind: "function",
             function: ChatToolFunction {
-                name: &tool.name,
-                description: &tool.description,
-                parameters: &tool.input_schema,
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.input_schema.clone(),
             },
         }
     }
 }
 
 #[derive(Serialize)]
-struct ChatToolFunction<'a> {
-    name: &'a str,
-    description: &'a str,
-    parameters: &'a serde_json::Value,
+struct ChatToolFunction {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -679,7 +783,10 @@ mod tests {
     use std::convert::Infallible;
 
     use super::*;
-    use agent_core::harness::RunId;
+    use agent_core::harness::{
+        BlobId, BlobMetadata, BlobObject, BlobStoreError, BlobStoreFuture, ModelAttachment,
+        PutBlob, RunId,
+    };
     use agent_harness::HarnessConfig;
     use axum::{
         Json, Router,
@@ -691,6 +798,20 @@ mod tests {
     use tokio::net::TcpListener;
 
     struct FixedEstimator;
+
+    struct FixedBlobStore(BlobObject);
+
+    impl BlobStore for FixedBlobStore {
+        fn put(&self, _command: PutBlob) -> BlobStoreFuture<'_, BlobMetadata> {
+            Box::pin(async { Err(BlobStoreError::backend("read only")) })
+        }
+
+        fn get(&self, blob_id: BlobId) -> BlobStoreFuture<'_, Option<BlobObject>> {
+            Box::pin(
+                async move { Ok((self.0.metadata.blob_id == blob_id).then(|| self.0.clone())) },
+            )
+        }
+    }
 
     impl TokenEstimator for FixedEstimator {
         fn descriptor(&self) -> agent_core::context::ContextComponentDescriptor {
@@ -721,8 +842,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn maps_normalized_request_to_streaming_chat_json() {
+    #[tokio::test]
+    async fn maps_normalized_request_to_streaming_chat_json() {
         let request = ModelRequest {
             run_id: RunId::new(),
             model: "example-model".into(),
@@ -748,8 +869,10 @@ mod tests {
             max_output_tokens: Some(512),
         };
 
-        let value = serde_json::to_value(ChatCompletionRequest::from_model_request(&request))
-            .expect("request should serialize");
+        let body = ChatCompletionRequest::from_model_request(&request, None)
+            .await
+            .expect("request should map");
+        let value = serde_json::to_value(body).expect("request should serialize");
 
         assert_eq!(value["model"], "example-model");
         assert_eq!(value["messages"][0]["role"], "system");
@@ -767,6 +890,46 @@ mod tests {
         assert_eq!(value["stream_options"]["include_usage"], true);
         assert_eq!(value["tools"][0]["type"], "function");
         assert_eq!(value["tools"][0]["function"]["name"], "get_current_time");
+    }
+
+    #[tokio::test]
+    async fn maps_blob_references_to_multimodal_content_parts() {
+        let blob_id = BlobId::new();
+        let store: Arc<dyn BlobStore> = Arc::new(FixedBlobStore(BlobObject {
+            metadata: BlobMetadata {
+                blob_id,
+                media_type: "image/png".into(),
+                name: Some("screen.png".into()),
+                size_bytes: 3,
+                created_at_ms: 1,
+            },
+            data: vec![1, 2, 3],
+        }));
+        let request = ModelRequest {
+            run_id: RunId::new(),
+            model: "vision-model".into(),
+            messages: vec![ModelMessage::user_with_attachments(
+                "describe this",
+                vec![ModelAttachment {
+                    blob_id,
+                    media_type: "image/png".into(),
+                    name: Some("screen.png".into()),
+                }],
+            )],
+            tools: Vec::new(),
+            max_output_tokens: None,
+        };
+        let body = ChatCompletionRequest::from_model_request(&request, Some(&store))
+            .await
+            .expect("multimodal request should map");
+        let value = serde_json::to_value(body).expect("request should serialize");
+        assert_eq!(value["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(value["messages"][0]["content"][1]["type"], "image_url");
+        assert!(
+            value["messages"][0]["content"][1]["image_url"]["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("data:image/png;base64,"))
+        );
     }
 
     #[tokio::test]

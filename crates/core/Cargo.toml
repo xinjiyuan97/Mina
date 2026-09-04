@@ -16,9 +16,19 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio.workspace = true
 tokio-util.workspace = true
-uuid.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# jsonschema -> ahash uses getrandom for hash seeding. Browser builds select
+# getrandom's Web Crypto backend explicitly via the workspace cargo config.
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
+tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7.17", features = ["rt"] }
+uuid = { version = "1.25.0", features = ["serde", "v4", "v5", "js"] }
 
 [dev-dependencies]
 jsonschema = { workspace = true, features = ["draft202012"] }

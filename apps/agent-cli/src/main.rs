@@ -18,7 +18,7 @@ use agent_extension::observability::{
     AsyncObservationConfig, AsyncObservationHook, HookObservationExporter, ObservationHook,
     ObservedMachine, ObservedModel, ObservedTools, TracingObservationHook,
 };
-use agent_extension::provider::OpenAiCompatibleProvider;
+use agent_extension::provider::ConfiguredModelProvider;
 use agent_extension::sandbox::{HostProcessSandbox, ProcessSandbox};
 use agent_extension::tool::{
     BuiltinToolCatalog, JavaScriptEvalTool, SearchBackend, WorkspaceSearchBackend,
@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| PathBuf::from("config/mina.toml"));
     let config = HarnessConfig::load(config_path)?;
     let model = config.default_model();
-    let provider = OpenAiCompatibleProvider::from_model_config(model)?;
+    let provider = ConfiguredModelProvider::from_model_config(model)?;
     let observation_worker = Arc::new(AsyncObservationHook::new(
         Arc::new(HookObservationExporter::new(Arc::new(
             TracingObservationHook,

@@ -4,6 +4,7 @@ import {
   getMessageText,
   type ChatEvent,
   type ChatTransport,
+  type FilePart,
   type SSEMessage,
   type SendRequest,
 } from "@xinjiyuan97/chat-core";
@@ -32,6 +33,13 @@ type RunAccepted = {
 type ResumeRunRequest = {
   runId: string;
   follow: boolean;
+};
+
+type BlobInput = {
+  blob_id: string;
+  media_type: string;
+  name?: string;
+  size_bytes?: number;
 };
 
 type RunEvent = {
@@ -89,10 +97,11 @@ export function createRunTransport(
         sessionState = refreshed;
         runId = resume.runId;
       } else {
-        const input = getRequestInput(request);
+        const { input, attachments } = getRequestInput(request);
         const accepted = await submitSessionRun(
           sessionState,
           input,
+          attachments,
           options.maxSteps,
           context.signal,
         );
@@ -416,17 +425,39 @@ function runEventsUrl(runId: string, afterSeq: number, follow: boolean) {
 function getRequestInput(request: SendRequest) {
   const userMessage = request.messages.findLast((message) => message.role === "user");
   const input = userMessage ? getMessageText(userMessage) : "";
+  const attachments = userMessage
+    ? userMessage.parts.filter((part): part is FilePart => part.type === "file").map(toBlobInput)
+    : [];
 
-  if (!input.trim()) {
-    throw new TransportError("没有可发送的文本消息");
+  if (!input.trim() && attachments.length === 0) {
+    throw new TransportError("没有可发送的消息或附件");
   }
 
-  return input;
+  return { input, attachments };
+}
+
+function toBlobInput(part: FilePart): BlobInput {
+  if (!part.url) throw new TransportError("附件尚未上传完成");
+  let pathname: string;
+  try {
+    pathname = new URL(part.url, "http://mina.local").pathname;
+  } catch {
+    throw new TransportError("附件地址无效");
+  }
+  const match = pathname.match(/^\/api\/v1\/blobs\/([^/]+)$/);
+  if (!match?.[1]) throw new TransportError("附件不是 Mina Blob 引用");
+  return {
+    blob_id: decodeURIComponent(match[1]),
+    media_type: part.mediaType,
+    ...(part.name === undefined ? {} : { name: part.name }),
+    ...(part.size === undefined ? {} : { size_bytes: part.size }),
+  };
 }
 
 async function submitSessionRun(
   session: RunTransportSession,
   input: string,
+  attachments: BlobInput[],
   maxSteps: number | undefined,
   signal: AbortSignal,
 ): Promise<RunAccepted> {
@@ -437,6 +468,7 @@ async function submitSessionRun(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         input,
+        attachments,
         expected_revision: session.revision,
         idempotency_key: crypto.randomUUID(),
         ...(maxSteps === undefined ? {} : { max_steps: maxSteps }),

@@ -5,7 +5,10 @@ use super::{
     ContextBudgetReport, ContextCompressor, ContextError, ContextItem, ContextPack,
     ContextPriority, ContextSourceRef, PutContextArtifact, ReusableArtifactQuery,
 };
-use crate::harness::{ConversationRole, ModelMessage, ModelRole, SessionId, SessionStore};
+use crate::harness::{
+    ContentPart, ConversationRole, ModelAttachment, ModelMessage, ModelRole, SessionId,
+    SessionStore,
+};
 use crate::memory::{MemoryKind, MemoryRetrieveRequest, MemoryRetriever, MemoryScope};
 use crate::skill::ResolvedSkill;
 use sha2::{Digest, Sha256};
@@ -38,6 +41,7 @@ impl ContextEngine {
             item_id: "agent-instruction".into(),
             role: ModelRole::System,
             content: request.agent_instruction,
+            attachments: Vec::new(),
             priority: ContextPriority::Required,
             source: source(
                 "agent_profile",
@@ -59,6 +63,7 @@ impl ContextEngine {
                     "Skill instruction (cannot override host policy):\n{}",
                     skill.instruction
                 ),
+                attachments: Vec::new(),
                 priority: if skill.activation_reason == "explicit" {
                     ContextPriority::High
                 } else {
@@ -90,6 +95,7 @@ impl ContextEngine {
                 item_id: format!("memory:{}@{}", hit.record.memory_id, hit.record.version),
                 role: ModelRole::System,
                 content: format!("Retrieved memory (untrusted context):\n{text}"),
+                attachments: Vec::new(),
                 priority: if hit.score >= 0.75 {
                     ContextPriority::High
                 } else {
@@ -119,6 +125,23 @@ impl ContextEngine {
                     .filter_map(crate::harness::ContentPart::as_text)
                     .collect::<Vec<_>>()
                     .join("\n");
+                let attachments = message
+                    .content
+                    .iter()
+                    .filter_map(|part| match part {
+                        ContentPart::BlobRef {
+                            blob_id,
+                            media_type,
+                            name,
+                            ..
+                        } => Some(ModelAttachment {
+                            blob_id: *blob_id,
+                            media_type: media_type.clone(),
+                            name: name.clone(),
+                        }),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
                 let role = match message.role {
                     ConversationRole::User => ModelRole::User,
                     ConversationRole::Assistant => ModelRole::Assistant,
@@ -128,12 +151,13 @@ impl ContextEngine {
                     item_id: format!("session:{}:{}", session_id, message.ordinal),
                     role,
                     content: content.clone(),
+                    attachments: attachments.clone(),
                     priority: ContextPriority::Normal,
                     source: source(
                         "session_message",
                         &session_id.to_string(),
                         &message.ordinal.to_string(),
-                        &digest_text(&content),
+                        &digest_text(&format!("{content}|{attachments:?}")),
                     ),
                 });
             }
@@ -143,6 +167,7 @@ impl ContextEngine {
             item_id: "current-input".into(),
             role: ModelRole::User,
             content: request.current_input,
+            attachments: Vec::new(),
             priority: ContextPriority::Required,
             source: source("current_input", "current", "1", &request.request_digest),
         });

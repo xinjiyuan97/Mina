@@ -35,7 +35,7 @@ Sandbox 使用自己的 `SandboxErrorKind`、稳定错误码、取消令牌、de
 
 稳定 category 是 `invalid_request / not_found / permission_denied / conflict / resource_exhausted / timeout / cancelled / unavailable / internal / unknown`。`retryable` 只表达是否值得重试，不授权 Agent 自动重放副作用。`ToolDefinition.execution` 额外声明 `idempotency/concurrency/completion/retry`；Registry 拒绝“未知副作用却配置自动重试”及“可挂起却声明 parallel-safe”的组合。只有 `read_only/idempotent` Tool 会按 1–5 次与有界指数 backoff 自动重试。超时、取消、审批拒绝、schema 校验和 Sandbox 错误均进入同一失败投影。
 
-Host 可配置 `tool_call_strategy = "parallel-safe"`。只有 Low risk、无需审批、`immediate + parallel_safe` 的连续调用会重叠；Exclusive/MaySuspend/需审批 Tool 保持串行。完成事件可以按实际完成时间出现，但 Tool result 写回模型时恢复原调用顺序。耐久 `AgentMachine` 与兼容 `Agent::run` 使用相同策略。
+Host 可配置 `tool_call_strategy = "parallel-safe"`。只有 Low risk、无需审批、`immediate + parallel_safe` 的连续调用会重叠；Exclusive/MaySuspend/需审批 Tool 保持串行。完成事件可以按实际完成时间出现，但 Tool result 写回模型时恢复原调用顺序。Server 只通过 reducer 驱动的耐久 `AgentMachine` 执行该策略。
 
 ## 3. Observability hooks
 

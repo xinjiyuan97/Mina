@@ -19,16 +19,15 @@ use agent_core::event_runtime::{
     SubscriptionId, SubscriptionMode, SubscriptionOwner, SubscriptionScope,
 };
 use agent_core::harness::{
-    Agent, AgentEvent, AgentEventStream, AgentLoop, AgentMetadata, ApprovalDecision, ApprovalError,
-    ApprovalFuture, ApprovalId, ApprovalPort, ApprovalRequest, ApprovalResolution, ArchiveSession,
-    BeginSessionRun, CheckpointCodec, CheckpointEnvelope, ContentPart, CreateSession,
-    EffectRequest, FinalizeSessionRun, FinishReason, FlowEffect, FlowEffectRouter, FlowError,
-    FlowStore, JobExecutionError, JobExecutionFuture, JobRecord, JobRouter, JobStore,
-    MAX_SESSION_PAGE_SIZE, MachineError, MachineOutput, MachineResumeRequest, MachineStartRequest,
-    MachineStream, ModelMessage, RunEvent, RunFailure, RunId, RunRequest, RunResponse, RunSnapshot,
-    RunStatus, RunStore, RunStoreError, SessionId, SessionStatus, SessionStore, SessionStoreError,
-    SingleTurnAgent, StepOutcome, ToolApprovalPolicy, ToolDefinition, ToolPort, ToolRegistry,
-    ToolRiskLevel, WakeFlowRun,
+    AGENT_LOOP_CHECKPOINT_SCHEMA_VERSION, AGENT_LOOP_REDUCER_PROTOCOL_VERSION, Agent, AgentLoop,
+    AgentMetadata, ApprovalDecision, ApprovalError, ApprovalFuture, ApprovalId, ApprovalPort,
+    ApprovalRequest, ApprovalResolution, ArchiveSession, BeginSessionRun, BlobId, BlobStore,
+    ContentPart, CreateSession, EffectRequest, FinalizeSessionRun, FinishReason, FlowEffect,
+    FlowEffectRouter, FlowError, FlowStore, JobExecutionError, JobExecutionFuture, JobRecord,
+    JobRouter, JobStore, MAX_SESSION_PAGE_SIZE, ModelAttachment, PutBlob, RunEvent, RunFailure,
+    RunId, RunResponse, RunSnapshot, RunStatus, RunStore, RunStoreError, SessionId, SessionStatus,
+    SessionStore, SessionStoreError, ToolDefinition, ToolPort, ToolRegistry, ToolRiskLevel,
+    WakeFlowRun,
 };
 use agent_core::memory::{
     CreateMemoryWriteProposal, HostMemoryWritePolicy, MemoryApprovalId, MemoryApprovalStatus,
@@ -48,35 +47,34 @@ use agent_extension::observability::{
     AsyncObservationConfig, AsyncObservationHook, HookObservationExporter, ObservationHook,
     ObservedMachine, ObservedModel, ObservedTools, TracingObservationHook,
 };
-use agent_extension::provider::OpenAiCompatibleProvider;
+use agent_extension::provider::ConfiguredModelProvider;
 use agent_extension::sandbox::{HostProcessSandbox, ProcessSandbox, ProcessSandboxDescriptor};
 use agent_extension::store::{
-    FilesystemSkillStore, SqliteEventStore, SqliteMemoryStore, SqliteRunStore,
+    FilesystemBlobStore, FilesystemSkillStore, SqliteEventStore, SqliteMemoryStore, SqliteRunStore,
 };
 use agent_extension::tool::{
     AsyncJobTool, BuiltinToolCatalog, JavaScriptEvalTool, SearchBackend, SearchBackendDescriptor,
     WorkspaceSearchBackend,
 };
 use agent_harness::{
-    AgentKind, ContextStrategy, EventRuntime, EventRuntimeConfig, FlowEffectRuntime,
-    FlowEffectRuntimeConfig, Harness, HarnessConfig, HarnessError, JobRuntime, JobRuntimeConfig,
-    MAX_RUN_STEPS, Modality, OrchestrationConfig, PlannedRun, QuickJsConfig, RunRuntime,
-    RunRuntimeError, StartedRun,
+    ContextStrategy, EventRuntime, EventRuntimeConfig, FlowEffectRuntime, FlowEffectRuntimeConfig,
+    Harness, HarnessConfig, HarnessError, JobRuntime, JobRuntimeConfig, Modality,
+    OrchestrationConfig, PlannedRun, QuickJsConfig, RunRuntime, RunRuntimeError, StartedRun,
     adf::JavaScriptAdfExecutor,
     script::{QuickJsRuntime, QuickJsRuntimeConfig},
 };
 use async_stream::stream;
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
 };
-use futures_util::{StreamExt, stream as futures_stream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -87,222 +85,22 @@ use tracing_subscriber::EnvFilter;
 
 use agent_harness as run_runtime;
 
-#[derive(Debug, Default)]
-struct EchoAgent;
+const MAX_BLOB_BYTES: usize = 10 * 1_048_576;
+const MAX_RUN_ATTACHMENTS: usize = 8;
 
-impl Agent for EchoAgent {
-    fn metadata(&self) -> AgentMetadata {
-        AgentMetadata::new("echo", env!("CARGO_PKG_VERSION"))
-            .with_capability("request_response")
-            .with_capability("event_stream")
-    }
-
-    fn run(&self, request: RunRequest) -> AgentEventStream {
-        Box::pin(futures_stream::iter(vec![
-            AgentEvent::text_delta(format!("Echo: {}", request.input)),
-            AgentEvent::completed(FinishReason::Stop),
-        ]))
-    }
-}
-
-enum RuntimeAgent {
-    Echo(EchoAgent),
-    SingleTurn(Box<SingleTurnAgent<ObservedModel<OpenAiCompatibleProvider>>>),
-    AgentLoop(
-        Box<
-            AgentLoop<
-                ObservedModel<OpenAiCompatibleProvider>,
-                ObservedTools<RunAdfToolSession<ToolRegistry>>,
-            >,
-        >,
-    ),
-}
-
-type AppRuntimeAgent = ObservedMachine<RuntimeAgent>;
-
-impl Agent for RuntimeAgent {
-    fn metadata(&self) -> AgentMetadata {
-        match self {
-            Self::Echo(agent) => agent.metadata(),
-            Self::SingleTurn(agent) => agent.metadata(),
-            Self::AgentLoop(agent) => agent.metadata(),
-        }
-    }
-
-    fn run(&self, request: RunRequest) -> AgentEventStream {
-        match self {
-            Self::Echo(agent) => agent.run(request),
-            Self::SingleTurn(agent) => agent.run(request),
-            Self::AgentLoop(agent) => agent.run(request),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacyMachineCheckpoint {
-    input: String,
-    prior_messages: Vec<ModelMessage>,
-    allowed_tools: Option<Vec<String>>,
-    allow_run_adf: bool,
-    max_steps: Option<u32>,
-}
-
-impl agent_core::harness::AgentMachine for RuntimeAgent {
-    fn metadata(&self) -> AgentMetadata {
-        Agent::metadata(self).with_capability("durable_checkpoint")
-    }
-
-    fn initial_checkpoint(
-        &self,
-        request: &MachineStartRequest,
-    ) -> Result<CheckpointEnvelope, MachineError> {
-        match self {
-            Self::AgentLoop(agent) => agent.initial_checkpoint(request),
-            Self::Echo(_) | Self::SingleTurn(_) => encode_legacy_checkpoint(request),
-        }
-    }
-
-    fn start(&self, request: MachineStartRequest) -> MachineStream {
-        match self {
-            Self::AgentLoop(agent) => agent.start(request),
-            Self::Echo(agent) => legacy_machine_stream(agent.run(machine_run_request(request))),
-            Self::SingleTurn(agent) => {
-                legacy_machine_stream(agent.run(machine_run_request(request)))
-            }
-        }
-    }
-
-    fn resume(&self, request: MachineResumeRequest) -> MachineStream {
-        match self {
-            Self::AgentLoop(agent) => agent.resume(request),
-            Self::Echo(agent) => legacy_resume(agent, request),
-            Self::SingleTurn(agent) => legacy_resume(agent.as_ref(), request),
-        }
-    }
-}
-
-fn encode_legacy_checkpoint(
-    request: &MachineStartRequest,
-) -> Result<CheckpointEnvelope, MachineError> {
-    let payload = serde_json::to_value(LegacyMachineCheckpoint {
-        input: request.input.clone(),
-        prior_messages: request.prior_messages.clone(),
-        allowed_tools: request.allowed_tools.clone(),
-        allow_run_adf: request.allow_run_adf,
-        max_steps: request.max_steps,
-    })
-    .map_err(|_| MachineError {
-        code: "checkpoint_encode_failed".into(),
-        message: "the legacy agent checkpoint could not be encoded".into(),
-        retryable: false,
-    })?;
-    let checkpoint = CheckpointEnvelope {
-        agent_kind: "legacy-agent".into(),
-        schema_version: 1,
-        codec: CheckpointCodec::Json,
-        payload,
-    };
-    checkpoint.validate().map_err(|error| MachineError {
-        code: "checkpoint_invalid".into(),
-        message: error.to_string(),
-        retryable: false,
-    })?;
-    Ok(checkpoint)
-}
-
-fn machine_run_request(request: MachineStartRequest) -> RunRequest {
-    RunRequest {
-        run_id: request.run_id,
-        input: request.input,
-        prior_messages: request.prior_messages,
-        allowed_tools: request.allowed_tools,
-        allow_run_adf: request.allow_run_adf,
-        max_steps: request.max_steps,
-        cancellation: request.cancellation,
-    }
-}
-
-fn legacy_resume<A: Agent>(agent: &A, request: MachineResumeRequest) -> MachineStream {
-    if request.checkpoint.agent_kind != "legacy-agent"
-        || request.checkpoint.schema_version != 1
-        || request.checkpoint.codec != CheckpointCodec::Json
-    {
-        return machine_failure_stream(
-            "checkpoint_incompatible",
-            "the checkpoint is not compatible with the legacy agent adapter",
-            false,
-        );
-    }
-    let checkpoint: LegacyMachineCheckpoint =
-        match serde_json::from_value(request.checkpoint.payload) {
-            Ok(checkpoint) => checkpoint,
-            Err(_) => {
-                return machine_failure_stream(
-                    "checkpoint_decode_failed",
-                    "the legacy agent checkpoint payload is invalid",
-                    false,
-                );
-            }
-        };
-    legacy_machine_stream(agent.run(RunRequest {
-        run_id: request.run_id,
-        input: checkpoint.input,
-        prior_messages: checkpoint.prior_messages,
-        allowed_tools: checkpoint.allowed_tools,
-        allow_run_adf: checkpoint.allow_run_adf,
-        max_steps: checkpoint.max_steps,
-        cancellation: request.cancellation,
-    }))
-}
-
-fn legacy_machine_stream(mut events: AgentEventStream) -> MachineStream {
-    Box::pin(stream! {
-        while let Some(event) = events.next().await {
-            match event {
-                AgentEvent::Completed { finish_reason } => {
-                    yield MachineOutput::Yield(StepOutcome::Complete { finish_reason });
-                    return;
-                }
-                AgentEvent::Failed { code, message, retryable } => {
-                    yield MachineOutput::Yield(StepOutcome::Failed {
-                        error: MachineError { code, message, retryable },
-                    });
-                    return;
-                }
-                AgentEvent::Cancelled => {
-                    yield MachineOutput::Yield(StepOutcome::Cancelled);
-                    return;
-                }
-                event => yield MachineOutput::Event(event),
-            }
-        }
-        yield MachineOutput::Yield(StepOutcome::Failed {
-            error: MachineError {
-                code: "agent_protocol_violation".into(),
-                message: "legacy agent event stream ended without a terminal event".into(),
-                retryable: false,
-            },
-        });
-    })
-}
-
-fn machine_failure_stream(code: &str, message: &str, retryable: bool) -> MachineStream {
-    let error = MachineError {
-        code: code.into(),
-        message: message.into(),
-        retryable,
-    };
-    Box::pin(futures_stream::once(async move {
-        MachineOutput::Yield(StepOutcome::Failed { error })
-    }))
-}
+type ServerAgentLoop = AgentLoop<
+    ObservedModel<ConfiguredModelProvider>,
+    ObservedTools<RunAdfToolSession<ToolRegistry>>,
+>;
+type AppRuntimeAgent = ObservedMachine<ServerAgentLoop>;
 
 #[derive(Clone)]
 struct AppState {
     runtime: RunRuntime<AppRuntimeAgent>,
-    config: Option<Arc<HarnessConfig>>,
+    config: Arc<HarnessConfig>,
     approvals: InMemoryApprovalBroker,
     events: Arc<EventRuntime>,
+    blobs: Arc<dyn BlobStore>,
     orchestration: Arc<OrchestrationRuntime>,
 }
 
@@ -321,7 +119,7 @@ struct OrchestrationRuntime {
     model_context_tokens: u64,
     reserved_output_tokens: u64,
     tools: Vec<ToolDefinition>,
-    tool_runtime: Option<ToolRuntimeInspection>,
+    tool_runtime: ToolRuntimeInspection,
 }
 
 struct ServerDeliveryRouter {
@@ -687,7 +485,8 @@ struct InfoResponse {
     service: &'static str,
     version: &'static str,
     agent: AgentMetadata,
-    model: Option<ModelInfo>,
+    engine: AgentEngineInfo,
+    model: ModelInfo,
 }
 
 #[derive(Debug, Serialize)]
@@ -695,13 +494,21 @@ struct AgentInspectionResponse {
     service: &'static str,
     version: &'static str,
     agent: AgentMetadata,
-    model: Option<ModelInfo>,
+    engine: AgentEngineInfo,
+    model: ModelInfo,
     system: SystemInspection,
     skills: SkillInspection,
     tools: Vec<ToolDefinition>,
     approval: ApprovalInspection,
-    tool_runtime: Option<ToolRuntimeInspection>,
+    tool_runtime: ToolRuntimeInspection,
     memory: MemoryInspection,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentEngineInfo {
+    kind: &'static str,
+    protocol_version: u32,
+    checkpoint_schema_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -752,6 +559,7 @@ struct MemoryInspection {
 struct ModelInfo {
     profile: String,
     provider: &'static str,
+    protocol: &'static str,
     model: String,
     input_modalities: Vec<Modality>,
     output_modalities: Vec<Modality>,
@@ -760,6 +568,8 @@ struct ModelInfo {
 #[derive(Debug, Deserialize)]
 struct CreateRunRequest {
     input: String,
+    #[serde(default)]
+    attachments: Vec<BlobInput>,
     #[serde(default)]
     stream: bool,
     #[serde(default)]
@@ -793,12 +603,41 @@ struct ListSessionsQuery {
 #[derive(Debug, Deserialize)]
 struct SubmitSessionRunRequest {
     input: String,
+    #[serde(default)]
+    attachments: Vec<BlobInput>,
     expected_revision: u64,
     idempotency_key: String,
     #[serde(default)]
     max_steps: Option<u32>,
     #[serde(default)]
     skills: Vec<SkillChoice>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BlobInput {
+    blob_id: BlobId,
+    #[serde(default)]
+    media_type: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UploadBlobQuery {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BlobResponse {
+    blob_id: BlobId,
+    url: String,
+    media_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    size_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -889,25 +728,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let config = env::var_os("MINA_CONFIG")
-        .map(HarnessConfig::load)
-        .transpose()?
-        .map(Arc::new);
+    let config_path = env::var_os("MINA_CONFIG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("config/mina.toml"));
+    let config = Arc::new(HarnessConfig::load(&config_path)?);
+    let model = config.default_model();
+    tracing::info!(
+        path = %config_path.display(),
+        profile = config.default_model_name(),
+        provider = model.provider.kind(),
+        model = model.model,
+        "loaded model configuration"
+    );
 
-    if let Some(config) = &config {
-        let model = config.default_model();
-        tracing::info!(
-            profile = config.default_model_name(),
-            provider = model.provider.kind(),
-            model = model.model,
-            "loaded model configuration"
-        );
-    }
-
-    let orchestration_config = config
-        .as_deref()
-        .map(|config| config.orchestration().clone())
-        .unwrap_or_default();
+    let orchestration_config = config.orchestration().clone();
     let estimator: Arc<dyn TokenEstimator> = Arc::new(HeuristicTokenEstimator);
     let approvals = InMemoryApprovalBroker::default();
     let observation_worker = Arc::new(AsyncObservationHook::new(
@@ -917,18 +751,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         AsyncObservationConfig::default(),
     )?);
     let observation_hook: Arc<dyn ObservationHook> = observation_worker.clone();
+    let blob_path = env::var_os("MINA_BLOB_STORE_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("data/blobs"));
+    let blob_adapter = Arc::new(FilesystemBlobStore::new(blob_path));
+    tracing::info!(path = %blob_adapter.root().display(), "configured durable blob store");
+    let blobs: Arc<dyn BlobStore> = blob_adapter;
     let (agent, tools, tool_runtime) = build_agent(
-        config.as_deref(),
+        &config,
         approvals.clone(),
         Arc::clone(&estimator),
         Arc::clone(&observation_hook),
+        Arc::clone(&blobs),
     )?;
-    tracing::info!(agent = agent.metadata().name, "configured agent runtime");
+    let agent_metadata = agent.metadata();
+    let engine = agent_engine_info();
+    tracing::info!(
+        agent = agent_metadata.name,
+        engine = engine.kind,
+        reducer_protocol_version = engine.protocol_version,
+        checkpoint_schema_version = engine.checkpoint_schema_version,
+        "configured agent runtime"
+    );
 
-    let mut harness = Harness::new(ObservedMachine::new(agent, Arc::clone(&observation_hook)));
-    if let Some(config) = &config {
-        harness = harness.with_run_timeout(Duration::from_secs(config.agent().run_timeout_seconds));
-    }
+    let harness = Harness::new(ObservedMachine::new(agent, Arc::clone(&observation_hook)))
+        .with_run_timeout(Duration::from_secs(config.agent().run_timeout_seconds));
     let store_path = env::var_os("MINA_RUN_STORE_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("data/runs.sqlite3"));
@@ -946,22 +793,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let memory_extractor: Arc<dyn MemoryExtractor> = Arc::new(RuleMemoryExtractor);
     let memory_writer = MemoryWriter::new(Arc::clone(&memory_store), memory_policy);
     let deterministic_summary: Arc<dyn SummaryGenerator> = Arc::new(DeterministicSummaryGenerator);
-    let summary: Arc<dyn SummaryGenerator> = if let Some(config) = config.as_deref() {
-        let model = config.default_model();
-        let provider = OpenAiCompatibleProvider::from_model_config(model)?
-            .with_token_estimator(Arc::clone(&estimator));
-        let provider = ObservedModel::new(provider, Arc::clone(&observation_hook));
-        let primary: Arc<dyn SummaryGenerator> = Arc::new(ModelSummaryGenerator::new(
-            provider,
-            Duration::from_secs(config.agent().model_timeout_seconds),
-        ));
-        Arc::new(FallbackSummaryGenerator::new(
-            primary,
-            deterministic_summary,
-        ))
-    } else {
-        deterministic_summary
-    };
+    let model = config.default_model();
+    let provider = ConfiguredModelProvider::from_model_config(model)?
+        .with_token_estimator(Arc::clone(&estimator))
+        .with_blob_store(Arc::clone(&blobs));
+    let provider = ObservedModel::new(provider, Arc::clone(&observation_hook));
+    let primary: Arc<dyn SummaryGenerator> = Arc::new(ModelSummaryGenerator::new(
+        provider,
+        Duration::from_secs(config.agent().model_timeout_seconds),
+    ));
+    let summary: Arc<dyn SummaryGenerator> = Arc::new(FallbackSummaryGenerator::new(
+        primary,
+        deterministic_summary,
+    ));
     let compressor: Arc<dyn ContextCompressor> = match orchestration_config.compressor {
         ContextStrategy::NoopFail => Arc::new(NoopFailCompressor::new(Arc::clone(&estimator))),
         ContextStrategy::SlidingWindow => {
@@ -1045,9 +889,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState {
         runtime,
-        config: config.clone(),
+        config: Arc::clone(&config),
         approvals,
         events: Arc::clone(&events),
+        blobs,
         orchestration: Arc::new(OrchestrationRuntime {
             sessions,
             context,
@@ -1057,23 +902,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             memory_extractor,
             memory_writer,
             config: orchestration_config,
-            agent_instruction: config
-                .as_deref()
-                .map(|config| config.agent().system_prompt.clone())
-                .unwrap_or_else(|| "You are a helpful agent.".into()),
+            agent_instruction: config.agent().system_prompt.clone(),
             agent_profile: "default".into(),
-            model_profile: config
-                .as_deref()
-                .map(|config| config.default_model_name().to_owned())
-                .unwrap_or_else(|| "echo".into()),
+            model_profile: config.default_model_name().to_owned(),
             model_context_tokens: config
-                .as_deref()
-                .and_then(|config| config.default_model().context_window)
+                .default_model()
+                .context_window
                 .map(u64::from)
                 .unwrap_or(32_768),
             reserved_output_tokens: config
-                .as_deref()
-                .and_then(|config| config.default_model().max_output_tokens)
+                .default_model()
+                .max_output_tokens
                 .map(u64::from)
                 .unwrap_or(2_048),
             tools,
@@ -1085,6 +924,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(health))
         .route("/api/v1/info", get(info))
         .route("/api/v1/debug/agent", get(inspect_agent))
+        .route("/api/v1/blobs", post(upload_blob))
+        .route("/api/v1/blobs/{blob_id}", get(download_blob))
         .route("/api/v1/runs", post(create_run))
         .route("/api/v1/runs/{run_id}", get(get_run))
         .route("/api/v1/runs/{run_id}/events", get(get_run_events))
@@ -1112,6 +953,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/v1/memories/approvals/{approval_id}",
             post(resolve_memory_approval),
         )
+        .layer(DefaultBodyLimit::max(MAX_BLOB_BYTES))
         .with_state(state);
 
     let address = env::var("MINA_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
@@ -1127,116 +969,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn build_agent(
-    config: Option<&HarnessConfig>,
+    config: &HarnessConfig,
     approvals: InMemoryApprovalBroker,
     estimator: Arc<dyn TokenEstimator>,
     hook: Arc<dyn ObservationHook>,
+    blobs: Arc<dyn BlobStore>,
 ) -> AgentBuildResult {
-    let Some(config) = config else {
-        return Ok((RuntimeAgent::Echo(EchoAgent), Vec::new(), None));
+    let model = config.default_model();
+    let provider = ConfiguredModelProvider::from_model_config(model)?
+        .with_token_estimator(estimator)
+        .with_blob_store(blobs);
+    let provider = ObservedModel::new(provider, Arc::clone(&hook));
+    let workspace = env::current_dir()?;
+    let process_sandbox: Arc<dyn ProcessSandbox> = Arc::new(HostProcessSandbox::default());
+    let search_backend: Arc<dyn SearchBackend> = Arc::new(WorkspaceSearchBackend::new(&workspace)?);
+    let tool_runtime = ToolRuntimeInspection {
+        process_sandbox: process_sandbox.descriptor(),
+        search_backend: search_backend.descriptor(),
+        script_runtime: None,
+        adf_enabled: config.adf().enabled,
     };
-
-    match config.agent().kind {
-        AgentKind::Echo => Ok((RuntimeAgent::Echo(EchoAgent), Vec::new(), None)),
-        AgentKind::SingleTurn => {
-            let model = config.default_model();
-            let provider =
-                OpenAiCompatibleProvider::from_model_config(model)?.with_token_estimator(estimator);
-            let provider = ObservedModel::new(provider, hook);
-            Ok((
-                RuntimeAgent::SingleTurn(Box::new(
-                    SingleTurnAgent::new(
-                        provider,
-                        model.model.clone(),
-                        "",
-                        model.max_output_tokens,
-                    )
-                    .with_model_timeout(Duration::from_secs(config.agent().model_timeout_seconds)),
-                )),
-                Vec::new(),
-                None,
-            ))
-        }
-        AgentKind::AgentLoop => {
-            let model = config.default_model();
-            let provider =
-                OpenAiCompatibleProvider::from_model_config(model)?.with_token_estimator(estimator);
-            let provider = ObservedModel::new(provider, Arc::clone(&hook));
-            let workspace = env::current_dir()?;
-            let process_sandbox: Arc<dyn ProcessSandbox> = Arc::new(HostProcessSandbox::default());
-            let search_backend: Arc<dyn SearchBackend> =
-                Arc::new(WorkspaceSearchBackend::new(&workspace)?);
-            let tool_runtime = ToolRuntimeInspection {
-                process_sandbox: process_sandbox.descriptor(),
-                search_backend: search_backend.descriptor(),
-                script_runtime: None,
-                adf_enabled: config.adf().enabled,
-            };
-            let mut tools = BuiltinToolCatalog::new(workspace)
-                .with_process_sandbox(process_sandbox)
-                .with_search_backend(search_backend)
-                .enable_terminal_tools()
-                .build()?;
-            if config.jobs().enabled {
-                tools.register(AsyncJobTool::new(
-                    config.jobs().allowed_kinds.iter().cloned(),
-                ))?;
-            }
-            let quickjs = if config.script().quickjs.enabled {
-                let limits = script_limits(&config.script().quickjs);
-                let runtime: Arc<dyn ScriptRuntime> =
-                    Arc::new(QuickJsRuntime::new(QuickJsRuntimeConfig {
-                        max_source_bytes: config.script().quickjs.max_source_bytes,
-                        max_limits: limits,
-                        max_concurrent_executions: config
-                            .script()
-                            .quickjs
-                            .max_concurrent_executions,
-                    })?);
-                tools.register(JavaScriptEvalTool::new(Arc::clone(&runtime), limits))?;
-                Some((runtime, limits))
-            } else {
-                None
-            };
-            let mut tools = RunAdfToolSession::new(tools);
-            if config.adf().enabled {
-                let (runtime, limits) = quickjs
-                    .as_ref()
-                    .expect("validated configuration enables QuickJS for ADF");
-                tools = tools.with_adf(
-                    Arc::new(InMemoryAdfArtifactStore::new()),
-                    Arc::new(RunScopedJavaScriptPolicy::new(runtime.descriptor())),
-                    Arc::new(JavaScriptAdfExecutor::new(Arc::clone(runtime), *limits)),
-                    config.adf().max_active_per_run,
-                )?;
-            }
-            let mut tool_runtime = tool_runtime;
-            tool_runtime.script_runtime = quickjs.as_ref().map(|(runtime, _)| runtime.descriptor());
-            let definitions = tools.definitions();
-            let tools = ObservedTools::new(tools, hook);
-            Ok((
-                RuntimeAgent::AgentLoop(Box::new(
-                    AgentLoop::new(
-                        provider,
-                        tools,
-                        model.model.clone(),
-                        "",
-                        model.max_output_tokens,
-                        config.agent().max_steps,
-                    )
-                    .with_approval_policy(config.approval().policy())
-                    .with_timeouts(
-                        Duration::from_secs(config.agent().model_timeout_seconds),
-                        Duration::from_secs(config.agent().tool_timeout_seconds),
-                    )
-                    .with_tool_call_strategy(config.agent().tool_call_strategy)
-                    .with_approval_port(approvals),
-                )),
-                definitions,
-                Some(tool_runtime),
-            ))
-        }
+    let mut tools = BuiltinToolCatalog::new(workspace)
+        .with_process_sandbox(process_sandbox)
+        .with_search_backend(search_backend)
+        .enable_terminal_tools()
+        .build()?;
+    if config.jobs().enabled {
+        tools.register(AsyncJobTool::new(
+            config.jobs().allowed_kinds.iter().cloned(),
+        ))?;
     }
+    let quickjs = if config.script().quickjs.enabled {
+        let limits = script_limits(&config.script().quickjs);
+        let runtime: Arc<dyn ScriptRuntime> =
+            Arc::new(QuickJsRuntime::new(QuickJsRuntimeConfig {
+                max_source_bytes: config.script().quickjs.max_source_bytes,
+                max_limits: limits,
+                max_concurrent_executions: config.script().quickjs.max_concurrent_executions,
+            })?);
+        tools.register(JavaScriptEvalTool::new(Arc::clone(&runtime), limits))?;
+        Some((runtime, limits))
+    } else {
+        None
+    };
+    let mut tools = RunAdfToolSession::new(tools);
+    if config.adf().enabled {
+        let (runtime, limits) = quickjs
+            .as_ref()
+            .expect("validated configuration enables QuickJS for ADF");
+        tools = tools.with_adf(
+            Arc::new(InMemoryAdfArtifactStore::new()),
+            Arc::new(RunScopedJavaScriptPolicy::new(runtime.descriptor())),
+            Arc::new(JavaScriptAdfExecutor::new(Arc::clone(runtime), *limits)),
+            config.adf().max_active_per_run,
+        )?;
+    }
+    let mut tool_runtime = tool_runtime;
+    tool_runtime.script_runtime = quickjs.as_ref().map(|(runtime, _)| runtime.descriptor());
+    let definitions = tools.definitions();
+    let tools = ObservedTools::new(tools, hook);
+    let agent = AgentLoop::new(
+        provider,
+        tools,
+        model.model.clone(),
+        "",
+        model.max_output_tokens,
+        config.agent().max_steps,
+    )
+    .with_approval_policy(config.approval().policy())
+    .with_timeouts(
+        Duration::from_secs(config.agent().model_timeout_seconds),
+        Duration::from_secs(config.agent().tool_timeout_seconds),
+    )
+    .with_tool_call_strategy(config.agent().tool_call_strategy)
+    .with_approval_port(approvals);
+    Ok((agent, definitions, tool_runtime))
 }
 
 fn script_limits(config: &QuickJsConfig) -> ScriptLimits {
@@ -1250,11 +1057,7 @@ fn script_limits(config: &QuickJsConfig) -> ScriptLimits {
 }
 
 type AgentBuildResult = Result<
-    (
-        RuntimeAgent,
-        Vec<ToolDefinition>,
-        Option<ToolRuntimeInspection>,
-    ),
+    (ServerAgentLoop, Vec<ToolDefinition>, ToolRuntimeInspection),
     Box<dyn std::error::Error>,
 >;
 
@@ -1373,12 +1176,148 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
+async fn upload_blob(
+    State(state): State<AppState>,
+    Query(query): Query<UploadBlobQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if body.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "empty_blob",
+            "attachment body must not be empty",
+            false,
+        );
+    }
+    if body.len() > MAX_BLOB_BYTES {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "blob_too_large",
+            format!("attachment must not exceed {MAX_BLOB_BYTES} bytes"),
+            false,
+        );
+    }
+    let media_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    let Some(media_type) = media_type else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "missing_media_type",
+            "attachment Content-Type is required",
+            false,
+        );
+    };
+    let name = query
+        .name
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty());
+    if name.as_ref().is_some_and(|name| name.len() > 512) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_blob_name",
+            "attachment name must not exceed 512 bytes",
+            false,
+        );
+    }
+    match state
+        .blobs
+        .put(PutBlob {
+            media_type,
+            name,
+            data: body.to_vec(),
+            created_at_ms: run_runtime::unix_time_ms(),
+        })
+        .await
+    {
+        Ok(metadata) => (
+            StatusCode::CREATED,
+            Json(BlobResponse {
+                blob_id: metadata.blob_id,
+                url: format!("/api/v1/blobs/{}", metadata.blob_id),
+                media_type: metadata.media_type,
+                name: metadata.name,
+                size_bytes: metadata.size_bytes,
+            }),
+        )
+            .into_response(),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "blob_store_error",
+            error.to_string(),
+            true,
+        ),
+    }
+}
+
+async fn download_blob(State(state): State<AppState>, Path(blob_id): Path<String>) -> Response {
+    let Ok(blob_id) = blob_id.parse::<BlobId>() else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_blob_id",
+            "blob_id must be a valid UUID",
+            false,
+        );
+    };
+    let object = match state.blobs.get(blob_id).await {
+        Ok(Some(object)) => object,
+        Ok(None) => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "blob_not_found",
+                "attachment does not exist",
+                false,
+            );
+        }
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "blob_store_error",
+                error.to_string(),
+                true,
+            );
+        }
+    };
+    let Ok(content_type) = HeaderValue::from_str(&object.metadata.media_type) else {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid_blob_metadata",
+            "attachment has an invalid media type",
+            false,
+        );
+    };
+    let mut response = object.data.into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=31536000, immutable"),
+    );
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        "content-security-policy",
+        HeaderValue::from_static("sandbox; default-src 'none'"),
+    );
+    response
+}
+
 async fn info(State(state): State<AppState>) -> Json<InfoResponse> {
+    let agent = state.runtime.metadata();
     Json(InfoResponse {
         service: "mina-server",
         version: env!("CARGO_PKG_VERSION"),
-        agent: state.runtime.metadata(),
-        model: state.config.as_deref().map(model_info),
+        engine: agent_engine_info(),
+        agent,
+        model: model_info(&state.config),
     })
 }
 
@@ -1448,18 +1387,15 @@ async fn inspect_agent(State(state): State<AppState>) -> Response {
         Vec::new()
     };
 
-    let review_level = state
-        .config
-        .as_deref()
-        .map_or(ToolApprovalPolicy::DEFAULT_REVIEW_LEVEL, |config| {
-            config.approval().review_level
-        });
+    let review_level = state.config.approval().review_level;
 
+    let agent = state.runtime.metadata();
     Json(AgentInspectionResponse {
         service: "mina-server",
         version: env!("CARGO_PKG_VERSION"),
-        agent: state.runtime.metadata(),
-        model: state.config.as_deref().map(model_info),
+        engine: agent_engine_info(),
+        agent,
+        model: model_info(&state.config),
         system: SystemInspection {
             source: "agent_config",
             content: state.orchestration.agent_instruction.clone(),
@@ -1490,11 +1426,20 @@ async fn inspect_agent(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
+const fn agent_engine_info() -> AgentEngineInfo {
+    AgentEngineInfo {
+        kind: "reducer",
+        protocol_version: AGENT_LOOP_REDUCER_PROTOCOL_VERSION,
+        checkpoint_schema_version: AGENT_LOOP_CHECKPOINT_SCHEMA_VERSION,
+    }
+}
+
 fn model_info(config: &HarnessConfig) -> ModelInfo {
     let model = config.default_model();
     ModelInfo {
         profile: config.default_model_name().into(),
         provider: model.provider.kind(),
+        protocol: model.provider.protocol(),
         model: model.model.clone(),
         input_modalities: model.modalities.input.iter().copied().collect(),
         output_modalities: model.modalities.output.iter().copied().collect(),
@@ -1510,14 +1455,21 @@ async fn create_run(
         Ok(max_steps) => max_steps,
         Err(error) => return map_run_max_steps_error(error),
     };
+    let attachments = match resolve_blob_inputs(&state, request.attachments).await {
+        Ok(attachments) => attachments,
+        Err(error) => return error,
+    };
     let prepared = match prepare_run_plan(
         &state,
-        run_id,
-        request.input,
-        request.skills,
-        max_steps,
-        None,
-        None,
+        PrepareRunRequest {
+            run_id,
+            input: request.input,
+            attachments: attachments.model,
+            explicit_skills: request.skills,
+            max_steps,
+            session_id: None,
+            through_message_ordinal: None,
+        },
     )
     .await
     {
@@ -1545,20 +1497,34 @@ struct PreparedRun {
     max_steps: u32,
 }
 
-async fn prepare_run_plan(
-    state: &AppState,
+struct PrepareRunRequest {
     run_id: RunId,
     input: String,
+    attachments: Vec<ModelAttachment>,
     explicit_skills: Vec<SkillChoice>,
     max_steps: u32,
     session_id: Option<SessionId>,
     through_message_ordinal: Option<u64>,
+}
+
+async fn prepare_run_plan(
+    state: &AppState,
+    request: PrepareRunRequest,
 ) -> Result<PreparedRun, Response> {
-    if input.trim().is_empty() {
+    let PrepareRunRequest {
+        run_id,
+        input,
+        attachments,
+        explicit_skills,
+        max_steps,
+        session_id,
+        through_message_ordinal,
+    } = request;
+    if input.trim().is_empty() && attachments.is_empty() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "invalid_input",
-            "input must not be empty",
+            "input or attachments must not be empty",
             false,
         ));
     }
@@ -1591,7 +1557,7 @@ async fn prepare_run_plan(
                 false,
             )
         })?;
-    let request_digest = request_digest(&input, &resolved_skills);
+    let request_digest = request_digest(&input, &attachments, &resolved_skills);
     let memory_scopes = if state.orchestration.config.memory_enabled {
         let mut scopes = vec![MemoryScope(state.orchestration.config.memory_scope.clone())];
         if let Some(session_id) = session_id {
@@ -1643,10 +1609,7 @@ async fn prepare_run_plan(
             )
         })?;
     let context_fingerprint = pack.fingerprint.clone();
-    let allow_run_adf = state
-        .config
-        .as_deref()
-        .is_some_and(|config| config.adf().enabled);
+    let allow_run_adf = state.config.adf().enabled;
     let manifest = serde_json::json!({
         "schema_version": 1,
         "context_fingerprint": pack.fingerprint,
@@ -1668,11 +1631,7 @@ async fn prepare_run_plan(
             "allow_run_adf": allow_run_adf,
         },
         "tool_runtime": {
-            "script": state
-                .orchestration
-                .tool_runtime
-                .as_ref()
-                .and_then(|runtime| runtime.script_runtime.as_ref()),
+            "script": state.orchestration.tool_runtime.script_runtime.as_ref(),
             "adf_enabled": allow_run_adf,
         }
     });
@@ -1680,6 +1639,7 @@ async fn prepare_run_plan(
         plan: PlannedRun {
             run_id,
             input,
+            attachments,
             prior_messages: pack.messages,
             allowed_tools: Some(pack.effective_tools),
             allow_run_adf,
@@ -1797,9 +1757,31 @@ async fn submit_session_run(
         Ok(max_steps) => max_steps,
         Err(error) => return map_run_max_steps_error(error),
     };
+    let attachments = match resolve_blob_inputs(&state, request.attachments).await {
+        Ok(attachments) => attachments,
+        Err(error) => return error,
+    };
+    if request.input.trim().is_empty() && attachments.model.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "input or attachments must not be empty",
+            false,
+        );
+    }
     let run_id = RunId::new();
     let now_ms = run_runtime::unix_time_ms();
-    let hash = raw_request_hash(&request.input, &request.skills, max_steps);
+    let hash = raw_request_hash(
+        &request.input,
+        &attachments.model,
+        &request.skills,
+        max_steps,
+    );
+    let mut input_parts = Vec::with_capacity(attachments.content.len() + 1);
+    if !request.input.is_empty() {
+        input_parts.push(ContentPart::text(request.input.clone()));
+    }
+    input_parts.extend(attachments.content);
     let begin = match state
         .orchestration
         .sessions
@@ -1810,7 +1792,7 @@ async fn submit_session_run(
                 expected_revision: request.expected_revision,
                 idempotency_key: request.idempotency_key,
                 request_hash: hash,
-                input: vec![ContentPart::text(request.input.clone())],
+                input: input_parts,
                 created_at_ms: now_ms,
             },
             RunSnapshot::new(run_id, request.input.clone(), now_ms),
@@ -1850,12 +1832,15 @@ async fn submit_session_run(
 
     let prepared = match prepare_run_plan(
         &state,
-        run_id,
-        request.input.clone(),
-        request.skills,
-        max_steps,
-        Some(session_id),
-        Some(begin.context_through_ordinal),
+        PrepareRunRequest {
+            run_id,
+            input: request.input.clone(),
+            attachments: attachments.model,
+            explicit_skills: request.skills,
+            max_steps,
+            session_id: Some(session_id),
+            through_message_ordinal: Some(begin.context_through_ordinal),
+        },
     )
     .await
     {
@@ -2662,15 +2647,136 @@ fn effective_run_max_steps(
     state: &AppState,
     requested: Option<u32>,
 ) -> Result<u32, RunMaxStepsError> {
-    let host_max = state
-        .config
-        .as_deref()
-        .map_or(MAX_RUN_STEPS, |config| config.agent().max_steps);
+    let host_max = state.config.agent().max_steps;
     let effective = requested.unwrap_or(host_max);
     if effective == 0 || effective > host_max {
         return Err(RunMaxStepsError { host_max });
     }
     Ok(effective)
+}
+
+struct ResolvedBlobInputs {
+    model: Vec<ModelAttachment>,
+    content: Vec<ContentPart>,
+}
+
+async fn resolve_blob_inputs(
+    state: &AppState,
+    inputs: Vec<BlobInput>,
+) -> Result<ResolvedBlobInputs, Response> {
+    if inputs.len() > MAX_RUN_ATTACHMENTS {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "too_many_attachments",
+            format!("a run may include at most {MAX_RUN_ATTACHMENTS} attachments"),
+            false,
+        ));
+    }
+    if inputs.is_empty() {
+        return Ok(ResolvedBlobInputs {
+            model: Vec::new(),
+            content: Vec::new(),
+        });
+    }
+    let allowed = &state.config.default_model().modalities.input;
+    let mut model = Vec::with_capacity(inputs.len());
+    let mut content = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        if model
+            .iter()
+            .any(|attachment: &ModelAttachment| attachment.blob_id == input.blob_id)
+        {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "duplicate_attachment",
+                "the same attachment must not be included more than once",
+                false,
+            ));
+        }
+        let object = state
+            .blobs
+            .get(input.blob_id)
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "blob_store_error",
+                    error.to_string(),
+                    true,
+                )
+            })?
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "blob_not_found",
+                    format!("attachment {} does not exist", input.blob_id),
+                    false,
+                )
+            })?;
+        if input
+            .media_type
+            .as_ref()
+            .is_some_and(|media_type| media_type != &object.metadata.media_type)
+            || input
+                .size_bytes
+                .is_some_and(|size_bytes| size_bytes != object.metadata.size_bytes)
+        {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "blob_metadata_mismatch",
+                "attachment metadata does not match the stored blob",
+                false,
+            ));
+        }
+        let modality = input_modality(&object.metadata.media_type);
+        if !allowed.contains(&modality) {
+            return Err(api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_input_modality",
+                format!(
+                    "the active model does not accept {} inputs",
+                    modality_name(modality)
+                ),
+                false,
+            ));
+        }
+        let name = object.metadata.name.clone().or(input.name);
+        model.push(ModelAttachment {
+            blob_id: object.metadata.blob_id,
+            media_type: object.metadata.media_type.clone(),
+            name: name.clone(),
+        });
+        content.push(ContentPart::BlobRef {
+            blob_id: object.metadata.blob_id,
+            media_type: object.metadata.media_type,
+            name,
+            size_bytes: Some(object.metadata.size_bytes),
+        });
+    }
+    Ok(ResolvedBlobInputs { model, content })
+}
+
+fn input_modality(media_type: &str) -> Modality {
+    if media_type.starts_with("image/") {
+        Modality::Image
+    } else if media_type.starts_with("audio/") {
+        Modality::Audio
+    } else if media_type.starts_with("video/") {
+        Modality::Video
+    } else {
+        Modality::Document
+    }
+}
+
+fn modality_name(modality: Modality) -> &'static str {
+    match modality {
+        Modality::Text => "text",
+        Modality::Image => "image",
+        Modality::Audio => "audio",
+        Modality::Video => "video",
+        Modality::Document => "document",
+        _ => "unknown",
+    }
 }
 
 fn map_run_max_steps_error(error: RunMaxStepsError) -> Response {
@@ -2685,9 +2791,17 @@ fn map_run_max_steps_error(error: RunMaxStepsError) -> Response {
     )
 }
 
-fn request_digest(input: &str, skills: &[ResolvedSkill]) -> String {
+fn request_digest(
+    input: &str,
+    attachments: &[ModelAttachment],
+    skills: &[ResolvedSkill],
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
+    for attachment in attachments {
+        hasher.update(attachment.blob_id.to_string().as_bytes());
+        hasher.update(attachment.media_type.as_bytes());
+    }
     for skill in skills {
         hasher.update((skill.locked.skill_id).0.as_bytes());
         hasher.update(skill.locked.version.as_bytes());
@@ -2696,7 +2810,12 @@ fn request_digest(input: &str, skills: &[ResolvedSkill]) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
-fn raw_request_hash(input: &str, skills: &[SkillChoice], max_steps: u32) -> String {
+fn raw_request_hash(
+    input: &str,
+    attachments: &[ModelAttachment],
+    skills: &[SkillChoice],
+    max_steps: u32,
+) -> String {
     let mut skills = skills.to_vec();
     skills.sort_by(|left, right| {
         (&left.skill_id, &left.version).cmp(&(&right.skill_id, &right.version))
@@ -2704,6 +2823,10 @@ fn raw_request_hash(input: &str, skills: &[SkillChoice], max_steps: u32) -> Stri
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     hasher.update(max_steps.to_le_bytes());
+    for attachment in attachments {
+        hasher.update(attachment.blob_id.to_string().as_bytes());
+        hasher.update(attachment.media_type.as_bytes());
+    }
     for skill in skills {
         hasher.update(skill.skill_id.as_bytes());
         hasher.update(skill.version.as_bytes());
@@ -2869,8 +2992,12 @@ mod tests {
         ClaimDeliveries, ClaimTimers, CompleteDelivery, EventComponentDescriptor, PublishResult,
         RetryDelivery, ScheduleOnce, Subscription, Timer, TimerId,
     };
+    use agent_core::harness::{
+        AgentEvent, MachineOutput, MachineResumeRequest, MachineStartRequest, StepOutcome,
+    };
     use agent_core::tool::ToolRiskLevel;
     use agent_extension::store::{InMemoryMemoryStore, InMemoryRunStore};
+    use futures_util::stream as futures_stream;
     use tempfile::tempdir;
 
     use super::*;
@@ -2959,7 +3086,39 @@ mod tests {
         test_state_with_approvals(InMemoryApprovalBroker::default())
     }
 
+    fn test_config() -> HarnessConfig {
+        HarnessConfig::from_toml_str(
+            r#"
+default_model = "primary"
+
+[agent]
+kind = "agent-loop"
+system_prompt = "You are helpful."
+max_steps = 8
+
+[script.quickjs]
+enabled = false
+
+[adf]
+enabled = false
+
+[jobs]
+enabled = false
+
+[models.primary]
+model = "test-model"
+
+[models.primary.provider]
+type = "openai-compatible"
+base_url = "http://127.0.0.1:9999/v1"
+api_key = "test-key"
+"#,
+        )
+        .expect("test config should parse")
+    }
+
     fn test_state_with_approvals(approvals: InMemoryApprovalBroker) -> AppState {
+        let config = Arc::new(test_config());
         let state_store = Arc::new(InMemoryRunStore::default());
         let store: Arc<dyn RunStore> = state_store.clone();
         let sessions: Arc<dyn SessionStore> = state_store;
@@ -2968,6 +3127,16 @@ mod tests {
         let memory_proposals: Arc<dyn MemoryProposalStore> = memory_adapter.clone();
         let memory_retriever: Arc<dyn MemoryRetriever> = memory_adapter;
         let estimator: Arc<dyn TokenEstimator> = Arc::new(HeuristicTokenEstimator);
+        let blobs: Arc<dyn BlobStore> = Arc::new(FilesystemBlobStore::new("target/test-blobs"));
+        let hook: Arc<dyn ObservationHook> = Arc::new(TracingObservationHook);
+        let (agent, tools, tool_runtime) = build_agent(
+            &config,
+            approvals.clone(),
+            Arc::clone(&estimator),
+            Arc::clone(&hook),
+            Arc::clone(&blobs),
+        )
+        .expect("native Agent loop should compose for tests");
         let compressor: Arc<dyn ContextCompressor> =
             Arc::new(SlidingWindowCompressor::new(Arc::clone(&estimator)));
         let artifacts: Arc<dyn ContextArtifactStore> =
@@ -2994,16 +3163,14 @@ mod tests {
         ));
         AppState {
             runtime: RunRuntime::new(
-                Harness::new(ObservedMachine::new(
-                    RuntimeAgent::Echo(EchoAgent),
-                    Arc::new(TracingObservationHook),
-                )),
+                Harness::new(ObservedMachine::new(agent, hook)),
                 store,
                 move |run_id| approval_cleanup.remove_run(run_id),
             ),
-            config: None,
+            config: Arc::clone(&config),
             approvals,
             events,
+            blobs,
             orchestration: Arc::new(OrchestrationRuntime {
                 sessions,
                 context,
@@ -3012,14 +3179,14 @@ mod tests {
                 memory_proposals,
                 memory_extractor: Arc::new(RuleMemoryExtractor),
                 memory_writer: MemoryWriter::new(memory_store, Arc::new(HostMemoryWritePolicy)),
-                config: OrchestrationConfig::default(),
-                agent_instruction: "You are helpful.".into(),
-                agent_profile: "test".into(),
-                model_profile: "echo".into(),
+                config: config.orchestration().clone(),
+                agent_instruction: config.agent().system_prompt.clone(),
+                agent_profile: "agent-loop".into(),
+                model_profile: config.default_model_name().into(),
                 model_context_tokens: 8_192,
                 reserved_output_tokens: 1_024,
-                tools: Vec::new(),
-                tool_runtime: None,
+                tools,
+                tool_runtime,
             }),
         }
     }
@@ -3275,45 +3442,6 @@ mod tests {
     }
 
     #[test]
-    fn composes_the_single_turn_agent_from_toml() {
-        let config = HarnessConfig::from_toml_str(
-            r#"
-default_model = "primary"
-
-[agent]
-kind = "single-turn"
-system_prompt = "Complete one task."
-
-[models.primary]
-model = "mock-model"
-
-[models.primary.provider]
-type = "openai-compatible"
-base_url = "http://127.0.0.1:9999/v1"
-api_key = "test-key"
-"#,
-        )
-        .expect("config should parse");
-
-        let (agent, _, _) = build_agent(
-            Some(&config),
-            InMemoryApprovalBroker::default(),
-            Arc::new(HeuristicTokenEstimator),
-            Arc::new(TracingObservationHook),
-        )
-        .expect("agent should compose");
-
-        assert_eq!(agent.metadata().name, "single-turn");
-        assert!(
-            agent
-                .metadata()
-                .capabilities
-                .iter()
-                .any(|capability| capability == "model_completion")
-        );
-    }
-
-    #[test]
     fn composes_the_agent_loop_with_tools_from_toml() {
         let config = HarnessConfig::from_toml_str(
             r#"
@@ -3336,10 +3464,11 @@ api_key = "test-key"
         .expect("config should parse");
 
         let (agent, definitions, runtime) = build_agent(
-            Some(&config),
+            &config,
             InMemoryApprovalBroker::default(),
             Arc::new(HeuristicTokenEstimator),
             Arc::new(TracingObservationHook),
+            Arc::new(FilesystemBlobStore::new("target/test-blobs")),
         )
         .expect("agent should compose");
 
@@ -3363,9 +3492,150 @@ api_key = "test-key"
                 "{expected} should be composed"
             );
         }
-        let runtime = runtime.expect("tool runtime inspection should exist");
         assert!(runtime.script_runtime.is_some());
         assert!(runtime.adf_enabled);
+    }
+
+    #[tokio::test]
+    async fn web_backend_drives_responses_through_the_core_reducer() {
+        use std::convert::Infallible;
+
+        use axum::{
+            Json as AxumJson, Router as AxumRouter,
+            response::sse::{Event as SseEvent, Sse as AxumSse},
+            routing::post as axum_post,
+        };
+        use futures_util::StreamExt as _;
+
+        async fn responses(
+            AxumJson(body): AxumJson<serde_json::Value>,
+        ) -> AxumSse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>> {
+            assert_eq!(body["model"], "gpt-test");
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["tools"], serde_json::json!([]));
+            AxumSse::new(futures_stream::iter(vec![
+                Ok(SseEvent::default().data(
+                    r#"{"type":"response.created","response":{"id":"resp_web"}}"#,
+                )),
+                Ok(SseEvent::default()
+                    .data(r#"{"type":"response.output_text.delta","delta":"hel"}"#)),
+                Ok(SseEvent::default()
+                    .data(r#"{"type":"response.output_text.delta","delta":"lo"}"#)),
+                Ok(SseEvent::default().data(
+                    r#"{"type":"response.completed","response":{"id":"resp_web","usage":{"input_tokens":2,"output_tokens":2,"total_tokens":4}}}"#,
+                )),
+            ]))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock Responses listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock Responses address should resolve");
+        let provider_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                AxumRouter::new().route("/v1/responses", axum_post(responses)),
+            )
+            .await
+            .expect("mock Responses server should run");
+        });
+        let config = HarnessConfig::from_toml_str(&format!(
+            r#"
+default_model = "primary"
+
+[agent]
+kind = "agent-loop"
+system_prompt = "Be concise."
+max_steps = 2
+model_timeout_seconds = 5
+tool_timeout_seconds = 5
+
+[script.quickjs]
+enabled = false
+
+[adf]
+enabled = false
+
+[jobs]
+enabled = false
+
+[models.primary]
+model = "gpt-test"
+
+[models.primary.provider]
+type = "openai-compatible"
+base_url = "http://{address}/v1"
+protocol = "responses"
+api_key = "test-key"
+"#
+        ))
+        .expect("Responses config should parse");
+        let (agent, _, _) = build_agent(
+            &config,
+            InMemoryApprovalBroker::default(),
+            Arc::new(HeuristicTokenEstimator),
+            Arc::new(TracingObservationHook),
+            Arc::new(FilesystemBlobStore::new("target/test-blobs")),
+        )
+        .expect("agent should compose");
+        let run_id = RunId::new();
+        let start = MachineStartRequest {
+            run_id,
+            input: "hello".into(),
+            attachments: Vec::new(),
+            prior_messages: Vec::new(),
+            allowed_tools: Some(Vec::new()),
+            allow_run_adf: false,
+            max_steps: Some(2),
+            context_fingerprint: Some("test-context".into()),
+            activated_at_ms: 1,
+            cancellation: agent_core::harness::RunCancellation::new(),
+        };
+        let checkpoint = agent_core::harness::AgentMachine::initial_checkpoint(&agent, &start)
+            .expect("reducer checkpoint should be created");
+        assert_eq!(checkpoint.agent_kind, "agent-loop");
+        assert_eq!(
+            checkpoint.schema_version,
+            AGENT_LOOP_CHECKPOINT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            checkpoint.payload["protocol_version"],
+            AGENT_LOOP_REDUCER_PROTOCOL_VERSION
+        );
+
+        let outputs: Vec<_> = agent_core::harness::AgentMachine::resume(
+            &agent,
+            MachineResumeRequest {
+                run_id,
+                activation_id: agent_core::harness::ActivationId::new(),
+                checkpoint,
+                inbox: Vec::new(),
+                activated_at_ms: 1,
+                cancellation: start.cancellation,
+            },
+        )
+        .collect()
+        .await;
+        let deltas = outputs
+            .iter()
+            .filter_map(|output| match output {
+                MachineOutput::Event(AgentEvent::OutputDelta {
+                    channel: agent_core::harness::OutputChannel::AssistantText,
+                    delta,
+                }) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deltas, vec!["hel", "lo"]);
+        assert!(matches!(
+            outputs.last(),
+            Some(MachineOutput::Yield(StepOutcome::Complete {
+                finish_reason: FinishReason::Stop
+            }))
+        ));
+        provider_server.abort();
     }
 
     #[test]
@@ -3390,15 +3660,15 @@ api_key = "test-key"
         )
         .expect("config should parse");
         let mut state = test_state();
-        state.config = Some(Arc::new(config));
+        state.config = Arc::new(config);
 
         assert_eq!(effective_run_max_steps(&state, None).ok(), Some(6));
         assert_eq!(effective_run_max_steps(&state, Some(3)).ok(), Some(3));
         assert!(effective_run_max_steps(&state, Some(0)).is_err());
         assert!(effective_run_max_steps(&state, Some(7)).is_err());
         assert_ne!(
-            raw_request_hash("hello", &[], 3),
-            raw_request_hash("hello", &[], 4),
+            raw_request_hash("hello", &[], &[], 3),
+            raw_request_hash("hello", &[], &[], 4),
             "step limits must participate in session idempotency"
         );
     }

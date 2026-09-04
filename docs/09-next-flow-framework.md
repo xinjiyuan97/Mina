@@ -54,17 +54,17 @@ P0 Session
 
 这里的 P4 仅指需要 durable checkpoint/event 的 JS `start/resume` binding。纯计算 `javascript_eval` 和 Run-scoped JavaScript ADF 不依赖 Flow Runtime，可以按独立的 Q0–Q3/A0–A3 切片更早交付。
 
-## 2. 与当前单次 Run 的兼容
+## 2. 原生状态机 Run
 
-现有能力保持不变：
+当前能力统一建立在原生状态机上：
 
 - `RunId + seq` 仍是单个 run 的事件顺序；
 - `RunStore` 仍负责 run snapshot 和 append-only events；
 - `POST /api/v1/runs` 继续作为无 Session 的独立任务入口；
-- 当前 `Agent::run() -> AgentEventStream` 在 P0 保留；
+- Server 只调用 reducer 驱动的 `AgentMachine`，不保留 `Agent::run()` 兼容分支；
 - 当前 Server 重启会把没有 checkpoint 的 active run 标记为 `run_interrupted`。
 
-新增能力采用扩展而非替换：
+Session 能力复用同一状态机入口：
 
 ```text
 POST /api/v1/runs                     # 现有：stateless run
@@ -932,7 +932,7 @@ set run = Runnable
 enqueue outbox wake item
 ```
 
-worker 获取有期限的 lease 后调用 `AgentMachine::resume`。lease 超时可被其他 worker 重领，因此 resume 和所有 Effect 必须携带幂等键。
+worker 获取有期限的 lease 后调用 `AgentMachine::resume`。执行期间由 Harness 周期性 heartbeat 续租；续租必须同时校验 `run_id + activation_id + revision + lease_owner`，且不能复活已经过期的 lease。heartbeat 逾期或 fencing 校验失败时，旧 worker 必须立即丢弃本地 machine stream，停止生成事件，但不能取消已经由新 worker 接管的整个 Run。lease 真正超时后可被其他 worker 重领，因此 resume 和所有 Effect 仍必须携带幂等键。
 
 ### 5.5 取消、deadline 与预算
 

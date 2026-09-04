@@ -81,7 +81,7 @@ type AgentInspection = {
   service: string;
   version: string;
   agent: AgentMetadata;
-  model: ModelInfo | null;
+  model: ModelInfo;
   system: {
     source: string;
     content: string;
@@ -111,7 +111,7 @@ type AgentInspection = {
       version: string;
       external_network: boolean;
     };
-  } | null;
+  };
   memory: {
     enabled: boolean;
     scopes: string[];
@@ -303,7 +303,7 @@ export function AgentWorkbench() {
     [refresh],
   );
 
-  const modelLabel = inspection?.model?.model ?? "No model";
+  const modelLabel = inspection?.model.model ?? "No model";
   const memoryCount = inspection
     ? inspection.memory.records.length + inspection.memory.pending_approvals.length
     : 0;
@@ -377,6 +377,7 @@ export function AgentWorkbench() {
           className={`agent-rail session-sidebar${sessionsOpen ? " is-open" : ""}`}
           conversations={conversations}
           activeId={activeSessionId ?? undefined}
+          activeIndicator="none"
           loading={sessionsLoading && sessions.length === 0}
           collapsed={sessionsCollapsed}
           onCollapsedChange={setSessionsCollapsed}
@@ -442,6 +443,7 @@ export function AgentWorkbench() {
               onRunFinished={handleRunFinished}
               onBusyChange={setChatBusy}
               maxSteps={100}
+              inputModalities={inspection?.model.input_modalities}
             />
           ) : (
             <div className="session-loading-state" role="status">
@@ -677,24 +679,22 @@ function ToolsPanel({ inspection }: { inspection: AgentInspection }) {
 
   return (
     <section className="inspection-section">
-      {inspection.tool_runtime && (
-        <div className="runtime-boundaries">
-          <div>
-            <span>Terminal sandbox</span>
-            <code>{inspection.tool_runtime.process_sandbox.kind}</code>
-            <strong className={`is-${inspection.tool_runtime.process_sandbox.isolation}`}>
-              {inspection.tool_runtime.process_sandbox.isolation}
-            </strong>
-          </div>
-          <div>
-            <span>Search backend</span>
-            <code>{inspection.tool_runtime.search_backend.kind}</code>
-            <strong>
-              {inspection.tool_runtime.search_backend.external_network ? "external" : "local"}
-            </strong>
-          </div>
+      <div className="runtime-boundaries">
+        <div>
+          <span>Terminal sandbox</span>
+          <code>{inspection.tool_runtime.process_sandbox.kind}</code>
+          <strong className={`is-${inspection.tool_runtime.process_sandbox.isolation}`}>
+            {inspection.tool_runtime.process_sandbox.isolation}
+          </strong>
         </div>
-      )}
+        <div>
+          <span>Search backend</span>
+          <code>{inspection.tool_runtime.search_backend.kind}</code>
+          <strong>
+            {inspection.tool_runtime.search_backend.external_network ? "external" : "local"}
+          </strong>
+        </div>
+      </div>
       <p className="section-help">当前 Run 可用的工具定义。展开可查看参数契约。</p>
       <div className="tool-list">
         {inspection.tools.map((tool) => (

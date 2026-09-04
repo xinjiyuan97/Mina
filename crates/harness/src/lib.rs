@@ -17,8 +17,8 @@ pub mod script;
 
 pub use config::{
     AdfConfig, AgentConfig, AgentKind, ApprovalConfig, ConfigError, ConfiguredSkill,
-    ContextStrategy, HarnessConfig, Modalities, Modality, ModelConfig, OrchestrationConfig,
-    ProviderConfig, QuickJsConfig, ScriptConfig, SecretSource, SecretString,
+    ContextStrategy, HarnessConfig, Modalities, Modality, ModelConfig, OpenAiProtocol,
+    OrchestrationConfig, ProviderConfig, QuickJsConfig, ScriptConfig, SecretSource, SecretString,
 };
 pub use event_runtime::{EventRuntime, EventRuntimeConfig, RuntimeTickReport};
 pub use flow_runtime::{FlowEffectRuntime, FlowEffectRuntimeConfig, FlowEffectTickReport};

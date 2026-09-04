@@ -1,8 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 use agent_core::harness::{
-    Agent, AgentMetadata, ModelMessage, OutputChannel, RunCancellation, RunEventKind,
-    RunEventStream, RunId, RunRequest, RunResponse,
+    Agent, AgentMetadata, ModelAttachment, ModelMessage, OutputChannel, RunCancellation,
+    RunEventKind, RunEventStream, RunId, RunRequest, RunResponse,
 };
 use futures_util::StreamExt;
 use thiserror::Error;
@@ -154,8 +154,19 @@ where
         prior_messages: Vec<ModelMessage>,
         options: RunOptions,
     ) -> Result<RunExecution, HarnessError> {
+        self.start_with_options_and_attachments(run_id, input, Vec::new(), prior_messages, options)
+    }
+
+    pub fn start_with_options_and_attachments(
+        &self,
+        run_id: RunId,
+        input: impl Into<String>,
+        attachments: Vec<ModelAttachment>,
+        prior_messages: Vec<ModelMessage>,
+        options: RunOptions,
+    ) -> Result<RunExecution, HarnessError> {
         let input = input.into();
-        if input.trim().is_empty() {
+        if input.trim().is_empty() && attachments.is_empty() {
             return Err(HarnessError::InvalidInput);
         }
         if let Some(requested) = options.max_steps
@@ -168,6 +179,7 @@ where
         let events = self.agent.run(RunRequest {
             run_id,
             input,
+            attachments,
             prior_messages,
             allowed_tools: options.allowed_tools,
             allow_run_adf: options.allow_run_adf,

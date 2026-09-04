@@ -13,6 +13,7 @@ adf = ["dep:agent-harness", "dep:jsonschema", "dep:sha2", "dep:tokio"]
 openai = [
     "dep:agent-harness",
     "dep:async-stream",
+    "dep:base64",
     "dep:eventsource-stream",
     "dep:futures-util",
     "dep:reqwest",
@@ -38,6 +39,7 @@ full = [
 agent-core.workspace = true
 agent-harness = { workspace = true, optional = true }
 async-stream = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 eventsource-stream = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }

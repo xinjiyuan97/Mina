@@ -511,6 +511,74 @@ button {
   flex: 1;
 }
 
+.chat-runtime {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+
+.chat-dock {
+  position: relative;
+  width: 100%;
+}
+
+/* The transcript fills the dock behind the composer so its scrollbar reaches
+   the physical bottom edge instead of stopping above the input. */
+.chat-dock > :first-child {
+  position: absolute;
+  inset: 0;
+}
+
+.chat-dock > :nth-child(2) {
+  position: relative;
+  z-index: 2;
+  grid-row: 2;
+}
+
+.chat-dock > :nth-child(3) {
+  grid-row: 3;
+}
+
+.chat-dock[data-cc-dock="docked"] .chat-transcript-content {
+  padding-bottom: calc(var(--chat-composer-height, 9rem) + 1.5rem);
+}
+
+.chat-transcript {
+  scrollbar-color: color-mix(in oklch, var(--color-cc-muted) 38%, transparent) transparent;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+}
+
+.chat-transcript::-webkit-scrollbar {
+  width: 10px;
+}
+
+.chat-transcript::-webkit-scrollbar-track,
+.chat-transcript::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.chat-transcript::-webkit-scrollbar-thumb {
+  min-height: 2.5rem;
+  border: 2px solid transparent;
+  border-radius: var(--radius-cc-full);
+  background: color-mix(in oklch, var(--color-cc-muted) 32%, transparent);
+  background-clip: padding-box;
+}
+
+.chat-transcript:hover::-webkit-scrollbar-thumb {
+  background-color: color-mix(in oklch, var(--color-cc-muted) 52%, transparent);
+}
+
+.chat-transcript::-webkit-scrollbar-thumb:active {
+  background-color: color-mix(in oklch, var(--color-cc-muted) 68%, transparent);
+}
+
+.chat-dock[data-cc-dock="docked"] .chat-transcript + button {
+  bottom: calc(var(--chat-composer-height, 9rem) + 0.75rem);
+}
+
 .session-loading-state {
   display: grid;
   min-height: 0;
@@ -545,16 +613,40 @@ button {
   cursor: pointer;
 }
 
-.composer {
-  flex: none;
-  border-top: 1px solid var(--color-cc-border);
+.chat-dock-content {
+  width: 100%;
   padding: 0.75rem 1rem 1rem;
+  background: var(--color-cc-canvas);
+  box-shadow: 0 -1px 0 color-mix(in oklch, var(--color-cc-border) 55%, transparent);
 }
 
-.composer-inner {
+.chat-composer-stack,
+.chat-intro {
   width: 100%;
   max-width: var(--spacing-cc-measure);
-  margin: 0 auto;
+  margin-inline: auto;
+}
+
+.chat-intro {
+  padding-bottom: 1.25rem;
+  text-align: center;
+}
+
+.chat-empty-state {
+  padding-block: 0;
+}
+
+.chat-suggestions {
+  margin-top: 1.25rem;
+}
+
+.chat-response-loading {
+  display: flex;
+  min-height: 1.5rem;
+  align-items: center;
+  gap: 0.55rem;
+  color: var(--color-cc-muted);
+  font-size: var(--text-cc-sm);
 }
 
 .chat-error {
@@ -1203,7 +1295,7 @@ button {
     padding-inline: 1rem;
   }
 
-  .composer {
+  .chat-dock-content {
     padding-inline: 0.75rem;
   }
 

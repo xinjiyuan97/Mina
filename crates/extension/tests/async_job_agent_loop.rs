@@ -242,6 +242,7 @@ async fn async_job_survives_store_and_agent_reconstruction_then_resumes_once() {
     let start = MachineStartRequest {
         run_id,
         input: "run a background job".into(),
+        attachments: Vec::new(),
         prior_messages: Vec::new(),
         allowed_tools: None,
         allow_run_adf: false,

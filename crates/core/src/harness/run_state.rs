@@ -248,6 +248,11 @@ impl RunSnapshot {
                 if self.tools.iter().any(|tool| tool.call_id == *call_id) {
                     return Err(RunStateError::DuplicateToolCall(call_id.clone()));
                 }
+                // A tool call closes the current visible assistant-text round. The live
+                // event stream preserves this boundary as separate text/tool parts, while
+                // the durable RunSnapshot has one flattened output string. Keep the
+                // flattened form readable when a later model round emits more text.
+                close_output_round(&mut self.output);
                 self.tools.push(RunToolState {
                     call_id: call_id.clone(),
                     name: name.clone(),
@@ -404,6 +409,38 @@ impl RunSnapshot {
             .iter_mut()
             .find(|tool| tool.call_id == call_id)
             .ok_or_else(|| RunStateError::ToolCallNotFound(call_id.into()))
+    }
+}
+
+/// Rebuilds the flattened assistant output from the authoritative run event log.
+///
+/// This is primarily useful to migrate materialized snapshots after projection rules
+/// change. Tool calls delimit model rounds in the flattened representation; reasoning
+/// and tool payloads remain available in their dedicated event fields.
+#[must_use]
+pub fn project_run_output<'a>(events: impl IntoIterator<Item = &'a RunEvent>) -> String {
+    let mut output = String::new();
+    for event in events {
+        match &event.kind {
+            RunEventKind::OutputDelta {
+                channel: OutputChannel::AssistantText,
+                delta,
+            } => output.push_str(delta),
+            RunEventKind::ToolCallStarted { .. } => close_output_round(&mut output),
+            _ => {}
+        }
+    }
+    output
+}
+
+fn close_output_round(output: &mut String) {
+    if output.is_empty() || output.ends_with("\n\n") {
+        return;
+    }
+    if output.ends_with('\n') {
+        output.push('\n');
+    } else {
+        output.push_str("\n\n");
     }
 }
 
@@ -583,6 +620,63 @@ mod tests {
         assert_eq!(snapshot.last_seq, 4);
         assert_eq!(snapshot.revision, 4);
         assert!(snapshot.is_terminal());
+    }
+
+    #[test]
+    fn separates_model_rounds_in_flattened_output() {
+        let run_id = RunId::new();
+        let mut snapshot = RunSnapshot::new(run_id, "hello", 10);
+        let events = [
+            RunEvent::new(run_id, 1, RunEventKind::RunStarted),
+            RunEvent::new(
+                run_id,
+                2,
+                RunEventKind::OutputDelta {
+                    channel: OutputChannel::AssistantText,
+                    delta: "first round".into(),
+                },
+            ),
+            RunEvent::new(
+                run_id,
+                3,
+                RunEventKind::ToolCallStarted {
+                    call_id: "call_1".into(),
+                    name: "read".into(),
+                },
+            ),
+            RunEvent::new(
+                run_id,
+                4,
+                RunEventKind::ToolCallStarted {
+                    call_id: "call_2".into(),
+                    name: "search".into(),
+                },
+            ),
+            RunEvent::new(
+                run_id,
+                5,
+                RunEventKind::OutputDelta {
+                    channel: OutputChannel::AssistantText,
+                    delta: "second round".into(),
+                },
+            ),
+            RunEvent::new(
+                run_id,
+                6,
+                RunEventKind::RunCompleted {
+                    finish_reason: FinishReason::Stop,
+                },
+            ),
+        ];
+
+        for (index, event) in events.iter().enumerate() {
+            snapshot
+                .apply(event, i64::try_from(index + 11).expect("small timestamp"))
+                .expect("event should apply");
+        }
+
+        assert_eq!(snapshot.output, "first round\n\nsecond round");
+        assert_eq!(project_run_output(&events), snapshot.output);
     }
 
     #[test]

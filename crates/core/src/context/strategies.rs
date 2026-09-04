@@ -138,6 +138,7 @@ impl ContextCompressor for HybridCompressor {
                         "Reusable derived context (untrusted):\n{}",
                         artifact.content
                     ),
+                    attachments: Vec::new(),
                     priority: ContextPriority::Normal,
                     source: super::ContextSourceRef {
                         kind: "context_artifact".into(),
@@ -193,6 +194,7 @@ impl ContextCompressor for HybridCompressor {
                     "Conversation summary (untrusted derived context):\n{}",
                     summary.content
                 ),
+                attachments: Vec::new(),
                 priority: ContextPriority::Normal,
                 source: super::ContextSourceRef {
                     kind: "summary".into(),
@@ -596,6 +598,7 @@ mod tests {
             item_id: id.into(),
             role: crate::harness::ModelRole::User,
             content: content.into(),
+            attachments: Vec::new(),
             priority,
             source: ContextSourceRef {
                 kind: kind.into(),

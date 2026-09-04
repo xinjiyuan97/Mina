@@ -52,6 +52,13 @@ impl ApprovalId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Builds a deterministic identifier for replayable reducer effects.
+    #[must_use]
+    pub fn stable(namespace: &str, key: &str) -> Self {
+        let name = format!("ApprovalId:{namespace}:{key}");
+        Self(Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()))
+    }
 }
 
 impl Default for ApprovalId {
