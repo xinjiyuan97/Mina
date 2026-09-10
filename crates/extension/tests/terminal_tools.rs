@@ -11,9 +11,14 @@ use agent_core::{
 use agent_extension::{
     sandbox::HostProcessSandbox,
     tool::{ApplyPatchTool, BuiltinToolCatalog, ExecCommandTool, ShellCommandTool, WriteStdinTool},
+    workspace::{NativeWorkspaceFs, WorkspaceFs},
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
+
+fn native_workspace(path: &std::path::Path) -> Arc<dyn WorkspaceFs> {
+    Arc::new(NativeWorkspaceFs::new(path).expect("workspace should be valid"))
+}
 
 fn request(name: &str, arguments: Value) -> ToolCallRequest {
     ToolCallRequest {
@@ -31,7 +36,7 @@ fn terminal_definitions_match_runtime_boundaries() {
     let shell = ShellCommandTool::new(directory.path()).expect("shell tool");
     let exec = ExecCommandTool::new(directory.path()).expect("exec tool");
     let write = WriteStdinTool::new(Arc::new(HostProcessSandbox::default()));
-    let patch = ApplyPatchTool::new(directory.path()).expect("patch tool");
+    let patch = ApplyPatchTool::new(native_workspace(directory.path()));
 
     let shell_definition = shell.definition();
     assert_eq!(shell_definition.name, "shell_command");
@@ -293,7 +298,7 @@ async fn apply_patch_mutates_workspace_and_rejects_unsafe_paths() {
     tokio::fs::write(directory.path().join("note.txt"), "alpha\nbeta\n")
         .await
         .expect("fixture");
-    let tool = ApplyPatchTool::new(directory.path()).expect("patch tool");
+    let tool = ApplyPatchTool::new(native_workspace(directory.path()));
     let output = tool
         .call(request(
             "apply_patch",
@@ -346,7 +351,7 @@ async fn apply_patch_rejects_symlink_destinations() {
         .await
         .expect("fixture");
     symlink(&outside_file, directory.path().join("link.txt")).expect("symlink");
-    let tool = ApplyPatchTool::new(directory.path()).expect("patch tool");
+    let tool = ApplyPatchTool::new(native_workspace(directory.path()));
     let error = tool
         .call(request(
             "apply_patch",

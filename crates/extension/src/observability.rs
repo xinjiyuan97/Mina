@@ -17,8 +17,8 @@ use agent_core::harness::{
     TokenUsage, ToolArgumentVisibility, ToolCallFuture, ToolCallRequest, ToolDefinition, ToolError,
     ToolPort, ToolRiskLevel, ToolSetSnapshot,
 };
-pub use agent_core::observability::{
-    NoopObservationHook, ObservationEvent, ObservationHook, ObservationKind, ObservationStatus,
+use agent_core::observability::{
+    ObservationEvent, ObservationHook, ObservationKind, ObservationStatus,
 };
 use async_stream::stream;
 use futures_util::StreamExt;

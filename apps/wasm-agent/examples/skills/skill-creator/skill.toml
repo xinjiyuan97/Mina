@@ -1,0 +1,6 @@
+skill_id = "skill-creator"
+version = "1.0.0"
+description = "Create or revise Mina browser Skill packages with focused instructions and valid manifests"
+required_tools = ["read", "write", "edit", "list_directory", "read_skill_resource"]
+activation = { type = "routable", hints = ["create a skill", "update a skill", "skill creator", "创建 skill", "新建 skill", "修改 skill"] }
+resources = [{ path = "references/mina-skill-format.md", media_type = "text/markdown" }]

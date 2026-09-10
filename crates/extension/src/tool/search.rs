@@ -1,4 +1,4 @@
-use std::{future::Future, path::Path, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use agent_core::harness::{
     RunCancellation, Tool, ToolCallFuture, ToolCallRequest, ToolConcurrency, ToolDefinition,
@@ -6,7 +6,10 @@ use agent_core::harness::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::tool::workspace::Workspace;
+use crate::{
+    tool::filesystem::{is_protected_path, map_workspace_error},
+    workspace::{FileKind, ListRequest, ReadRequest, WorkspaceFs, WorkspacePath},
+};
 
 const MAX_RESULTS: usize = 100;
 const MAX_SEARCH_FILES: usize = 10_000;
@@ -127,19 +130,23 @@ impl Tool for SearchTool {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorkspaceSearchBackend {
-    workspace: Workspace,
+    workspace: Arc<dyn WorkspaceFs>,
+}
+
+impl std::fmt::Debug for WorkspaceSearchBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspaceSearchBackend")
+            .field("workspace", &self.workspace.descriptor())
+            .finish()
+    }
 }
 
 impl WorkspaceSearchBackend {
-    pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self, std::io::Error> {
-        Ok(Self {
-            workspace: Workspace::new(workspace_root)?,
-        })
-    }
-
-    pub(crate) const fn from_workspace(workspace: Workspace) -> Self {
+    #[must_use]
+    pub fn new(workspace: Arc<dyn WorkspaceFs>) -> Self {
         Self { workspace }
     }
 }
@@ -159,18 +166,8 @@ impl SearchBackend for WorkspaceSearchBackend {
     }
 
     fn search(&self, request: SearchRequest) -> SearchFuture {
-        let workspace = self.workspace.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || search_workspace(workspace, request))
-                .await
-                .map_err(|_| {
-                    ToolError::new(
-                        "search_backend_failed",
-                        "the search backend could not complete the request",
-                        true,
-                    )
-                })?
-        })
+        let workspace = Arc::clone(&self.workspace);
+        Box::pin(async move { search_workspace(workspace, request).await })
     }
 }
 
@@ -186,12 +183,12 @@ fn default_limit() -> usize {
     20
 }
 
-fn search_workspace(
-    workspace: Workspace,
+async fn search_workspace(
+    workspace: Arc<dyn WorkspaceFs>,
     request: SearchRequest,
 ) -> Result<Vec<SearchHit>, ToolError> {
     let lowered_query = request.query.to_lowercase();
-    let mut stack = vec![workspace.root().to_path_buf()];
+    let mut stack = vec![WorkspacePath::root()];
     let mut scanned_files = 0_usize;
     let mut results = Vec::new();
 
@@ -203,49 +200,71 @@ fn search_workspace(
                 false,
             ));
         }
-        let entries = std::fs::read_dir(&directory).map_err(|_| search_failed())?;
-        for entry in entries {
-            let entry = entry.map_err(|_| search_failed())?;
-            let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path).map_err(|_| search_failed())?;
-            if metadata.file_type().is_symlink() || workspace.is_protected(&path) {
-                continue;
-            }
-            if metadata.is_dir() {
-                if !ignored_directory(&path) {
-                    stack.push(path);
+        let mut cursor = None;
+        loop {
+            let page = workspace
+                .list(ListRequest {
+                    path: directory.clone(),
+                    cursor,
+                    limit: 500,
+                })
+                .await
+                .map_err(map_workspace_error)?;
+            for entry in page.entries {
+                if entry.kind == FileKind::Symlink || is_protected_path(&entry.path) {
+                    continue;
                 }
-                continue;
+                if entry.kind == FileKind::Directory {
+                    if !ignored_directory(&entry.path) {
+                        stack.push(entry.path);
+                    }
+                    continue;
+                }
+                if entry.kind != FileKind::File || entry.size > MAX_SEARCH_FILE_BYTES {
+                    continue;
+                }
+                scanned_files += 1;
+                if scanned_files > MAX_SEARCH_FILES {
+                    break;
+                }
+                let Ok(content) = workspace
+                    .read(ReadRequest {
+                        path: entry.path.clone(),
+                        offset: 0,
+                        length: None,
+                        max_bytes: MAX_SEARCH_FILE_BYTES,
+                    })
+                    .await
+                else {
+                    continue;
+                };
+                let Ok(content) = std::str::from_utf8(&content.bytes) else {
+                    continue;
+                };
+                for (index, line) in content.lines().enumerate() {
+                    if !line.to_lowercase().contains(&lowered_query) {
+                        continue;
+                    }
+                    let relative = entry.path.as_str().to_owned();
+                    results.push(SearchHit {
+                        title: format!("{relative}:{}", index + 1),
+                        uri: relative,
+                        snippet: truncate(line.trim(), MAX_SNIPPET_CHARS),
+                        score: 1.0,
+                        metadata: Some(serde_json::json!({"line": index + 1})),
+                    });
+                    if results.len() >= request.limit {
+                        return Ok(results);
+                    }
+                }
             }
-            if !metadata.is_file() || metadata.len() > MAX_SEARCH_FILE_BYTES {
-                continue;
-            }
-            scanned_files += 1;
             if scanned_files > MAX_SEARCH_FILES {
                 break;
             }
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
+            let Some(next_cursor) = page.next_cursor else {
+                break;
             };
-            let Ok(content) = std::str::from_utf8(&bytes) else {
-                continue;
-            };
-            for (index, line) in content.lines().enumerate() {
-                if !line.to_lowercase().contains(&lowered_query) {
-                    continue;
-                }
-                let relative = workspace.display_relative(&path);
-                results.push(SearchHit {
-                    title: format!("{relative}:{}", index + 1),
-                    uri: relative.clone(),
-                    snippet: truncate(line.trim(), MAX_SNIPPET_CHARS),
-                    score: 1.0,
-                    metadata: Some(serde_json::json!({"line": index + 1})),
-                });
-                if results.len() >= request.limit {
-                    return Ok(results);
-                }
-            }
+            cursor = Some(next_cursor);
         }
         if scanned_files > MAX_SEARCH_FILES {
             break;
@@ -254,11 +273,8 @@ fn search_workspace(
     Ok(results)
 }
 
-fn ignored_directory(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some("target" | "node_modules" | ".next")
-    )
+fn ignored_directory(path: &WorkspacePath) -> bool {
+    matches!(path.file_name(), Some("target" | "node_modules" | ".next"))
 }
 
 fn truncate(value: &str, maximum_chars: usize) -> String {
@@ -279,14 +295,6 @@ fn invalid_arguments() -> ToolError {
     )
 }
 
-fn search_failed() -> ToolError {
-    ToolError::new(
-        "search_backend_failed",
-        "the search backend could not read the configured source",
-        true,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use agent_core::harness::{RunCancellation, RunId};
@@ -294,6 +302,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::workspace::NativeWorkspaceFs;
 
     struct ExternalFakeBackend;
 
@@ -336,9 +345,9 @@ mod tests {
             "searchable_symbol = 'secret'",
         )
         .expect("secret fixture should be written");
-        let tool = SearchTool::new(Arc::new(
-            WorkspaceSearchBackend::new(directory.path()).expect("workspace should be valid"),
-        ));
+        let workspace: Arc<dyn WorkspaceFs> =
+            Arc::new(NativeWorkspaceFs::new(directory.path()).expect("workspace should be valid"));
+        let tool = SearchTool::new(Arc::new(WorkspaceSearchBackend::new(workspace)));
         let output = tool
             .call(ToolCallRequest {
                 run_id: RunId::new(),

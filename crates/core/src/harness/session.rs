@@ -12,6 +12,10 @@ use crate::harness::{
 
 pub const MAX_SESSION_PAGE_SIZE: usize = 1_000;
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(Uuid);
@@ -92,6 +96,8 @@ pub enum ContentPart {
     },
     Reasoning {
         text: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        redacted: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
     },
@@ -194,6 +200,32 @@ pub fn project_run_content(events: &[ObservedRunEvent]) -> Vec<ContentPart> {
     for observed in events {
         let observed_at_ms = observed.observed_at_ms;
         match &observed.event.kind {
+            RunEventKind::ReasoningStarted { redacted } => {
+                let index = match active_output {
+                    Some(ActiveOutput::Reasoning { index, .. }) => index,
+                    _ => {
+                        close_output(&mut content, &mut active_output, observed_at_ms);
+                        content.push(ContentPart::Reasoning {
+                            text: String::new(),
+                            redacted: *redacted,
+                            duration_ms: None,
+                        });
+                        let index = content.len().saturating_sub(1);
+                        active_output = Some(ActiveOutput::Reasoning {
+                            index,
+                            started_at_ms: observed_at_ms,
+                        });
+                        index
+                    }
+                };
+                if let Some(ContentPart::Reasoning {
+                    redacted: stored_redacted,
+                    ..
+                }) = content.get_mut(index)
+                {
+                    *stored_redacted |= *redacted;
+                }
+            }
             RunEventKind::OutputDelta { channel, delta } if !delta.is_empty() => match channel {
                 OutputChannel::AssistantText => {
                     let index = match active_output {
@@ -219,6 +251,7 @@ pub fn project_run_content(events: &[ObservedRunEvent]) -> Vec<ContentPart> {
                             close_output(&mut content, &mut active_output, observed_at_ms);
                             content.push(ContentPart::Reasoning {
                                 text: String::new(),
+                                redacted: false,
                                 duration_ms: None,
                             });
                             let index = content.len().saturating_sub(1);
@@ -234,6 +267,17 @@ pub fn project_run_content(events: &[ObservedRunEvent]) -> Vec<ContentPart> {
                     }
                 }
             },
+            RunEventKind::ReasoningCompleted { redacted } => {
+                if let Some(ActiveOutput::Reasoning { index, .. }) = active_output
+                    && let Some(ContentPart::Reasoning {
+                        redacted: stored_redacted,
+                        ..
+                    }) = content.get_mut(index)
+                {
+                    *stored_redacted |= *redacted;
+                }
+                close_output(&mut content, &mut active_output, observed_at_ms);
+            }
             RunEventKind::ToolCallStarted { call_id, name } => {
                 close_output(&mut content, &mut active_output, observed_at_ms);
                 content.push(ContentPart::ToolCall {
@@ -665,6 +709,7 @@ mod tests {
             content[0],
             ContentPart::Reasoning {
                 text: "inspect".into(),
+                redacted: false,
                 duration_ms: Some(15),
             }
         );
@@ -713,6 +758,55 @@ mod tests {
         );
         assert_eq!(content[5], ContentPart::text("done"));
         assert!(content[2..5].iter().all(|part| part.as_text().is_none()));
+    }
+
+    #[test]
+    fn projects_redacted_reasoning_without_text() {
+        let run_id = RunId::new();
+        let events = vec![
+            observed(run_id, 1, RunEventKind::RunStarted, 10),
+            observed(
+                run_id,
+                2,
+                RunEventKind::ReasoningStarted { redacted: true },
+                20,
+            ),
+            observed(
+                run_id,
+                3,
+                RunEventKind::ReasoningCompleted { redacted: true },
+                58,
+            ),
+            observed(
+                run_id,
+                4,
+                RunEventKind::OutputDelta {
+                    channel: OutputChannel::AssistantText,
+                    delta: "answer".into(),
+                },
+                60,
+            ),
+            observed(
+                run_id,
+                5,
+                RunEventKind::RunCompleted {
+                    finish_reason: FinishReason::Stop,
+                },
+                70,
+            ),
+        ];
+
+        assert_eq!(
+            project_run_content(&events),
+            vec![
+                ContentPart::Reasoning {
+                    text: String::new(),
+                    redacted: true,
+                    duration_ms: Some(38),
+                },
+                ContentPart::text("answer"),
+            ]
+        );
     }
 
     fn observed(

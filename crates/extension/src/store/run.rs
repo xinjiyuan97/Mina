@@ -101,24 +101,43 @@ impl RunStore for InMemoryRunStore {
         event: RunEvent,
         observed_at_ms: i64,
     ) -> RunStoreFuture<'_, RunSnapshot> {
+        self.append_events(vec![ObservedRunEvent::new(event, observed_at_ms)])
+    }
+
+    fn append_events(&self, events: Vec<ObservedRunEvent>) -> RunStoreFuture<'_, RunSnapshot> {
         Box::pin(async move {
+            let first = events
+                .first()
+                .ok_or_else(|| RunStoreError::backend("cannot append an empty event batch"))?;
+            let run_id = first.event.run_id;
+            if events.iter().any(|item| item.event.run_id != run_id) {
+                return Err(RunStoreError::backend(
+                    "one event batch cannot contain multiple runs",
+                ));
+            }
+
             let mut runs = self.lock()?;
             let run = runs
-                .get_mut(&event.run_id)
-                .ok_or(RunStoreError::NotFound(event.run_id))?;
-            if let Some(existing) = run.events.get(&event.seq) {
-                return if existing.event == event {
-                    Ok(run.snapshot.clone())
-                } else {
-                    Err(RunStoreError::EventConflict {
-                        run_id: event.run_id,
-                        seq: event.seq,
-                    })
-                };
+                .get_mut(&run_id)
+                .ok_or(RunStoreError::NotFound(run_id))?;
+            let mut next_snapshot = run.snapshot.clone();
+            for observed in &events {
+                if let Some(existing) = run.events.get(&observed.event.seq) {
+                    if existing.event != observed.event {
+                        return Err(RunStoreError::EventConflict {
+                            run_id,
+                            seq: observed.event.seq,
+                        });
+                    }
+                    continue;
+                }
+                next_snapshot.apply(&observed.event, observed.observed_at_ms)?;
             }
-            run.snapshot.apply(&event, observed_at_ms)?;
-            run.events
-                .insert(event.seq, ObservedRunEvent::new(event, observed_at_ms));
+
+            run.snapshot = next_snapshot;
+            for observed in events {
+                run.events.entry(observed.event.seq).or_insert(observed);
+            }
             Ok(run.snapshot.clone())
         })
     }
@@ -2536,7 +2555,8 @@ mod tests {
             &messages[1].content[0],
             ContentPart::Reasoning {
                 text,
-                duration_ms: Some(1)
+                redacted: false,
+                duration_ms: Some(1),
             } if text == "thinking"
         ));
         assert_eq!(messages[1].content[1].as_text(), Some("first round"));

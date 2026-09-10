@@ -9,12 +9,15 @@
   "scripts": {
     "dev": "concurrently -n web,server -c cyan,magenta \"pnpm dev:web\" \"pnpm dev:server\"",
     "dev:web": "pnpm --filter @mina/web dev",
+    "dev:wasm": "pnpm --filter @mina/wasm-demo dev",
     "dev:server": "cargo run -p mina-server",
-    "build": "pnpm build:web && cargo build --workspace",
+    "build": "pnpm build:web && pnpm build:wasm && cargo build --workspace",
     "build:web": "pnpm --filter @mina/web build",
-    "check": "pnpm check:web && pnpm check:rust-boundaries && cargo check --workspace --all-targets",
+    "build:wasm": "pnpm --filter @mina/wasm-demo build",
+    "check": "pnpm check:web && pnpm check:wasm && pnpm check:rust-boundaries && cargo check --workspace --all-targets",
     "check:rust-boundaries": "scripts/check-rust-boundaries.sh",
     "check:web": "pnpm --filter @mina/web check",
+    "check:wasm": "pnpm --filter @mina/wasm-demo check",
     "test": "cargo test --workspace"
   },
   "devDependencies": {

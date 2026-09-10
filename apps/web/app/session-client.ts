@@ -14,7 +14,7 @@ export type SessionSnapshot = {
 
 type SessionContentPart =
   | { type: "text"; text: string }
-  | { type: "reasoning"; text: string; duration_ms?: number }
+  | { type: "reasoning"; text: string; redacted?: boolean; duration_ms?: number }
   | {
       type: "tool_call";
       tool_call_id: string;
@@ -144,6 +144,7 @@ function toChatPart(part: SessionContentPart, message: SessionMessage): MessageP
       return {
         type: "reasoning",
         text: part.text,
+        redacted: part.redacted,
         durationMs: part.duration_ms,
       };
     case "tool_call":
@@ -273,6 +274,7 @@ function isSessionContentPart(value: unknown): value is SessionContentPart {
     case "reasoning":
       return (
         typeof value.text === "string" &&
+        (value.redacted === undefined || typeof value.redacted === "boolean") &&
         (value.duration_ms === undefined || typeof value.duration_ms === "number")
       );
     case "tool_call":

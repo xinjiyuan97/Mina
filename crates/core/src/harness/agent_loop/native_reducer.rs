@@ -92,6 +92,7 @@ fn initial_transition<P, T>(
         attachments: request.attachments.clone(),
         prior_messages: request.prior_messages.clone(),
         context_fingerprint: request.context_fingerprint.clone(),
+        skill_lock: None,
         config: AgentLoopReducerConfig {
             model: agent.model.clone(),
             system_prompt: agent.system_prompt.clone(),

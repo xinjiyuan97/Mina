@@ -9,7 +9,6 @@ use agent_core::{
         ModelPort, ModelRequest, ModelRole, TokenUsage, TokenUsageSource,
     },
 };
-use agent_harness::{ModelConfig, ProviderConfig, SecretString};
 use async_stream::stream;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -19,6 +18,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 use super::{
+    ModelConfig, ProviderConfig, SecretString,
     attachment::{base64_data, load_blob},
     openai::AdapterConfigError,
 };
@@ -125,6 +125,7 @@ impl ModelPort for AnthropicMessagesProvider {
             let mut output_tokens = None;
             let mut finish_reason = FinishReason::Unknown;
             let mut tool_calls = HashMap::<u64, String>::new();
+            let mut reasoning_blocks = HashMap::<u64, bool>::new();
             while let Some(event) = source.next().await {
                 let event = match event {
                     Ok(event) => event,
@@ -187,12 +188,19 @@ impl ModelPort for AnthropicMessagesProvider {
                                 }
                             }
                             Some("thinking") => {
+                                reasoning_blocks.insert(index, false);
+                                saw_output = true;
+                                yield ModelEvent::ReasoningStarted { redacted: false };
                                 if let Some(thinking) = value.pointer("/content_block/thinking").and_then(Value::as_str)
                                     && !thinking.is_empty()
                                 {
-                                    saw_output = true;
                                     yield ModelEvent::ReasoningDelta { delta: thinking.into() };
                                 }
+                            }
+                            Some("redacted_thinking") => {
+                                reasoning_blocks.insert(index, true);
+                                saw_output = true;
+                                yield ModelEvent::ReasoningStarted { redacted: true };
                             }
                             _ => {}
                         }
@@ -229,6 +237,12 @@ impl ModelPort for AnthropicMessagesProvider {
                                 }
                             }
                             _ => {}
+                        }
+                    }
+                    "content_block_stop" => {
+                        let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
+                        if let Some(redacted) = reasoning_blocks.remove(&index) {
+                            yield ModelEvent::ReasoningCompleted { redacted };
                         }
                     }
                     "message_delta" => {
@@ -468,7 +482,6 @@ mod tests {
     use std::convert::Infallible;
 
     use agent_core::harness::{ModelMessage, RunId};
-    use agent_harness::HarnessConfig;
     use axum::{
         Json, Router,
         http::HeaderMap,
@@ -540,6 +553,9 @@ mod tests {
                     r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"think"}}"#,
                 )),
                 Ok(Event::default().data(
+                    r#"{"type":"content_block_stop","index":0}"#,
+                )),
+                Ok(Event::default().data(
                     r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello"}}"#,
                 )),
                 Ok(Event::default().data(
@@ -561,20 +577,20 @@ mod tests {
             .await
             .expect("mock server should run");
         });
-        let config = HarnessConfig::from_toml_str(&format!(
-            r#"
-default_model = "primary"
-[models.primary]
-model = "claude-test"
-[models.primary.provider]
-type = "anthropic"
-base_url = "http://{address}/v1"
-api_key = "test-key"
-"#
-        ))
-        .expect("config should parse");
-        let provider = AnthropicMessagesProvider::from_model_config(config.default_model())
-            .expect("provider should build");
+        let model = ModelConfig {
+            model: "claude-test".into(),
+            modalities: crate::provider::Modalities::default(),
+            context_window: None,
+            max_output_tokens: None,
+            provider: ProviderConfig::Anthropic {
+                base_url: Url::parse(&format!("http://{address}/v1/"))
+                    .expect("test URL should parse"),
+                api_key: crate::provider::SecretSource::Literal("test-key".into()),
+                version: "2023-06-01".into(),
+            },
+        };
+        let provider =
+            AnthropicMessagesProvider::from_model_config(&model).expect("provider should build");
         let events: Vec<_> = provider
             .stream(ModelRequest {
                 run_id: RunId::new(),
@@ -586,11 +602,19 @@ api_key = "test-key"
             .collect()
             .await;
         assert!(matches!(events[0], ModelEvent::Accepted { .. }));
-        assert!(matches!(&events[1], ModelEvent::ReasoningDelta { delta } if delta == "think"));
-        assert!(matches!(&events[2], ModelEvent::TextDelta { delta } if delta == "hello"));
-        assert!(matches!(events[3], ModelEvent::Usage { .. }));
         assert!(matches!(
-            events[4],
+            events[1],
+            ModelEvent::ReasoningStarted { redacted: false }
+        ));
+        assert!(matches!(&events[2], ModelEvent::ReasoningDelta { delta } if delta == "think"));
+        assert!(matches!(
+            events[3],
+            ModelEvent::ReasoningCompleted { redacted: false }
+        ));
+        assert!(matches!(&events[4], ModelEvent::TextDelta { delta } if delta == "hello"));
+        assert!(matches!(events[5], ModelEvent::Usage { .. }));
+        assert!(matches!(
+            events[6],
             ModelEvent::Completed {
                 finish_reason: FinishReason::Stop
             }

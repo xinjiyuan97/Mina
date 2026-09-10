@@ -1,0 +1,12 @@
+import { mkdtemp, cp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+const root = fileURLToPath(new URL("../", import.meta.url));
+const dir = await mkdtemp(join(tmpdir(), "mina-vite-consumer-"));
+const pack = spawnSync("pnpm", ["pack", "--pack-destination", dir], {cwd: root, stdio: "inherit"});
+if (pack.status) process.exit(pack.status);
+await cp(new URL("../tests/vite-consumer/", import.meta.url), dir, {recursive: true});
+await writeFile(join(dir, "package.json"), JSON.stringify({private: true, type:"module", scripts:{dev:"vite --host 127.0.0.1",build:"vite build",preview:"vite preview --host 127.0.0.1"},dependencies:{"@mina/browser-agent":"file:./mina-browser-agent-0.1.0.tgz"}, devDependencies:{vite:"7.3.6",typescript:"5.9.3"}}, null, 2));
+console.log(`Standalone consumer: ${dir}`);

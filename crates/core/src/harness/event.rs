@@ -23,9 +23,17 @@ pub type RunEventStream = Pin<Box<dyn Stream<Item = RunEvent> + Send + 'static>>
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AgentEvent {
+    ReasoningStarted {
+        #[serde(default)]
+        redacted: bool,
+    },
     OutputDelta {
         channel: OutputChannel,
         delta: String,
+    },
+    ReasoningCompleted {
+        #[serde(default)]
+        redacted: bool,
     },
     UsageUpdated {
         usage: TokenUsage,
@@ -119,7 +127,9 @@ impl AgentEvent {
     #[must_use]
     pub fn into_run_event_kind(self) -> RunEventKind {
         match self {
+            Self::ReasoningStarted { redacted } => RunEventKind::ReasoningStarted { redacted },
             Self::OutputDelta { channel, delta } => RunEventKind::OutputDelta { channel, delta },
+            Self::ReasoningCompleted { redacted } => RunEventKind::ReasoningCompleted { redacted },
             Self::UsageUpdated { usage } => RunEventKind::UsageUpdated { usage },
             Self::ToolSetUpdated {
                 revision,
@@ -230,9 +240,17 @@ pub enum RunEventKind {
         activation_id: ActivationId,
         checkpoint_revision: u64,
     },
+    ReasoningStarted {
+        #[serde(default)]
+        redacted: bool,
+    },
     OutputDelta {
         channel: OutputChannel,
         delta: String,
+    },
+    ReasoningCompleted {
+        #[serde(default)]
+        redacted: bool,
     },
     UsageUpdated {
         usage: TokenUsage,
@@ -299,7 +317,9 @@ impl RunEventKind {
             Self::RunStarted => "run_started",
             Self::RunWaiting { .. } => "run_waiting",
             Self::RunResumed { .. } => "run_resumed",
+            Self::ReasoningStarted { .. } => "reasoning_started",
             Self::OutputDelta { .. } => "output_delta",
+            Self::ReasoningCompleted { .. } => "reasoning_completed",
             Self::UsageUpdated { .. } => "usage_updated",
             Self::ToolSetUpdated { .. } => "tool_set_updated",
             Self::ToolCallStarted { .. } => "tool_call_started",

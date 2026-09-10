@@ -12,6 +12,8 @@ mod memory;
 mod run;
 #[cfg(feature = "filesystem")]
 mod skill;
+#[cfg(feature = "workspace-skill")]
+mod workspace_skill;
 
 #[cfg(feature = "filesystem")]
 pub use blob::*;
@@ -23,3 +25,5 @@ pub use memory::*;
 pub use run::*;
 #[cfg(feature = "filesystem")]
 pub use skill::*;
+#[cfg(feature = "workspace-skill")]
+pub use workspace_skill::*;

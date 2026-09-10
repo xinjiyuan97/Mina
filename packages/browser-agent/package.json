@@ -1,0 +1,28 @@
+{
+  "name": "@mina/browser-agent",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:dev": "node scripts/build.mjs --dev",
+    "check": "pnpm build:dev && node --test tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "@jitl/quickjs-singlefile-browser-release-sync": "^0.32.0",
+    "quickjs-emscripten-core": "^0.32.0"
+  }
+}

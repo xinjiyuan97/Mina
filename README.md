@@ -1,6 +1,6 @@
 # Mina
 
-Mina 是一个用于持续迭代 Agent Harness 的 Rust + Next.js monorepo。当前采用模块化单体：`agent-core` 保存稳定契约与 Agent 决策逻辑，`agent-harness` 负责宿主运行、耐久编排和可选 QuickJS，`agent-extension` 保存外部实现。
+Mina 是一个用于持续迭代 Agent Harness 的 Rust + Next.js monorepo。当前采用模块化单体：`agent-core` 保存稳定契约与 Agent 决策逻辑，`agent-extension` 保存外部实现，`agent-harness` 组合 Core 与 Extension 并负责宿主运行、耐久编排和可选 QuickJS。
 
 ## 目录
 
@@ -114,7 +114,7 @@ context_policy_version = 1
 
 ## 当前调用链
 
-应用层使用三个内部入口：`agent-core` 提供契约与 Agent 决策逻辑，`agent-harness` 提供 Harness、耐久运行时和可选脚本引擎，`agent-extension` 按 Feature 提供 Provider、Tools、Sandbox、Store 和可观测性实现。依赖始终从 Apps/Extension/Harness 指向 Core，Core 不反向依赖宿主或外部实现。
+应用层使用三个内部入口：`agent-core` 提供契约与 Agent 决策逻辑，`agent-extension` 按 Feature 提供 Provider、Tools、Workspace FS、Sandbox、Store 和可观测性实现，`agent-harness` 在二者之上提供 Harness、耐久运行时和可选脚本引擎。依赖方向固定为 `extension -> core`、`harness -> core + extension`，禁止 `extension -> harness`。
 
 ```text
 Next.js -> Session submit -> SkillOrchestrator -> ContextEngine
@@ -134,7 +134,7 @@ Next.js -> Session submit -> SkillOrchestrator -> ContextEngine
 
 服务端直接组合 `AgentLoop` 的原生 `AgentMachine` 实现。所有决策由 `AgentLoopReducer` 产生，Native Effect Runner 只负责模型、工具、计时与取消等异步效果。前端停止按钮会调用 `POST /api/v1/runs/{run_id}/cancel`，取消信号贯穿 run、审批、模型和工具执行。
 
-`agent-extension::tool` 当前提供 `get_current_time`、`read`、`list_directory`、`search`、`write`、`edit`、`apply_patch`、`shell_command`、`exec_command`、`write_stdin`、`javascript_eval` 和 `async_job`；ADF overlay 另外提供 `adf_define/list/remove` 及动态生成的工具。`read/list/search/javascript_eval` 默认 Low，`write/edit/apply_patch/async_job` 默认 Medium，terminal process tools 始终 High。文件工具限制在 workspace 内并拒绝密钥配置、`.env`、私钥和 `.git` 路径；`search` 通过可替换的 `SearchBackend` 工作，默认 adapter 是不联网的 workspace text search。
+`agent-extension::tool` 当前提供 `get_current_time`、`read`、`list_directory`、`search`、`write`、`edit`、`apply_patch`、`shell_command`、`exec_command`、`write_stdin`、`pptx_check`、`xlsx_check`、`docx_check`、`javascript_eval` 和 `async_job`；ADF overlay 另外提供 `adf_define/list/remove` 及动态生成的工具。`read/list/search/pptx_check/xlsx_check/docx_check/javascript_eval` 默认 Low，`write/edit/apply_patch/async_job` 默认 Medium，terminal process tools 始终 High。文件工具限制在 workspace 内并拒绝密钥配置、`.env`、私钥和 `.git` 路径；三个 Office checker 对未打包 OOXML 目录或最终 `.pptx/.xlsx/.docx` 文件执行有界结构校验，包括 XML、Content Types、关系及格式专属引用，但不替代 Office 应用的 Schema、公式语义或视觉渲染检查；`search` 通过可替换的 `SearchBackend` 工作，默认 adapter 是不联网的 workspace text search。
 
 Tool 还声明 `idempotency/concurrency/completion/retry`。只有 ReadOnly/Idempotent Tool 可有限自动重试；只有 `parallel_safe + immediate` 且无需审批的调用可并发，写回模型时仍保持调用顺序；MaySuspend Tool 通过 checkpoint + wait/effect 释放 worker，事件到达后跨重启恢复。
 
@@ -164,3 +164,6 @@ Tool failure 统一包含稳定 `code`、`category`、安全 `message`、`retrya
 - [Core/Harness/Extension 三包边界](./docs/12-core-extension-consolidation.md)
 - [QuickJS 便携脚本运行时设计与执行计划](./docs/13-quickjs-portable-script-runtime.md)
 - [Agent Defined Functions（ADF）设计与执行计划](./docs/14-agent-defined-functions.md)
+- [跨环境 Workspace FS 契约与实现](./docs/15-workspace-filesystem.md)
+
+The browser runtime is available as the headless [`@mina/browser-agent` SDK](packages/browser-agent/README.md); `apps/wasm-agent` is its React demo. The host system prompt is embedded in WASM.

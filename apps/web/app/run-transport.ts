@@ -64,6 +64,7 @@ type RunEvent = {
   code?: string;
   message?: string;
   retryable?: boolean;
+  redacted?: boolean;
 };
 
 export function createRunTransport(
@@ -152,6 +153,27 @@ export function createRunTransport(
               assertRunning(messageStarted, finished);
               suspended = true;
               return closeActiveOutput();
+
+            case "reasoning_started": {
+              assertRunning(messageStarted, finished);
+              if (typeof event.redacted !== "boolean") {
+                throw protocolError("后端返回了无效的 reasoning_started");
+              }
+              if (activeOutput === "reasoning") return null;
+              const events = closeActiveOutput();
+              events.push({ type: "reasoning-start", redacted: event.redacted });
+              activeOutput = "reasoning";
+              return events;
+            }
+
+            case "reasoning_completed":
+              assertRunning(messageStarted, finished);
+              if (typeof event.redacted !== "boolean") {
+                throw protocolError("后端返回了无效的 reasoning_completed");
+              }
+              if (activeOutput !== "reasoning") return null;
+              activeOutput = null;
+              return { type: "reasoning-end", redacted: event.redacted };
 
             case "output_delta": {
               assertRunning(messageStarted, finished);

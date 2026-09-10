@@ -10,7 +10,6 @@ use agent_core::harness::{
     BlobStore, FinishReason, ModelError, ModelErrorKind, ModelEvent, ModelEventStream,
     ModelMessage, ModelPort, ModelRequest, ModelRole, TokenUsage, TokenUsageSource, ToolDefinition,
 };
-use agent_harness::{ConfigError, ModelConfig, OpenAiProtocol, ProviderConfig, SecretString};
 use async_stream::stream;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -19,7 +18,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
-use super::attachment::{base64_data, data_url, load_blob};
+use super::{
+    ModelConfig, OpenAiProtocol, ProviderConfig, ProviderConfigError, SecretString,
+    attachment::{base64_data, data_url, load_blob},
+};
 
 /// HTTP/SSE implementation of Mina's provider-neutral model port.
 pub struct OpenAiCompatibleProvider {
@@ -292,7 +294,7 @@ pub enum AdapterConfigError {
     UnsupportedProtocol,
 
     #[error(transparent)]
-    Secret(#[from] ConfigError),
+    Secret(#[from] ProviderConfigError),
 
     #[error("failed to build HTTP client: {0}")]
     HttpClient(#[from] reqwest::Error),
@@ -787,7 +789,6 @@ mod tests {
         BlobId, BlobMetadata, BlobObject, BlobStoreError, BlobStoreFuture, ModelAttachment,
         PutBlob, RunId,
     };
-    use agent_harness::HarnessConfig;
     use axum::{
         Json, Router,
         http::HeaderMap,
@@ -1040,22 +1041,22 @@ mod tests {
                 .expect("mock server should run");
         });
 
-        let config = HarnessConfig::from_toml_str(&format!(
-            r#"
-default_model = "primary"
-
-[models.primary]
-model = "mock-model"
-
-[models.primary.provider]
-type = "openai-compatible"
-base_url = "http://{address}/v1"
-api_key = "test-key"
-"#
-        ))
-        .expect("test config should parse");
-        let provider = OpenAiCompatibleProvider::from_model_config(config.default_model())
-            .expect("provider should build");
+        let model = ModelConfig {
+            model: "mock-model".into(),
+            modalities: crate::provider::Modalities::default(),
+            context_window: None,
+            max_output_tokens: None,
+            provider: ProviderConfig::OpenAiCompatible {
+                base_url: Url::parse(&format!("http://{address}/v1/"))
+                    .expect("test URL should parse"),
+                protocol: OpenAiProtocol::ChatCompletions,
+                api_key: Some(crate::provider::SecretSource::Literal("test-key".into())),
+                organization: None,
+                project: None,
+            },
+        };
+        let provider =
+            OpenAiCompatibleProvider::from_model_config(&model).expect("provider should build");
 
         let events: Vec<_> = provider
             .stream(ModelRequest {

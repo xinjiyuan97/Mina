@@ -2,6 +2,7 @@ use std::pin::Pin;
 
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::harness::{BlobId, RunId, ToolDefinition};
@@ -195,14 +196,55 @@ pub enum ModelErrorKind {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ModelEvent {
-    Accepted { provider_request_id: Option<String> },
-    ReasoningDelta { delta: String },
-    TextDelta { delta: String },
-    ToolCallStarted { call_id: String, name: String },
-    ToolCallArgumentsDelta { call_id: String, delta: String },
-    Usage { usage: TokenUsage },
-    Completed { finish_reason: FinishReason },
-    Failed { error: ModelError },
+    Accepted {
+        provider_request_id: Option<String>,
+    },
+    /// The provider started a reasoning item. `redacted` means the provider
+    /// exposes the lifecycle but withholds the underlying reasoning text.
+    ReasoningStarted {
+        #[serde(default)]
+        redacted: bool,
+    },
+    ReasoningDelta {
+        delta: String,
+    },
+    ReasoningCompleted {
+        #[serde(default)]
+        redacted: bool,
+    },
+    TextDelta {
+        delta: String,
+    },
+    /// A tool executed by the model provider rather than by the Agent host.
+    ///
+    /// Provider tools are observable output only: they must never enter the
+    /// local tool validation, approval, or invocation pipeline.
+    ProviderToolCallStarted {
+        call_id: String,
+        name: String,
+        arguments: Value,
+    },
+    ProviderToolCallCompleted {
+        call_id: String,
+        output: String,
+    },
+    ToolCallStarted {
+        call_id: String,
+        name: String,
+    },
+    ToolCallArgumentsDelta {
+        call_id: String,
+        delta: String,
+    },
+    Usage {
+        usage: TokenUsage,
+    },
+    Completed {
+        finish_reason: FinishReason,
+    },
+    Failed {
+        error: ModelError,
+    },
 }
 
 /// Pull-based model stream. Polling provides natural backpressure and dropping

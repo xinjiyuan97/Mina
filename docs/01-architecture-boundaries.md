@@ -115,8 +115,8 @@ flowchart TD
     Apps --> Harness[agent-harness]
     Apps --> Extension[agent-extension]
     Harness --> Core
+    Harness --> Extension
     Extension --> Core
-    Extension -. optional host types .-> Harness
     Core --> Agent[AgentLoop / Run / Session contracts]
     Core --> Contracts[Tool / Sandbox / Memory / Skill / Observability contracts]
     Harness --> Runtime[Run / Event / Job / Flow / QuickJS runtime]
@@ -128,8 +128,8 @@ flowchart TD
 必须遵守：
 
 1. `agent-core` 不依赖 `agent-harness`、`agent-extension`、Web 框架、数据库驱动、QuickJS 或 Provider SDK。
-2. `agent-harness` 依赖 Core 契约，不依赖 Extension 的具体 adapter。
-3. `agent-extension` 只能实现 Core/Harness 定义的端口，不得重新定义运行状态和公共事件。
+2. `agent-harness` 依赖 Core 契约和 Extension 的 Provider 配置/扩展实现，不允许 Extension 反向引用 Harness。
+3. `agent-extension` 只能实现 Core 定义的端口，不得重新定义运行状态和公共事件。
 4. `apps/server` 与 `apps/agent-cli` 是 composition root，负责选择并装配具体实现。
 5. transport/provider adapter 可以依赖 Core 端口，Core 端口不能反向依赖 adapter。
 

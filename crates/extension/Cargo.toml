@@ -9,16 +9,33 @@ description = "External providers, tools, stores, sandboxes and observability ad
 
 [features]
 default = []
-adf = ["dep:agent-harness", "dep:jsonschema", "dep:sha2", "dep:tokio"]
+adf = ["dep:jsonschema", "dep:sha2", "dep:tokio"]
 openai = [
-    "dep:agent-harness",
     "dep:async-stream",
     "dep:base64",
     "dep:eventsource-stream",
     "dep:futures-util",
     "dep:reqwest",
 ]
-builtin-tools = ["host-sandbox", "dep:time"]
+workspace = []
+workspace-native = ["workspace", "dep:sha2", "dep:tokio"]
+workspace-opfs = [
+    "workspace",
+    "dep:js-sys",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+]
+workspace-skill = ["workspace", "dep:sha2", "dep:toml"]
+workspace-s3 = ["workspace", "dep:aws-sdk-s3"]
+builtin-tools = ["host-sandbox", "workspace-native", "dep:time"]
+pptx = ["ooxml"]
+pptx-tools = ["builtin-tools", "pptx"]
+xlsx = ["ooxml"]
+xlsx-tools = ["builtin-tools", "xlsx"]
+docx = ["ooxml"]
+docx-tools = ["builtin-tools", "docx"]
+ooxml = ["dep:quick-xml", "dep:zip"]
+office-tools = ["pptx-tools", "xlsx-tools", "docx-tools"]
 host-sandbox = ["dep:tokio", "dep:tokio-util"]
 sqlite = ["dep:rusqlite", "dep:tokio"]
 filesystem = ["dep:sha2", "dep:tokio", "dep:toml"]
@@ -28,22 +45,27 @@ full = [
     "adf",
     "openai",
     "builtin-tools",
+    "office-tools",
     "host-sandbox",
     "sqlite",
     "filesystem",
     "observability-tracing",
     "context-model",
+    "workspace-native",
+    "workspace-skill",
 ]
 
 [dependencies]
 agent-core.workspace = true
-agent-harness = { workspace = true, optional = true }
 async-stream = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 eventsource-stream = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 jsonschema = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+quick-xml = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -55,10 +77,12 @@ tokio-util = { workspace = true, optional = true }
 toml = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 url.workspace = true
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
 
 [dev-dependencies]
 agent-core.workspace = true
-agent-harness = { workspace = true, features = ["quickjs"] }
 axum.workspace = true
 futures-util.workspace = true
 sha2.workspace = true
@@ -67,22 +91,6 @@ tokio.workspace = true
 
 [[test]]
 name = "context_engine"
-required-features = ["sqlite"]
-
-[[test]]
-name = "adf_agent_loop"
-required-features = ["adf"]
-
-[[test]]
-name = "javascript_agent_loop"
-required-features = ["builtin-tools"]
-
-[[test]]
-name = "async_job_agent_loop"
-required-features = ["builtin-tools", "sqlite"]
-
-[[test]]
-name = "quickjs_flow"
 required-features = ["sqlite"]
 
 [lints]

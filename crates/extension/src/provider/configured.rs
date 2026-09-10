@@ -1,14 +1,12 @@
 use std::sync::Arc;
 
+use super::{
+    AdapterConfigError, AnthropicMessagesProvider, ModelConfig, OpenAiCompatibleProvider,
+    OpenAiProtocol, OpenAiResponsesProvider, ProviderConfig,
+};
 use agent_core::{
     context::TokenEstimator,
     harness::{BlobStore, ModelEventStream, ModelPort, ModelRequest},
-};
-use agent_harness::{ModelConfig, OpenAiProtocol, ProviderConfig};
-
-use super::{
-    AdapterConfigError, AnthropicMessagesProvider, OpenAiCompatibleProvider,
-    OpenAiResponsesProvider,
 };
 
 /// Runtime-selected provider adapter behind the provider-neutral `ModelPort`.
@@ -35,7 +33,6 @@ impl ConfiguredModelProvider {
             ProviderConfig::Anthropic { .. } => Ok(Self::AnthropicMessages(
                 AnthropicMessagesProvider::from_model_config(model)?,
             )),
-            _ => Err(AdapterConfigError::UnsupportedProvider),
         }
     }
 

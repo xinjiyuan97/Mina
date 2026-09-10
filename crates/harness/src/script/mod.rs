@@ -1,7 +1,5 @@
 //! Host-owned portable script engines and durable JavaScript flows.
 
-pub use agent_core::script::*;
-
 mod flow;
 pub use flow::{JavaScriptAgentMachine, JavaScriptFlowPolicy};
 

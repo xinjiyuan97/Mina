@@ -407,7 +407,9 @@ where
             match event.kind {
                 RunEventKind::RunStarted
                 | RunEventKind::RunWaiting { .. }
-                | RunEventKind::RunResumed { .. } => {}
+                | RunEventKind::RunResumed { .. }
+                | RunEventKind::ReasoningStarted { .. }
+                | RunEventKind::ReasoningCompleted { .. } => {}
                 RunEventKind::OutputDelta {
                     channel: OutputChannel::AssistantText,
                     delta,

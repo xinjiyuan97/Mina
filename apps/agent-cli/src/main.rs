@@ -11,18 +11,21 @@ use agent_core::{
     harness::{
         AgentLoop, ApprovalError, ApprovalFuture, ApprovalPort, ApprovalRequest, ApprovalResolution,
     },
+    observability::ObservationHook,
+    sandbox::ProcessSandbox,
     script::{ScriptLimits, ScriptRuntime},
 };
 use agent_extension::adf::{InMemoryAdfArtifactStore, RunAdfToolSession};
 use agent_extension::observability::{
-    AsyncObservationConfig, AsyncObservationHook, HookObservationExporter, ObservationHook,
-    ObservedMachine, ObservedModel, ObservedTools, TracingObservationHook,
+    AsyncObservationConfig, AsyncObservationHook, HookObservationExporter, ObservedMachine,
+    ObservedModel, ObservedTools, TracingObservationHook,
 };
 use agent_extension::provider::ConfiguredModelProvider;
-use agent_extension::sandbox::{HostProcessSandbox, ProcessSandbox};
+use agent_extension::sandbox::HostProcessSandbox;
 use agent_extension::tool::{
     BuiltinToolCatalog, JavaScriptEvalTool, SearchBackend, WorkspaceSearchBackend,
 };
+use agent_extension::workspace::{NativeWorkspaceFs, WorkspaceFs};
 use agent_harness::{
     Harness, HarnessConfig, QuickJsConfig, RunOptions,
     adf::JavaScriptAdfExecutor,
@@ -106,11 +109,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workspace = env::current_dir()?;
 
     let process_sandbox: Arc<dyn ProcessSandbox> = Arc::new(HostProcessSandbox::default());
-    let search_backend: Arc<dyn SearchBackend> = Arc::new(WorkspaceSearchBackend::new(&workspace)?);
+    let file_workspace: Arc<dyn WorkspaceFs> = Arc::new(NativeWorkspaceFs::new(&workspace)?);
+    let search_backend: Arc<dyn SearchBackend> =
+        Arc::new(WorkspaceSearchBackend::new(Arc::clone(&file_workspace)));
     let mut tools = BuiltinToolCatalog::new(workspace)
+        .with_file_workspace(file_workspace)
         .with_process_sandbox(process_sandbox)
         .with_search_backend(search_backend)
         .enable_terminal_tools()
+        .enable_office_tools()
         .build()?;
     let quickjs = if config.script().quickjs.enabled {
         let limits = script_limits(&config.script().quickjs);

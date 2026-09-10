@@ -218,6 +218,10 @@ impl RunSnapshot {
                 }
                 self.status = RunStatus::Running;
             }
+            RunEventKind::ReasoningStarted { .. } | RunEventKind::ReasoningCompleted { .. } => {
+                self.require_started(event)?;
+                self.status = RunStatus::Running;
+            }
             RunEventKind::OutputDelta { channel, delta } => {
                 self.require_started(event)?;
                 match channel {
@@ -536,23 +540,8 @@ pub trait RunStore: Send + Sync + 'static {
     fn append_event(&self, event: RunEvent, observed_at_ms: i64)
     -> RunStoreFuture<'_, RunSnapshot>;
 
-    /// Persists a non-empty, contiguous group of events in order.
-    ///
-    /// The default implementation preserves compatibility for external store
-    /// adapters. Transactional adapters should override this method so the
-    /// group and its final projected snapshot are committed atomically.
-    fn append_events(&self, events: Vec<ObservedRunEvent>) -> RunStoreFuture<'_, RunSnapshot> {
-        Box::pin(async move {
-            let mut snapshot = None;
-            for observed in events {
-                snapshot = Some(
-                    self.append_event(observed.event, observed.observed_at_ms)
-                        .await?,
-                );
-            }
-            snapshot.ok_or_else(|| RunStoreError::backend("cannot append an empty event batch"))
-        })
-    }
+    /// Atomically persists a non-empty, contiguous group of events in order.
+    fn append_events(&self, events: Vec<ObservedRunEvent>) -> RunStoreFuture<'_, RunSnapshot>;
 
     fn events_after(
         &self,

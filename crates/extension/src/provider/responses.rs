@@ -1,6 +1,9 @@
 //! OpenAI Responses API adapter.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use agent_core::{
     context::TokenEstimator,
@@ -9,7 +12,6 @@ use agent_core::{
         ModelMessage, ModelPort, ModelRequest, ModelRole, TokenUsage, TokenUsageSource,
     },
 };
-use agent_harness::{ModelConfig, OpenAiProtocol, ProviderConfig, SecretString};
 use async_stream::stream;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -18,6 +20,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 use super::{
+    ModelConfig, OpenAiProtocol, ProviderConfig, SecretString,
     attachment::{data_url, load_blob},
     openai::AdapterConfigError,
 };
@@ -135,6 +138,7 @@ impl ModelPort for OpenAiResponsesProvider {
             let mut accepted = false;
             let mut saw_output = false;
             let mut tool_calls = HashMap::<String, String>::new();
+            let mut provider_tools = ResponsesProviderToolTracker::default();
             while let Some(event) = source.next().await {
                 let event = match event {
                     Ok(event) => event,
@@ -166,6 +170,10 @@ impl ModelPort for OpenAiResponsesProvider {
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or(event.event.as_str());
+                for event in provider_tools.push(event_type, &value) {
+                    saw_output = true;
+                    yield event;
+                }
                 match event_type {
                     "response.created" | "response.in_progress" => {
                         if !accepted {
@@ -195,7 +203,10 @@ impl ModelPort for OpenAiResponsesProvider {
                         }
                     }
                     "response.output_item.added" => {
-                        if value.pointer("/item/type").and_then(Value::as_str) == Some("function_call") {
+                        if value.pointer("/item/type").and_then(Value::as_str) == Some("reasoning") {
+                            saw_output = true;
+                            yield ModelEvent::ReasoningStarted { redacted: true };
+                        } else if value.pointer("/item/type").and_then(Value::as_str) == Some("function_call") {
                             let item_id = value.pointer("/item/id").and_then(Value::as_str);
                             let call_id = value.pointer("/item/call_id").and_then(Value::as_str);
                             let name = value.pointer("/item/name").and_then(Value::as_str);
@@ -208,6 +219,11 @@ impl ModelPort for OpenAiResponsesProvider {
                             }
                             saw_output = true;
                             yield ModelEvent::ToolCallStarted { call_id: call_id.into(), name: name.into() };
+                        }
+                    }
+                    "response.output_item.done" => {
+                        if value.pointer("/item/type").and_then(Value::as_str) == Some("reasoning") {
+                            yield ModelEvent::ReasoningCompleted { redacted: true };
                         }
                     }
                     "response.function_call_arguments.delta" => {
@@ -319,7 +335,12 @@ async fn append_message_items(
 
     let mut content = Vec::new();
     if !message.content.is_empty() {
-        content.push(json!({"type": "input_text", "text": message.content}));
+        let content_type = if message.role == ModelRole::Assistant {
+            "output_text"
+        } else {
+            "input_text"
+        };
+        content.push(json!({"type": content_type, "text": message.content}));
     }
     for attachment in &message.attachments {
         if message.role != ModelRole::User {
@@ -379,6 +400,122 @@ fn responses_usage(value: &Value) -> Option<TokenUsage> {
     })
 }
 
+#[derive(Default)]
+struct ResponsesProviderToolTracker {
+    started: HashSet<String>,
+    completed: HashSet<String>,
+}
+
+impl ResponsesProviderToolTracker {
+    fn push(&mut self, event_type: &str, value: &Value) -> Vec<ModelEvent> {
+        match event_type {
+            "response.output_item.added" => value
+                .get("item")
+                .map_or_else(Vec::new, |item| self.start_from_item(item, "in_progress")),
+            "response.output_item.done" => value
+                .get("item")
+                .map_or_else(Vec::new, |item| self.complete_from_item(item)),
+            "response.web_search_call.in_progress"
+            | "response.web_search_call.searching"
+            | "response.web_search_call.completed" => {
+                let Some(call_id) = value.get("item_id").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                let status = event_type
+                    .strip_prefix("response.web_search_call.")
+                    .unwrap_or("in_progress");
+                self.start(call_id, "web_search", json!({ "status": status }))
+            }
+            "response.completed" | "response.incomplete" => {
+                let mut events = Vec::new();
+                if let Some(output) = value.pointer("/response/output").and_then(Value::as_array) {
+                    for item in output {
+                        events.extend(self.complete_from_item(item));
+                    }
+                }
+                let pending = self
+                    .started
+                    .iter()
+                    .filter(|call_id| !self.completed.contains(*call_id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for call_id in pending {
+                    events.extend(self.complete(&call_id, json!({ "status": "completed" })));
+                }
+                events
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn start_from_item(&mut self, item: &Value, fallback_status: &str) -> Vec<ModelEvent> {
+        let Some(name) = provider_tool_name(item.get("type").and_then(Value::as_str)) else {
+            return Vec::new();
+        };
+        let Some(call_id) = item.get("id").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let arguments = item.get("action").cloned().unwrap_or_else(|| {
+            json!({
+                "status": item
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or(fallback_status)
+            })
+        });
+        self.start(call_id, name, arguments)
+    }
+
+    fn complete_from_item(&mut self, item: &Value) -> Vec<ModelEvent> {
+        if provider_tool_name(item.get("type").and_then(Value::as_str)).is_none() {
+            return Vec::new();
+        }
+        let Some(call_id) = item.get("id").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let mut events = self.start_from_item(item, "completed");
+        let mut output = json!({
+            "status": item
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("completed")
+        });
+        if let Some(action) = item.get("action") {
+            output["action"] = action.clone();
+        }
+        events.extend(self.complete(call_id, output));
+        events
+    }
+
+    fn start(&mut self, call_id: &str, name: &str, arguments: Value) -> Vec<ModelEvent> {
+        if !self.started.insert(call_id.to_owned()) {
+            return Vec::new();
+        }
+        vec![ModelEvent::ProviderToolCallStarted {
+            call_id: call_id.into(),
+            name: name.into(),
+            arguments,
+        }]
+    }
+
+    fn complete(&mut self, call_id: &str, output: Value) -> Vec<ModelEvent> {
+        if !self.completed.insert(call_id.to_owned()) {
+            return Vec::new();
+        }
+        vec![ModelEvent::ProviderToolCallCompleted {
+            call_id: call_id.into(),
+            output: output.to_string(),
+        }]
+    }
+}
+
+fn provider_tool_name(item_type: Option<&str>) -> Option<&'static str> {
+    match item_type {
+        Some("web_search_call") => Some("web_search"),
+        _ => None,
+    }
+}
+
 fn protocol_error(message: &str) -> ModelError {
     ModelError::new(ModelErrorKind::ProtocolViolation, message, false)
 }
@@ -436,7 +573,6 @@ mod tests {
     use std::convert::Infallible;
 
     use agent_core::harness::{ModelMessage, RunId, ToolDefinition};
-    use agent_harness::HarnessConfig;
     use axum::{
         Json, Router,
         response::sse::{Event, Sse},
@@ -456,7 +592,7 @@ mod tests {
                 ModelMessage::system("Be concise."),
                 ModelMessage::user("hello"),
                 ModelMessage::assistant_tool_calls(
-                    "",
+                    "checking",
                     "",
                     vec![agent_core::harness::ModelToolCall {
                         id: "call_1".into(),
@@ -479,8 +615,10 @@ mod tests {
         assert_eq!(value["model"], "gpt-test");
         assert_eq!(value["input"][0]["role"], "system");
         assert_eq!(value["input"][1]["content"][0]["type"], "input_text");
-        assert_eq!(value["input"][2]["type"], "function_call");
-        assert_eq!(value["input"][3]["type"], "function_call_output");
+        assert_eq!(value["input"][2]["role"], "assistant");
+        assert_eq!(value["input"][2]["content"][0]["type"], "output_text");
+        assert_eq!(value["input"][3]["type"], "function_call");
+        assert_eq!(value["input"][4]["type"], "function_call_output");
         assert_eq!(value["tools"][0]["name"], "lookup");
         assert_eq!(value["max_output_tokens"], 123);
     }
@@ -497,7 +635,22 @@ mod tests {
                     r#"{"type":"response.created","response":{"id":"resp_1"}}"#,
                 )),
                 Ok(Event::default().data(
+                    r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}"#,
+                )),
+                Ok(Event::default().data(
                     r#"{"type":"response.reasoning_summary_text.delta","delta":"think"}"#,
+                )),
+                Ok(Event::default().data(
+                    r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}"#,
+                )),
+                Ok(Event::default().data(
+                    r#"{"type":"response.web_search_call.in_progress","item_id":"ws_1"}"#,
+                )),
+                Ok(Event::default().data(
+                    r#"{"type":"response.web_search_call.searching","item_id":"ws_1"}"#,
+                )),
+                Ok(Event::default().data(
+                    r#"{"type":"response.output_item.done","item":{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"Mina"}}}"#,
                 )),
                 Ok(Event::default().data(
                     r#"{"type":"response.output_text.delta","delta":"hello"}"#,
@@ -520,21 +673,22 @@ mod tests {
             .await
             .expect("mock server should run");
         });
-        let config = HarnessConfig::from_toml_str(&format!(
-            r#"
-default_model = "primary"
-[models.primary]
-model = "gpt-test"
-[models.primary.provider]
-type = "openai-compatible"
-base_url = "http://{address}/v1"
-protocol = "responses"
-api_key = "test-key"
-"#
-        ))
-        .expect("config should parse");
-        let provider = OpenAiResponsesProvider::from_model_config(config.default_model())
-            .expect("provider should build");
+        let model = ModelConfig {
+            model: "gpt-test".into(),
+            modalities: crate::provider::Modalities::default(),
+            context_window: None,
+            max_output_tokens: None,
+            provider: ProviderConfig::OpenAiCompatible {
+                base_url: Url::parse(&format!("http://{address}/v1/"))
+                    .expect("test URL should parse"),
+                protocol: OpenAiProtocol::Responses,
+                api_key: Some(crate::provider::SecretSource::Literal("test-key".into())),
+                organization: None,
+                project: None,
+            },
+        };
+        let provider =
+            OpenAiResponsesProvider::from_model_config(&model).expect("provider should build");
         let events: Vec<_> = provider
             .stream(ModelRequest {
                 run_id: RunId::new(),
@@ -546,11 +700,28 @@ api_key = "test-key"
             .collect()
             .await;
         assert!(matches!(events[0], ModelEvent::Accepted { .. }));
-        assert!(matches!(&events[1], ModelEvent::ReasoningDelta { delta } if delta == "think"));
-        assert!(matches!(&events[2], ModelEvent::TextDelta { delta } if delta == "hello"));
-        assert!(matches!(events[3], ModelEvent::Usage { .. }));
         assert!(matches!(
-            events[4],
+            events[1],
+            ModelEvent::ReasoningStarted { redacted: true }
+        ));
+        assert!(matches!(&events[2], ModelEvent::ReasoningDelta { delta } if delta == "think"));
+        assert!(matches!(
+            events[3],
+            ModelEvent::ReasoningCompleted { redacted: true }
+        ));
+        assert!(matches!(
+            &events[4],
+            ModelEvent::ProviderToolCallStarted { call_id, name, .. }
+                if call_id == "ws_1" && name == "web_search"
+        ));
+        assert!(matches!(
+            &events[5],
+            ModelEvent::ProviderToolCallCompleted { call_id, .. } if call_id == "ws_1"
+        ));
+        assert!(matches!(&events[6], ModelEvent::TextDelta { delta } if delta == "hello"));
+        assert!(matches!(events[7], ModelEvent::Usage { .. }));
+        assert!(matches!(
+            events[8],
             ModelEvent::Completed {
                 finish_reason: FinishReason::Stop
             }

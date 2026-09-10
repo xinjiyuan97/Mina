@@ -1,5 +1,3 @@
-#![cfg(feature = "adf")]
-
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},

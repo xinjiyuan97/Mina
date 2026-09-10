@@ -36,6 +36,8 @@ use agent_core::memory::{
     MemoryStore, MemoryWriteOutcome, MemoryWritePolicy, MemoryWriteProposal, MemoryWriter,
     PutMemory, ResolveMemoryWriteProposal, RuleMemoryExtractor,
 };
+use agent_core::observability::ObservationHook;
+use agent_core::sandbox::{ProcessSandbox, ProcessSandboxDescriptor};
 use agent_core::script::{ScriptLimits, ScriptRuntime, ScriptRuntimeDescriptor};
 use agent_core::skill::{
     ComponentDescriptor, ResolveSkillsRequest, ResolvedSkill, SkillDescriptor, SkillId,
@@ -44,11 +46,11 @@ use agent_core::skill::{
 use agent_extension::adf::{InMemoryAdfArtifactStore, RunAdfToolSession};
 use agent_extension::context::ModelSummaryGenerator;
 use agent_extension::observability::{
-    AsyncObservationConfig, AsyncObservationHook, HookObservationExporter, ObservationHook,
-    ObservedMachine, ObservedModel, ObservedTools, TracingObservationHook,
+    AsyncObservationConfig, AsyncObservationHook, HookObservationExporter, ObservedMachine,
+    ObservedModel, ObservedTools, TracingObservationHook,
 };
-use agent_extension::provider::ConfiguredModelProvider;
-use agent_extension::sandbox::{HostProcessSandbox, ProcessSandbox, ProcessSandboxDescriptor};
+use agent_extension::provider::{ConfiguredModelProvider, Modality};
+use agent_extension::sandbox::HostProcessSandbox;
 use agent_extension::store::{
     FilesystemBlobStore, FilesystemSkillStore, SqliteEventStore, SqliteMemoryStore, SqliteRunStore,
 };
@@ -56,10 +58,11 @@ use agent_extension::tool::{
     AsyncJobTool, BuiltinToolCatalog, JavaScriptEvalTool, SearchBackend, SearchBackendDescriptor,
     WorkspaceSearchBackend,
 };
+use agent_extension::workspace::{NativeWorkspaceFs, WorkspaceFs};
 use agent_harness::{
     ContextStrategy, EventRuntime, EventRuntimeConfig, FlowEffectRuntime, FlowEffectRuntimeConfig,
-    Harness, HarnessConfig, HarnessError, JobRuntime, JobRuntimeConfig, Modality,
-    OrchestrationConfig, PlannedRun, QuickJsConfig, RunRuntime, RunRuntimeError, StartedRun,
+    Harness, HarnessConfig, HarnessError, JobRuntime, JobRuntimeConfig, OrchestrationConfig,
+    PlannedRun, QuickJsConfig, RunRuntime, RunRuntimeError, StartedRun,
     adf::JavaScriptAdfExecutor,
     script::{QuickJsRuntime, QuickJsRuntimeConfig},
 };
@@ -982,7 +985,9 @@ fn build_agent(
     let provider = ObservedModel::new(provider, Arc::clone(&hook));
     let workspace = env::current_dir()?;
     let process_sandbox: Arc<dyn ProcessSandbox> = Arc::new(HostProcessSandbox::default());
-    let search_backend: Arc<dyn SearchBackend> = Arc::new(WorkspaceSearchBackend::new(&workspace)?);
+    let file_workspace: Arc<dyn WorkspaceFs> = Arc::new(NativeWorkspaceFs::new(&workspace)?);
+    let search_backend: Arc<dyn SearchBackend> =
+        Arc::new(WorkspaceSearchBackend::new(Arc::clone(&file_workspace)));
     let tool_runtime = ToolRuntimeInspection {
         process_sandbox: process_sandbox.descriptor(),
         search_backend: search_backend.descriptor(),
@@ -990,9 +995,11 @@ fn build_agent(
         adf_enabled: config.adf().enabled,
     };
     let mut tools = BuiltinToolCatalog::new(workspace)
+        .with_file_workspace(file_workspace)
         .with_process_sandbox(process_sandbox)
         .with_search_backend(search_backend)
         .enable_terminal_tools()
+        .enable_office_tools()
         .build()?;
     if config.jobs().enabled {
         tools.register(AsyncJobTool::new(

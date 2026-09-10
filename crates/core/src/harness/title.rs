@@ -226,7 +226,9 @@ impl TitleGenerationReducer {
         match input {
             TitleGenerationInput::ModelEvent { event, .. } => match event {
                 ModelEvent::Accepted { .. }
+                | ModelEvent::ReasoningStarted { .. }
                 | ModelEvent::ReasoningDelta { .. }
+                | ModelEvent::ReasoningCompleted { .. }
                 | ModelEvent::Usage { .. } => transition(state, Vec::new()),
                 ModelEvent::TextDelta { delta } => {
                     state.generated.push_str(&delta);
@@ -241,7 +243,10 @@ impl TitleGenerationReducer {
                 ModelEvent::Failed { error } => {
                     fallback(state, format!("model_failed:{}", error.kind().code()))
                 }
-                ModelEvent::ToolCallStarted { .. } | ModelEvent::ToolCallArgumentsDelta { .. } => {
+                ModelEvent::ProviderToolCallStarted { .. }
+                | ModelEvent::ProviderToolCallCompleted { .. }
+                | ModelEvent::ToolCallStarted { .. }
+                | ModelEvent::ToolCallArgumentsDelta { .. } => {
                     fallback(state, "model_requested_forbidden_tool".into())
                 }
             },

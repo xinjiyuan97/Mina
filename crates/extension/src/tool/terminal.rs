@@ -3,15 +3,13 @@ use std::{path::Path, sync::Arc, time::Duration};
 use agent_core::harness::{
     Tool, ToolCallFuture, ToolCallRequest, ToolDefinition, ToolError, ToolOutput, ToolRiskLevel,
 };
+use agent_core::sandbox::{
+    ProcessSandbox, ProcessSandboxRequest, ProcessSandboxSessionRequest,
+    ProcessSandboxWriteRequest, SandboxError, SandboxErrorKind,
+};
 use serde::Deserialize;
 
-use crate::{
-    sandbox::{
-        HostProcessSandbox, ProcessSandbox, ProcessSandboxRequest, ProcessSandboxSessionRequest,
-        ProcessSandboxWriteRequest, SandboxError, SandboxErrorKind,
-    },
-    tool::workspace::Workspace,
-};
+use crate::{sandbox::HostProcessSandbox, tool::native_path::NativePathWorkspace};
 
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
@@ -21,7 +19,7 @@ const DEFAULT_OUTPUT_BYTES: usize = 40_000;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
 pub struct ShellCommandTool {
-    workspace: Workspace,
+    workspace: NativePathWorkspace,
     sandbox: Arc<dyn ProcessSandbox>,
     max_output_bytes: usize,
 }
@@ -40,7 +38,7 @@ impl std::fmt::Debug for ShellCommandTool {
 impl ShellCommandTool {
     pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self, std::io::Error> {
         Ok(Self::from_workspace_with_sandbox(
-            Workspace::new(workspace_root)?,
+            NativePathWorkspace::new(workspace_root)?,
             Arc::new(HostProcessSandbox::default()),
         ))
     }
@@ -51,7 +49,7 @@ impl ShellCommandTool {
     }
 
     pub(crate) fn from_workspace_with_sandbox(
-        workspace: Workspace,
+        workspace: NativePathWorkspace,
         sandbox: Arc<dyn ProcessSandbox>,
     ) -> Self {
         Self {
@@ -127,7 +125,7 @@ impl Tool for ShellCommandTool {
 }
 
 pub struct ExecCommandTool {
-    workspace: Workspace,
+    workspace: NativePathWorkspace,
     sandbox: Arc<dyn ProcessSandbox>,
 }
 
@@ -154,13 +152,13 @@ impl ExecCommandTool {
         sandbox: Arc<dyn ProcessSandbox>,
     ) -> Result<Self, std::io::Error> {
         Ok(Self {
-            workspace: Workspace::new(workspace_root)?,
+            workspace: NativePathWorkspace::new(workspace_root)?,
             sandbox,
         })
     }
 
     pub(crate) fn from_workspace_with_sandbox(
-        workspace: Workspace,
+        workspace: NativePathWorkspace,
         sandbox: Arc<dyn ProcessSandbox>,
     ) -> Self {
         Self { workspace, sandbox }
@@ -337,7 +335,7 @@ struct WriteStdinArguments {
 }
 
 async fn resolve_workdir(
-    workspace: &Workspace,
+    workspace: &NativePathWorkspace,
     requested: Option<&str>,
 ) -> Result<std::path::PathBuf, ToolError> {
     let path = workspace.resolve_existing(requested.unwrap_or("")).await?;

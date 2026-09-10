@@ -6,10 +6,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use agent_core::script::{
-    SCRIPT_ABI_VERSION, ScriptError, ScriptErrorKind, ScriptExecutionFuture, ScriptExecutionOutput,
-    ScriptExecutionRequest, ScriptIsolation, ScriptLanguage, ScriptLimits, ScriptLog,
-    ScriptPurpose, ScriptRuntime, ScriptRuntimeDescriptor, ScriptUsage, ScriptValidationFuture,
-    ScriptValidationOutput, ScriptValidationRequest,
+    SCRIPT_ABI_VERSION, ScriptCapability, ScriptError, ScriptErrorKind, ScriptExecutionFuture,
+    ScriptExecutionOutput, ScriptExecutionRequest, ScriptIsolation, ScriptLanguage, ScriptLimits,
+    ScriptLog, ScriptPurpose, ScriptRuntime, ScriptRuntimeDescriptor, ScriptSource, ScriptUsage,
+    ScriptValidationFuture, ScriptValidationOutput, ScriptValidationRequest,
 };
 
 const RQUICKJS_VERSION: &str = "0.12.2";
@@ -312,9 +312,9 @@ fn check_request<'a>(
     config: &QuickJsRuntimeConfig,
     language: ScriptLanguage,
     _purpose: ScriptPurpose,
-    source: &'a super::ScriptSource,
+    source: &'a ScriptSource,
     export: &str,
-    capabilities: &[super::ScriptCapability],
+    capabilities: &[ScriptCapability],
     limits: ScriptLimits,
 ) -> Result<CheckedSource<'a>, ScriptError> {
     if language != ScriptLanguage::JavaScript {
@@ -509,7 +509,7 @@ mod tests {
             .validate(ScriptValidationRequest {
                 language: ScriptLanguage::JavaScript,
                 purpose: ScriptPurpose::Eval,
-                source: super::super::ScriptSource::Inline {
+                source: ScriptSource::Inline {
                     source: source.into(),
                     expected_digest: None,
                 },
@@ -575,7 +575,7 @@ mod tests {
             "export function main() { return null; }",
             json!(null),
         );
-        request.source = super::super::ScriptSource::Inline {
+        request.source = ScriptSource::Inline {
             source: request.source.source().into(),
             expected_digest: Some("sha256:not-the-source".into()),
         };

@@ -34,7 +34,7 @@ pub use reducer::{
 /// Schema version of the native durable checkpoint envelope that contains an
 /// [`AgentLoopReducerState`]. Hosts can expose this alongside the reducer JSON
 /// protocol version so deployments can verify which execution path is active.
-pub const AGENT_LOOP_CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+pub const AGENT_LOOP_CHECKPOINT_SCHEMA_VERSION: u32 = 4;
 
 /// A bounded model/tool loop for one independent run.
 ///
@@ -272,6 +272,9 @@ where
                     };
                     match event {
                         ModelEvent::Accepted { .. } => {}
+                        ModelEvent::ReasoningStarted { redacted } => {
+                            yield AgentEvent::ReasoningStarted { redacted };
+                        }
                         ModelEvent::ReasoningDelta { delta } => {
                             if !delta.is_empty() {
                                 assistant_reasoning.push_str(&delta);
@@ -281,11 +284,36 @@ where
                                 };
                             }
                         }
+                        ModelEvent::ReasoningCompleted { redacted } => {
+                            yield AgentEvent::ReasoningCompleted { redacted };
+                        }
                         ModelEvent::TextDelta { delta } => {
                             if !delta.is_empty() {
                                 assistant_text.push_str(&delta);
                                 yield AgentEvent::text_delta(delta);
                             }
+                        }
+                        ModelEvent::ProviderToolCallStarted {
+                            call_id,
+                            name,
+                            arguments,
+                        } => {
+                            if !seen_call_ids.insert(call_id.clone()) {
+                                yield protocol_failure("model emitted a duplicate tool call id");
+                                return;
+                            }
+                            yield AgentEvent::ToolCallStarted {
+                                call_id: call_id.clone(),
+                                name,
+                            };
+                            yield AgentEvent::ToolExecutionStarted { call_id, arguments };
+                        }
+                        ModelEvent::ProviderToolCallCompleted { call_id, output } => {
+                            if !seen_call_ids.contains(&call_id) {
+                                yield protocol_failure("model completed a provider tool before it started");
+                                return;
+                            }
+                            yield AgentEvent::ToolExecutionCompleted { call_id, output };
                         }
                         ModelEvent::ToolCallStarted { call_id, name } => {
                             if !seen_call_ids.insert(call_id.clone()) {
@@ -1018,6 +1046,9 @@ where
 
             match event {
                 ModelEvent::Accepted { .. } => {}
+                ModelEvent::ReasoningStarted { redacted } => {
+                    yield AgentEvent::ReasoningStarted { redacted };
+                }
                 ModelEvent::ReasoningDelta { delta } => {
                     if !delta.is_empty() {
                         yield AgentEvent::OutputDelta {
@@ -1026,10 +1057,27 @@ where
                         };
                     }
                 }
+                ModelEvent::ReasoningCompleted { redacted } => {
+                    yield AgentEvent::ReasoningCompleted { redacted };
+                }
                 ModelEvent::TextDelta { delta } => {
                     if !delta.is_empty() {
                         yield AgentEvent::text_delta(delta);
                     }
+                }
+                ModelEvent::ProviderToolCallStarted {
+                    call_id,
+                    name,
+                    arguments,
+                } => {
+                    yield AgentEvent::ToolCallStarted {
+                        call_id: call_id.clone(),
+                        name,
+                    };
+                    yield AgentEvent::ToolExecutionStarted { call_id, arguments };
+                }
+                ModelEvent::ProviderToolCallCompleted { call_id, output } => {
+                    yield AgentEvent::ToolExecutionCompleted { call_id, output };
                 }
                 ModelEvent::Usage { usage } => {
                     yield AgentEvent::UsageUpdated {

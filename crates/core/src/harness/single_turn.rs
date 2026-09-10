@@ -108,6 +108,9 @@ where
                 };
                 match event {
                     ModelEvent::Accepted { .. } => {}
+                    ModelEvent::ReasoningStarted { redacted } => {
+                        yield AgentEvent::ReasoningStarted { redacted };
+                    }
                     ModelEvent::ReasoningDelta { delta } => {
                         if !delta.is_empty() {
                             yield AgentEvent::OutputDelta {
@@ -116,10 +119,27 @@ where
                             };
                         }
                     }
+                    ModelEvent::ReasoningCompleted { redacted } => {
+                        yield AgentEvent::ReasoningCompleted { redacted };
+                    }
                     ModelEvent::TextDelta { delta } => {
                         if !delta.is_empty() {
                             yield AgentEvent::text_delta(delta);
                         }
+                    }
+                    ModelEvent::ProviderToolCallStarted {
+                        call_id,
+                        name,
+                        arguments,
+                    } => {
+                        yield AgentEvent::ToolCallStarted {
+                            call_id: call_id.clone(),
+                            name,
+                        };
+                        yield AgentEvent::ToolExecutionStarted { call_id, arguments };
+                    }
+                    ModelEvent::ProviderToolCallCompleted { call_id, output } => {
+                        yield AgentEvent::ToolExecutionCompleted { call_id, output };
                     }
                     ModelEvent::ToolCallStarted { .. }
                     | ModelEvent::ToolCallArgumentsDelta { .. } => {

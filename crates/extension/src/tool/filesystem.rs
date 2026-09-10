@@ -1,29 +1,35 @@
+use std::sync::Arc;
+
 use agent_core::harness::{
     Tool, ToolCallFuture, ToolCallRequest, ToolConcurrency, ToolDefinition, ToolError,
-    ToolExecutionPolicy, ToolOutput, ToolRetryPolicy, ToolRiskLevel,
+    ToolErrorCategory, ToolExecutionPolicy, ToolOutput, ToolRetryPolicy, ToolRiskLevel,
 };
-use std::path::Path;
-
 use serde::Deserialize;
 
-use crate::tool::workspace::Workspace;
+use crate::workspace::{
+    FileKind, ListRequest, ReadRequest, WorkspaceError, WorkspaceErrorKind, WorkspaceFs,
+    WorkspacePath, WriteMode, WriteRequest,
+};
 
 const MAX_TEXT_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 500;
 
-#[derive(Debug)]
 pub struct ReadTool {
-    workspace: Workspace,
+    workspace: Arc<dyn WorkspaceFs>,
+}
+
+impl std::fmt::Debug for ReadTool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReadTool")
+            .field("workspace", &self.workspace.descriptor())
+            .finish()
+    }
 }
 
 impl ReadTool {
-    pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self, std::io::Error> {
-        Ok(Self {
-            workspace: Workspace::new(workspace_root)?,
-        })
-    }
-
-    pub(crate) const fn from_workspace(workspace: Workspace) -> Self {
+    #[must_use]
+    pub fn new(workspace: Arc<dyn WorkspaceFs>) -> Self {
         Self { workspace }
     }
 }
@@ -50,35 +56,23 @@ impl Tool for ReadTool {
     }
 
     fn call(&self, request: ToolCallRequest) -> ToolCallFuture {
-        let workspace = self.workspace.clone();
+        let workspace = Arc::clone(&self.workspace);
         Box::pin(async move {
             if request.cancellation.is_cancelled() {
                 return Err(cancelled());
             }
             let arguments: ReadTextFileArguments = parse_arguments(request.arguments)?;
-            let path = workspace.resolve_existing(&arguments.path).await?;
-            let metadata = tokio::fs::metadata(&path)
+            let path = parse_tool_path(&arguments.path)?;
+            let content = workspace
+                .read(ReadRequest {
+                    path: path.clone(),
+                    offset: 0,
+                    length: None,
+                    max_bytes: MAX_TEXT_FILE_BYTES,
+                })
                 .await
-                .map_err(|_| unavailable_path())?;
-            if !metadata.is_file() {
-                return Err(ToolError::new(
-                    "path_not_file",
-                    "the requested workspace path is not a file",
-                    false,
-                ));
-            }
-            if metadata.len() > MAX_TEXT_FILE_BYTES {
-                return Err(ToolError::new(
-                    "file_too_large",
-                    "the requested text file exceeds the 1 MiB tool limit",
-                    false,
-                ));
-            }
-
-            let bytes = tokio::fs::read(&path)
-                .await
-                .map_err(|_| unavailable_path())?;
-            let content = String::from_utf8(bytes).map_err(|_| {
+                .map_err(map_workspace_error)?;
+            let content = String::from_utf8(content.bytes).map_err(|_| {
                 ToolError::new(
                     "file_not_utf8",
                     "the requested file is not valid UTF-8 text",
@@ -87,7 +81,7 @@ impl Tool for ReadTool {
             })?;
             Ok(ToolOutput::text(
                 serde_json::json!({
-                    "path": workspace.display_relative(&path),
+                    "path": path.as_str(),
                     "content": content
                 })
                 .to_string(),
@@ -96,19 +90,22 @@ impl Tool for ReadTool {
     }
 }
 
-#[derive(Debug)]
 pub struct WriteTool {
-    workspace: Workspace,
+    workspace: Arc<dyn WorkspaceFs>,
+}
+
+impl std::fmt::Debug for WriteTool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WriteTool")
+            .field("workspace", &self.workspace.descriptor())
+            .finish()
+    }
 }
 
 impl WriteTool {
-    pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self, std::io::Error> {
-        Ok(Self {
-            workspace: Workspace::new(workspace_root)?,
-        })
-    }
-
-    pub(crate) const fn from_workspace(workspace: Workspace) -> Self {
+    #[must_use]
+    pub fn new(workspace: Arc<dyn WorkspaceFs>) -> Self {
         Self { workspace }
     }
 }
@@ -117,7 +114,7 @@ impl Tool for WriteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             "write",
-            "Create or replace one UTF-8 text file inside the workspace. The parent directory must already exist and symbolic-link destinations are rejected.",
+            "Create or replace one UTF-8 text file inside the workspace. The parent directory must already exist.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -139,7 +136,7 @@ impl Tool for WriteTool {
     }
 
     fn call(&self, request: ToolCallRequest) -> ToolCallFuture {
-        let workspace = self.workspace.clone();
+        let workspace = Arc::clone(&self.workspace);
         Box::pin(async move {
             if request.cancellation.is_cancelled() {
                 return Err(cancelled());
@@ -148,28 +145,28 @@ impl Tool for WriteTool {
             if arguments.content.len() as u64 > MAX_TEXT_FILE_BYTES {
                 return Err(file_too_large());
             }
-            let path = workspace.resolve_for_write(&arguments.path).await?;
-            let created = tokio::fs::symlink_metadata(&path).await.is_err();
-            if !created {
-                let metadata = tokio::fs::metadata(&path)
-                    .await
-                    .map_err(|_| unavailable_path())?;
-                if !metadata.is_file() {
-                    return Err(ToolError::new(
-                        "path_not_file",
-                        "the requested workspace path is not a file",
-                        false,
-                    ));
-                }
-            }
-            tokio::fs::write(&path, arguments.content.as_bytes())
+            let path = parse_tool_path(&arguments.path)?;
+            let created = match workspace.stat(path.clone()).await {
+                Ok(metadata) if metadata.kind != FileKind::File => return Err(path_not_file()),
+                Ok(_) => false,
+                Err(error) if error.kind() == WorkspaceErrorKind::NotFound => true,
+                Err(error) => return Err(map_workspace_error(error)),
+            };
+            let metadata = workspace
+                .write(WriteRequest {
+                    path: path.clone(),
+                    bytes: arguments.content.as_bytes().to_vec(),
+                    mode: WriteMode::Truncate,
+                    create_parents: false,
+                })
                 .await
-                .map_err(|_| write_failed())?;
+                .map_err(map_workspace_error)?;
             Ok(ToolOutput::text(
                 serde_json::json!({
-                    "path": workspace.display_relative(&path),
+                    "path": path.as_str(),
                     "bytes_written": arguments.content.len(),
-                    "created": created
+                    "created": created,
+                    "revision": metadata.revision
                 })
                 .to_string(),
             ))
@@ -177,19 +174,22 @@ impl Tool for WriteTool {
     }
 }
 
-#[derive(Debug)]
 pub struct EditTool {
-    workspace: Workspace,
+    workspace: Arc<dyn WorkspaceFs>,
+}
+
+impl std::fmt::Debug for EditTool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EditTool")
+            .field("workspace", &self.workspace.descriptor())
+            .finish()
+    }
 }
 
 impl EditTool {
-    pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self, std::io::Error> {
-        Ok(Self {
-            workspace: Workspace::new(workspace_root)?,
-        })
-    }
-
-    pub(crate) const fn from_workspace(workspace: Workspace) -> Self {
+    #[must_use]
+    pub fn new(workspace: Arc<dyn WorkspaceFs>) -> Self {
         Self { workspace }
     }
 }
@@ -230,7 +230,7 @@ impl Tool for EditTool {
     }
 
     fn call(&self, request: ToolCallRequest) -> ToolCallFuture {
-        let workspace = self.workspace.clone();
+        let workspace = Arc::clone(&self.workspace);
         Box::pin(async move {
             if request.cancellation.is_cancelled() {
                 return Err(cancelled());
@@ -243,24 +243,17 @@ impl Tool for EditTool {
                     false,
                 ));
             }
-            let path = workspace.resolve_for_write(&arguments.path).await?;
-            let metadata = tokio::fs::metadata(&path)
+            let path = parse_tool_path(&arguments.path)?;
+            let content = workspace
+                .read(ReadRequest {
+                    path: path.clone(),
+                    offset: 0,
+                    length: None,
+                    max_bytes: MAX_TEXT_FILE_BYTES,
+                })
                 .await
-                .map_err(|_| unavailable_path())?;
-            if !metadata.is_file() {
-                return Err(ToolError::new(
-                    "path_not_file",
-                    "the requested workspace path is not a file",
-                    false,
-                ));
-            }
-            if metadata.len() > MAX_TEXT_FILE_BYTES {
-                return Err(file_too_large());
-            }
-            let bytes = tokio::fs::read(&path)
-                .await
-                .map_err(|_| unavailable_path())?;
-            let content = String::from_utf8(bytes).map_err(|_| {
+                .map_err(map_workspace_error)?;
+            let content = String::from_utf8(content.bytes).map_err(|_| {
                 ToolError::new(
                     "file_not_utf8",
                     "the requested file is not valid UTF-8 text",
@@ -293,14 +286,21 @@ impl Tool for EditTool {
             if request.cancellation.is_cancelled() {
                 return Err(cancelled());
             }
-            tokio::fs::write(&path, edited.as_bytes())
+            let metadata = workspace
+                .write(WriteRequest {
+                    path: path.clone(),
+                    bytes: edited.as_bytes().to_vec(),
+                    mode: WriteMode::Truncate,
+                    create_parents: false,
+                })
                 .await
-                .map_err(|_| write_failed())?;
+                .map_err(map_workspace_error)?;
             Ok(ToolOutput::text(
                 serde_json::json!({
-                    "path": workspace.display_relative(&path),
+                    "path": path.as_str(),
                     "replacements": if arguments.replace_all { occurrences } else { 1 },
-                    "bytes_written": edited.len()
+                    "bytes_written": edited.len(),
+                    "revision": metadata.revision
                 })
                 .to_string(),
             ))
@@ -308,19 +308,22 @@ impl Tool for EditTool {
     }
 }
 
-#[derive(Debug)]
 pub struct ListDirectoryTool {
-    workspace: Workspace,
+    workspace: Arc<dyn WorkspaceFs>,
+}
+
+impl std::fmt::Debug for ListDirectoryTool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ListDirectoryTool")
+            .field("workspace", &self.workspace.descriptor())
+            .finish()
+    }
 }
 
 impl ListDirectoryTool {
-    pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self, std::io::Error> {
-        Ok(Self {
-            workspace: Workspace::new(workspace_root)?,
-        })
-    }
-
-    pub(crate) const fn from_workspace(workspace: Workspace) -> Self {
+    #[must_use]
+    pub fn new(workspace: Arc<dyn WorkspaceFs>) -> Self {
         Self { workspace }
     }
 }
@@ -345,48 +348,43 @@ impl Tool for ListDirectoryTool {
     }
 
     fn call(&self, request: ToolCallRequest) -> ToolCallFuture {
-        let workspace = self.workspace.clone();
+        let workspace = Arc::clone(&self.workspace);
         Box::pin(async move {
             let arguments: ListDirectoryArguments = parse_arguments(request.arguments)?;
-            let path = workspace.resolve_existing(&arguments.path).await?;
-            let mut directory = tokio::fs::read_dir(&path)
+            let path = parse_tool_path(&arguments.path)?;
+            let mut page = workspace
+                .list(ListRequest {
+                    path: path.clone(),
+                    cursor: None,
+                    limit: MAX_DIRECTORY_ENTRIES + 1,
+                })
                 .await
-                .map_err(|_| unavailable_path())?;
-            let mut entries = Vec::new();
-            let mut truncated = false;
-
-            while let Some(entry) = directory
-                .next_entry()
-                .await
-                .map_err(|_| unavailable_path())?
-            {
-                if request.cancellation.is_cancelled() {
-                    return Err(cancelled());
-                }
-                if entries.len() == MAX_DIRECTORY_ENTRIES {
-                    truncated = true;
-                    break;
-                }
-                let file_type = entry.file_type().await.map_err(|_| unavailable_path())?;
-                let kind = if file_type.is_dir() {
-                    "directory"
-                } else if file_type.is_file() {
-                    "file"
-                } else if file_type.is_symlink() {
-                    "symlink"
-                } else {
-                    "other"
-                };
-                entries.push(serde_json::json!({
-                    "path": workspace.display_relative(&entry.path()),
-                    "kind": kind
-                }));
+                .map_err(map_workspace_error)?;
+            if request.cancellation.is_cancelled() {
+                return Err(cancelled());
             }
-            entries.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
-
+            let truncated =
+                page.entries.len() > MAX_DIRECTORY_ENTRIES || page.next_cursor.is_some();
+            page.entries.truncate(MAX_DIRECTORY_ENTRIES);
+            let entries = page
+                .entries
+                .into_iter()
+                .filter(|entry| !is_protected_path(&entry.path))
+                .map(|entry| {
+                    serde_json::json!({
+                        "path": entry.path.as_str(),
+                        "kind": match entry.kind {
+                            FileKind::File => "file",
+                            FileKind::Directory => "directory",
+                            FileKind::Symlink => "symlink",
+                            FileKind::Other => "other",
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
             Ok(ToolOutput::text(
                 serde_json::json!({
-                    "path": workspace.display_relative(&path),
+                    "path": path.as_str(),
                     "entries": entries,
                     "truncated": truncated
                 })
@@ -443,16 +441,62 @@ where
     })
 }
 
+pub(crate) fn parse_tool_path(path: &str) -> Result<WorkspacePath, ToolError> {
+    let path = WorkspacePath::parse(path).map_err(|_| {
+        ToolError::new(
+            "path_outside_workspace",
+            "tool paths must remain inside the configured workspace",
+            false,
+        )
+    })?;
+    if is_protected_path(&path) {
+        return Err(ToolError::new(
+            "path_protected",
+            "the requested path is protected by the host file policy",
+            false,
+        ));
+    }
+    Ok(path)
+}
+
+pub(crate) fn is_protected_path(path: &WorkspacePath) -> bool {
+    let file_name = path.file_name().unwrap_or_default();
+    path.storage_key().split('/').any(|part| part == ".git")
+        || path.storage_key() == "config/mina.toml"
+        || file_name == ".env"
+        || file_name.starts_with(".env.")
+        || file_name.ends_with(".pem")
+        || file_name.ends_with(".key")
+}
+
+pub(crate) fn map_workspace_error(error: WorkspaceError) -> ToolError {
+    let category = match error.kind() {
+        WorkspaceErrorKind::InvalidPath => ToolErrorCategory::InvalidRequest,
+        WorkspaceErrorKind::NotFound => ToolErrorCategory::NotFound,
+        WorkspaceErrorKind::AlreadyExists | WorkspaceErrorKind::Conflict => {
+            ToolErrorCategory::Conflict
+        }
+        WorkspaceErrorKind::PermissionDenied => ToolErrorCategory::PermissionDenied,
+        WorkspaceErrorKind::TooLarge => ToolErrorCategory::ResourceExhausted,
+        WorkspaceErrorKind::Unavailable => ToolErrorCategory::Unavailable,
+        WorkspaceErrorKind::NotFile
+        | WorkspaceErrorKind::NotDirectory
+        | WorkspaceErrorKind::Unsupported
+        | WorkspaceErrorKind::Backend => ToolErrorCategory::Internal,
+    };
+    ToolError::new(error.code(), error.safe_message(), error.retryable()).with_category(category)
+}
+
 const fn read_only_policy() -> ToolExecutionPolicy {
     ToolExecutionPolicy::read_only()
         .with_concurrency(ToolConcurrency::ParallelSafe)
         .with_retry(ToolRetryPolicy::bounded(2, 25, 250))
 }
 
-fn unavailable_path() -> ToolError {
+fn path_not_file() -> ToolError {
     ToolError::new(
-        "path_unavailable",
-        "the requested workspace path is unavailable",
+        "path_not_file",
+        "the requested workspace path is not a file",
         false,
     )
 }
@@ -465,32 +509,31 @@ fn file_too_large() -> ToolError {
     )
 }
 
-fn write_failed() -> ToolError {
-    ToolError::new(
-        "file_write_failed",
-        "the requested workspace file could not be written",
-        false,
-    )
-}
-
 fn cancelled() -> ToolError {
     ToolError::new("tool_cancelled", "tool execution was cancelled", false)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use agent_core::harness::{RunCancellation, RunId, ToolCallRequest};
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::*;
+    use crate::workspace::NativeWorkspaceFs;
+
+    fn native_workspace(path: &Path) -> Arc<dyn WorkspaceFs> {
+        Arc::new(NativeWorkspaceFs::new(path).expect("workspace should be valid"))
+    }
 
     #[tokio::test]
     async fn reads_utf8_files_inside_the_workspace() {
         let directory = tempdir().expect("temporary workspace should be created");
         std::fs::write(directory.path().join("hello.txt"), "hello")
             .expect("fixture should be written");
-        let tool = ReadTool::new(directory.path()).expect("workspace should be valid");
+        let tool = ReadTool::new(native_workspace(directory.path()));
         let output = tool
             .call(ToolCallRequest {
                 run_id: RunId::new(),
@@ -511,7 +554,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_parent_directory_traversal() {
         let directory = tempdir().expect("temporary workspace should be created");
-        let tool = ReadTool::new(directory.path()).expect("workspace should be valid");
+        let tool = ReadTool::new(native_workspace(directory.path()));
         let error = tool
             .call(ToolCallRequest {
                 run_id: RunId::new(),
@@ -536,7 +579,7 @@ mod tests {
             "api_key='secret'",
         )
         .expect("fixture should be written");
-        let tool = ReadTool::new(directory.path()).expect("workspace should be valid");
+        let tool = ReadTool::new(native_workspace(directory.path()));
         let error = tool
             .call(ToolCallRequest {
                 run_id: RunId::new(),
@@ -565,7 +608,7 @@ mod tests {
             directory.path().join("link.txt"),
         )
         .expect("fixture symlink should be created");
-        let tool = ReadTool::new(directory.path()).expect("workspace should be valid");
+        let tool = ReadTool::new(native_workspace(directory.path()));
         let error = tool
             .call(ToolCallRequest {
                 run_id: RunId::new(),
@@ -577,14 +620,14 @@ mod tests {
             .await
             .expect_err("escaping symlink should fail");
 
-        assert_eq!(error.code(), "path_outside_workspace");
+        assert_eq!(error.code(), "workspace_path_outside_root");
     }
 
     #[tokio::test]
     async fn writes_and_edits_workspace_files_with_medium_risk() {
         let directory = tempdir().expect("temporary workspace should be created");
-        let write = WriteTool::new(directory.path()).expect("workspace should be valid");
-        let edit = EditTool::new(directory.path()).expect("workspace should be valid");
+        let write = WriteTool::new(native_workspace(directory.path()));
+        let edit = EditTool::new(native_workspace(directory.path()));
 
         assert_eq!(write.definition().risk_level, ToolRiskLevel::Medium);
         assert_eq!(edit.definition().risk_level, ToolRiskLevel::Medium);
@@ -629,7 +672,7 @@ mod tests {
         let directory = tempdir().expect("temporary workspace should be created");
         std::fs::write(directory.path().join("notes.txt"), "same same")
             .expect("fixture should be written");
-        let tool = EditTool::new(directory.path()).expect("workspace should be valid");
+        let tool = EditTool::new(native_workspace(directory.path()));
         let error = tool
             .call(ToolCallRequest {
                 run_id: RunId::new(),

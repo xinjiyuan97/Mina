@@ -1,28 +1,37 @@
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agent_core::harness::{
     Tool, ToolCallFuture, ToolCallRequest, ToolDefinition, ToolError, ToolOutput, ToolRiskLevel,
 };
 use serde::Deserialize;
 
-use crate::tool::workspace::Workspace;
+use crate::{
+    tool::filesystem::{map_workspace_error, parse_tool_path},
+    workspace::{
+        FileKind, ReadRequest, RemoveRequest, WorkspaceErrorKind, WorkspaceFs, WorkspacePath,
+        WriteMode, WriteRequest,
+    },
+};
 
 const MAX_PATCH_BYTES: usize = 1024 * 1024;
 const MAX_PATCH_FILES: usize = 128;
 
-#[derive(Debug)]
 pub struct ApplyPatchTool {
-    workspace: Workspace,
+    workspace: Arc<dyn WorkspaceFs>,
+}
+
+impl std::fmt::Debug for ApplyPatchTool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApplyPatchTool")
+            .field("workspace", &self.workspace.descriptor())
+            .finish()
+    }
 }
 
 impl ApplyPatchTool {
-    pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self, std::io::Error> {
-        Ok(Self {
-            workspace: Workspace::new(workspace_root)?,
-        })
-    }
-
-    pub(crate) const fn from_workspace(workspace: Workspace) -> Self {
+    #[must_use]
+    pub fn new(workspace: Arc<dyn WorkspaceFs>) -> Self {
         Self { workspace }
     }
 }
@@ -50,7 +59,7 @@ impl Tool for ApplyPatchTool {
     }
 
     fn call(&self, request: ToolCallRequest) -> ToolCallFuture {
-        let workspace = self.workspace.clone();
+        let workspace = Arc::clone(&self.workspace);
         Box::pin(async move {
             if request.cancellation.is_cancelled() {
                 return Err(cancelled());
@@ -67,7 +76,7 @@ impl Tool for ApplyPatchTool {
                 ));
             }
 
-            let prepared = prepare_operations(&workspace, operations).await?;
+            let prepared = prepare_operations(workspace.as_ref(), operations).await?;
             if request.cancellation.is_cancelled() {
                 return Err(cancelled());
             }
@@ -77,14 +86,28 @@ impl Tool for ApplyPatchTool {
                     return Err(cancelled());
                 }
                 match operation.change {
-                    PreparedChange::Write(content) => tokio::fs::write(&operation.path, content)
-                        .await
-                        .map_err(|_| patch_write_failed())?,
-                    PreparedChange::Delete => tokio::fs::remove_file(&operation.path)
-                        .await
-                        .map_err(|_| patch_write_failed())?,
+                    PreparedChange::Write(content) => {
+                        workspace
+                            .write(WriteRequest {
+                                path: operation.path.clone(),
+                                bytes: content,
+                                mode: WriteMode::Truncate,
+                                create_parents: false,
+                            })
+                            .await
+                            .map_err(map_workspace_error)?;
+                    }
+                    PreparedChange::Delete => {
+                        workspace
+                            .remove(RemoveRequest {
+                                path: operation.path.clone(),
+                                recursive: false,
+                            })
+                            .await
+                            .map_err(map_workspace_error)?;
+                    }
                 }
-                changed.push(workspace.display_relative(&operation.path));
+                changed.push(operation.path.as_str().to_owned());
             }
             Ok(ToolOutput::text(
                 serde_json::json!({
@@ -115,7 +138,7 @@ struct PatchHunk {
 }
 
 struct PreparedOperation {
-    path: PathBuf,
+    path: WorkspacePath,
     change: PreparedChange,
 }
 
@@ -218,7 +241,7 @@ fn parse_patch(patch: &str) -> Result<Vec<PatchOperation>, ToolError> {
 }
 
 async fn prepare_operations(
-    workspace: &Workspace,
+    workspace: &dyn WorkspaceFs,
     operations: Vec<PatchOperation>,
 ) -> Result<Vec<PreparedOperation>, ToolError> {
     let mut prepared = Vec::with_capacity(operations.len());
@@ -228,11 +251,14 @@ async fn prepare_operations(
                 if content.len() > MAX_PATCH_BYTES {
                     return Err(invalid_patch("patched file exceeds the 1 MiB limit"));
                 }
-                let path = workspace.resolve_for_write(&path).await?;
-                if let Ok(metadata) = tokio::fs::metadata(&path).await
-                    && !metadata.is_file()
-                {
-                    return Err(path_not_file());
+                let path = parse_tool_path(&path)?;
+                match workspace.stat(path.clone()).await {
+                    Ok(metadata) if metadata.kind != FileKind::File => {
+                        return Err(path_not_file());
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == WorkspaceErrorKind::NotFound => {}
+                    Err(error) => return Err(map_workspace_error(error)),
                 }
                 prepared.push(PreparedOperation {
                     path,
@@ -240,19 +266,26 @@ async fn prepare_operations(
                 });
             }
             PatchOperation::Delete { path } => {
-                let path = workspace.resolve_for_write(&path).await?;
-                ensure_regular_file(&path).await?;
+                let path = parse_tool_path(&path)?;
+                ensure_regular_file(workspace, path.clone()).await?;
                 prepared.push(PreparedOperation {
                     path,
                     change: PreparedChange::Delete,
                 });
             }
             PatchOperation::Update { path, hunks } => {
-                let path = workspace.resolve_for_write(&path).await?;
-                ensure_regular_file(&path).await?;
-                let bytes = tokio::fs::read(&path)
+                let path = parse_tool_path(&path)?;
+                ensure_regular_file(workspace, path.clone()).await?;
+                let bytes = workspace
+                    .read(ReadRequest {
+                        path: path.clone(),
+                        offset: 0,
+                        length: None,
+                        max_bytes: MAX_PATCH_BYTES as u64,
+                    })
                     .await
-                    .map_err(|_| path_unavailable())?;
+                    .map_err(map_workspace_error)?
+                    .bytes;
                 if bytes.len() > MAX_PATCH_BYTES {
                     return Err(invalid_patch("patched file exceeds the 1 MiB limit"));
                 }
@@ -301,11 +334,15 @@ fn validate_patch_path(path: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-async fn ensure_regular_file(path: &Path) -> Result<(), ToolError> {
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .map_err(|_| path_unavailable())?;
-    if !metadata.is_file() {
+async fn ensure_regular_file(
+    workspace: &dyn WorkspaceFs,
+    path: WorkspacePath,
+) -> Result<(), ToolError> {
+    let metadata = workspace.stat(path).await.map_err(map_workspace_error)?;
+    if metadata.kind == FileKind::Symlink {
+        return Err(path_is_symlink());
+    }
+    if metadata.kind != FileKind::File {
         return Err(path_not_file());
     }
     Ok(())
@@ -331,14 +368,10 @@ fn path_not_file() -> ToolError {
     )
 }
 
-fn path_unavailable() -> ToolError {
-    ToolError::new("path_unavailable", "a patch target is unavailable", false)
-}
-
-fn patch_write_failed() -> ToolError {
+fn path_is_symlink() -> ToolError {
     ToolError::new(
-        "patch_write_failed",
-        "the patch could not be committed",
+        "path_is_symlink",
+        "patch tools do not write through symbolic links",
         false,
     )
 }

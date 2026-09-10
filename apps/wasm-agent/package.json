@@ -1,0 +1,24 @@
+{
+  "name": "@mina/wasm-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @mina/browser-agent build:dev && vite --host 127.0.0.1 --port 3002",
+    "build": "pnpm --filter @mina/browser-agent build && vite build",
+    "check": "pnpm --filter @mina/browser-agent check && tsc --noEmit"
+  },
+  "dependencies": {
+    "@xinjiyuan97/chat-core": "file:../web/vendor/xinjiyuan97-chat-core-0.2.0.tgz",
+    "@xinjiyuan97/chat-ui": "file:../web/vendor/xinjiyuan97-chat-ui-0.2.0.tgz",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "@mina/browser-agent": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
+    "typescript": "5.9.3",
+    "vite": "^7.3.6"
+  }
+}

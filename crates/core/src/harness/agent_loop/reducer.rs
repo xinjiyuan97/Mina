@@ -21,6 +21,7 @@ use crate::harness::{
     ToolBindingKind, ToolCompletion, ToolConcurrency, ToolErrorCategory, ToolExecutionPolicy,
     ToolRiskLevel, ToolSetSnapshot, ToolSuspension, WaitSpec,
 };
+use crate::skill::SkillLock;
 
 /// Version of the JSON request/response boundary exposed by the reducer.
 pub const AGENT_LOOP_REDUCER_PROTOCOL_VERSION: u32 = 1;
@@ -57,6 +58,8 @@ pub struct AgentLoopStart {
     pub prior_messages: Vec<ModelMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_lock: Option<SkillLock>,
     pub config: AgentLoopReducerConfig,
 }
 
@@ -258,6 +261,8 @@ pub struct AgentLoopReducerState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_lock: Option<SkillLock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     previous_tool_set: Option<ToolSetIdentity>,
     next_effect_sequence: u32,
     phase: AgentLoopPhase,
@@ -417,6 +422,7 @@ impl AgentLoopReducer {
             completed_usage: zero_usage(),
             next_step: 0,
             context_fingerprint: start.context_fingerprint,
+            skill_lock: start.skill_lock,
             previous_tool_set: None,
             next_effect_sequence: 0,
             phase: AgentLoopPhase::Terminal {
@@ -681,6 +687,9 @@ fn reduce_model_event(
     let mut events = Vec::new();
     match event {
         ModelEvent::Accepted { .. } => {}
+        ModelEvent::ReasoningStarted { redacted } => {
+            events.push(AgentEvent::ReasoningStarted { redacted });
+        }
         ModelEvent::ReasoningDelta { delta } => {
             if !delta.is_empty() {
                 turn.assistant_reasoning.push_str(&delta);
@@ -690,11 +699,44 @@ fn reduce_model_event(
                 });
             }
         }
+        ModelEvent::ReasoningCompleted { redacted } => {
+            events.push(AgentEvent::ReasoningCompleted { redacted });
+        }
         ModelEvent::TextDelta { delta } => {
             if !delta.is_empty() {
                 turn.assistant_text.push_str(&delta);
                 events.push(AgentEvent::text_delta(delta));
             }
+        }
+        ModelEvent::ProviderToolCallStarted {
+            call_id,
+            name,
+            arguments,
+        } => {
+            if !turn.seen_call_ids.insert(call_id.clone()) {
+                return fail(
+                    state,
+                    "upstream_protocol_violation",
+                    "model emitted a duplicate tool call id",
+                    false,
+                );
+            }
+            events.push(AgentEvent::ToolCallStarted {
+                call_id: call_id.clone(),
+                name,
+            });
+            events.push(AgentEvent::ToolExecutionStarted { call_id, arguments });
+        }
+        ModelEvent::ProviderToolCallCompleted { call_id, output } => {
+            if !turn.seen_call_ids.contains(&call_id) {
+                return fail(
+                    state,
+                    "upstream_protocol_violation",
+                    "model completed a provider tool before it started",
+                    false,
+                );
+            }
+            events.push(AgentEvent::ToolExecutionCompleted { call_id, output });
         }
         ModelEvent::ToolCallStarted { call_id, name } => {
             if !turn.seen_call_ids.insert(call_id.clone()) {
@@ -781,6 +823,14 @@ fn model_completed(
                 false,
             );
         }
+        // A completed checkpoint is also the canonical conversation for the
+        // next turn. Keep the final answer here instead of relying on a UI
+        // projection to reconstruct it from streamed deltas.
+        state.messages.push(ModelMessage::assistant_tool_calls(
+            turn.assistant_text,
+            turn.assistant_reasoning,
+            Vec::new(),
+        ));
         state.phase = AgentLoopPhase::Terminal {
             outcome: AgentLoopOutcome::Complete { finish_reason },
         };
@@ -1517,6 +1567,64 @@ mod tests {
     }
 
     #[test]
+    fn completed_checkpoint_retains_final_answer_and_reasoning_for_next_turn() {
+        let started = AgentLoopReducer::start(AgentLoopStart {
+            run_id: RunId::new(),
+            input: "hello".into(),
+            attachments: Vec::new(),
+            prior_messages: Vec::new(),
+            context_fingerprint: None,
+            skill_lock: None,
+            config: config(),
+        });
+        let load_id = effect_id(&started);
+        let mut transition = AgentLoopReducer::dispatch(
+            started.state,
+            AgentLoopInput::ToolSetLoaded {
+                effect_id: load_id,
+                tool_set: tool_set(),
+            },
+        );
+        let model_id = effect_id(&transition);
+        for event in [
+            ModelEvent::ReasoningDelta {
+                delta: "thinking".into(),
+            },
+            ModelEvent::TextDelta {
+                delta: "hello back".into(),
+            },
+            ModelEvent::Completed {
+                finish_reason: FinishReason::Stop,
+            },
+        ] {
+            transition = AgentLoopReducer::dispatch(
+                transition.state,
+                AgentLoopInput::ModelEvent {
+                    effect_id: model_id.clone(),
+                    event,
+                },
+            );
+        }
+        let checkpoint = serde_json::to_string(&transition.state).expect("checkpoint");
+        let restored: AgentLoopReducerState = serde_json::from_str(&checkpoint).expect("restore");
+        let answer = restored.messages.last().expect("final assistant message");
+        assert_eq!(answer.role, crate::harness::ModelRole::Assistant);
+        assert_eq!(answer.content, "hello back");
+        assert_eq!(answer.reasoning, "thinking");
+        let next = AgentLoopReducer::start(AgentLoopStart {
+            run_id: RunId::new(),
+            input: "continue".into(),
+            attachments: Vec::new(),
+            prior_messages: restored.messages.into_iter().skip(1).collect(),
+            context_fingerprint: None,
+            skill_lock: None,
+            config: config(),
+        });
+        assert_eq!(next.state.messages[2].content, "hello back");
+        assert_eq!(next.state.messages[3].content, "continue");
+    }
+
+    #[test]
     fn drives_model_tool_model_without_host_specific_io() {
         let run_id = RunId::new();
         let started = AgentLoopReducer::start(AgentLoopStart {
@@ -1525,6 +1633,7 @@ mod tests {
             attachments: Vec::new(),
             prior_messages: Vec::new(),
             context_fingerprint: None,
+            skill_lock: None,
             config: config(),
         });
         assert!(matches!(
@@ -1603,6 +1712,155 @@ mod tests {
     }
 
     #[test]
+    fn exposes_provider_tools_without_entering_local_tool_execution() {
+        let started = AgentLoopReducer::start(AgentLoopStart {
+            run_id: RunId::new(),
+            input: "find current information".into(),
+            attachments: Vec::new(),
+            prior_messages: Vec::new(),
+            context_fingerprint: None,
+            skill_lock: None,
+            config: config(),
+        });
+        let load_id = effect_id(&started);
+        let loaded = AgentLoopReducer::dispatch(
+            started.state,
+            AgentLoopInput::ToolSetLoaded {
+                effect_id: load_id,
+                tool_set: tool_set(),
+            },
+        );
+        let model_id = effect_id(&loaded);
+
+        let started_search = AgentLoopReducer::dispatch(
+            loaded.state,
+            AgentLoopInput::ModelEvent {
+                effect_id: model_id.clone(),
+                event: ModelEvent::ProviderToolCallStarted {
+                    call_id: "ws_1".into(),
+                    name: "web_search".into(),
+                    arguments: json!({"status": "searching"}),
+                },
+            },
+        );
+        assert!(matches!(
+            started_search.events.as_slice(),
+            [
+                AgentEvent::ToolCallStarted { call_id, name },
+                AgentEvent::ToolExecutionStarted { call_id: execution_id, .. }
+            ] if call_id == "ws_1" && name == "web_search" && execution_id == "ws_1"
+        ));
+
+        let completed_search = AgentLoopReducer::dispatch(
+            started_search.state,
+            AgentLoopInput::ModelEvent {
+                effect_id: model_id.clone(),
+                event: ModelEvent::ProviderToolCallCompleted {
+                    call_id: "ws_1".into(),
+                    output: r#"{"status":"completed"}"#.into(),
+                },
+            },
+        );
+        assert!(matches!(
+            completed_search.events.as_slice(),
+            [AgentEvent::ToolExecutionCompleted { call_id, .. }] if call_id == "ws_1"
+        ));
+
+        let completed = AgentLoopReducer::dispatch(
+            completed_search.state,
+            AgentLoopInput::ModelEvent {
+                effect_id: model_id,
+                event: ModelEvent::Completed {
+                    finish_reason: FinishReason::Stop,
+                },
+            },
+        );
+        assert!(matches!(
+            completed.outcome,
+            AgentLoopOutcome::Complete { .. }
+        ));
+        assert!(completed.effects.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_round_trip_preserves_skill_lock() {
+        let skill_lock = SkillLock {
+            skills: vec![agent_core_skill_locked("browser-helper")],
+            compiler_version: crate::skill::SKILL_COMPILER_VERSION,
+            compiled_instruction_digest: "sha256:compiled".into(),
+        };
+        let started = AgentLoopReducer::start(AgentLoopStart {
+            run_id: RunId::new(),
+            input: "use skill".into(),
+            attachments: Vec::new(),
+            prior_messages: Vec::new(),
+            context_fingerprint: Some(skill_lock.compiled_instruction_digest.clone()),
+            skill_lock: Some(skill_lock.clone()),
+            config: config(),
+        });
+
+        let checkpoint = serde_json::to_string(&started.state).expect("serialize checkpoint");
+        let restored: AgentLoopReducerState =
+            serde_json::from_str(&checkpoint).expect("deserialize checkpoint");
+        assert_eq!(restored.skill_lock, Some(skill_lock));
+    }
+
+    fn agent_core_skill_locked(id: &str) -> crate::skill::LockedSkill {
+        crate::skill::LockedSkill {
+            skill_id: crate::skill::SkillId(id.into()),
+            version: "1.0.0".into(),
+            digest: "sha256:package".into(),
+            store_identity: "skills:opfs:test".into(),
+        }
+    }
+
+    #[test]
+    fn exposes_reasoning_lifecycle_without_reasoning_text() {
+        let started = AgentLoopReducer::start(AgentLoopStart {
+            run_id: RunId::new(),
+            input: "answer carefully".into(),
+            attachments: Vec::new(),
+            prior_messages: Vec::new(),
+            context_fingerprint: None,
+            skill_lock: None,
+            config: config(),
+        });
+        let load_id = effect_id(&started);
+        let loaded = AgentLoopReducer::dispatch(
+            started.state,
+            AgentLoopInput::ToolSetLoaded {
+                effect_id: load_id,
+                tool_set: tool_set(),
+            },
+        );
+        let model_id = effect_id(&loaded);
+
+        let reasoning_started = AgentLoopReducer::dispatch(
+            loaded.state,
+            AgentLoopInput::ModelEvent {
+                effect_id: model_id.clone(),
+                event: ModelEvent::ReasoningStarted { redacted: true },
+            },
+        );
+        assert_eq!(
+            reasoning_started.events,
+            vec![AgentEvent::ReasoningStarted { redacted: true }]
+        );
+
+        let reasoning_completed = AgentLoopReducer::dispatch(
+            reasoning_started.state,
+            AgentLoopInput::ModelEvent {
+                effect_id: model_id,
+                event: ModelEvent::ReasoningCompleted { redacted: true },
+            },
+        );
+        assert_eq!(
+            reasoning_completed.events,
+            vec![AgentEvent::ReasoningCompleted { redacted: true }]
+        );
+    }
+
+    #[test]
     fn rejects_stale_effect_results() {
         let started = AgentLoopReducer::start(AgentLoopStart {
             run_id: RunId::new(),
@@ -1610,6 +1868,7 @@ mod tests {
             attachments: Vec::new(),
             prior_messages: Vec::new(),
             context_fingerprint: None,
+            skill_lock: None,
             config: config(),
         });
         let transition = AgentLoopReducer::dispatch(
@@ -1634,6 +1893,7 @@ mod tests {
             attachments: Vec::new(),
             prior_messages: Vec::new(),
             context_fingerprint: None,
+            skill_lock: None,
             config: config(),
         });
         let load_id = effect_id(&started);

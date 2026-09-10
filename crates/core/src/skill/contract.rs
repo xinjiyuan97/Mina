@@ -137,9 +137,22 @@ pub struct SkillStoreCapabilities {
     pub deletable: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub type SkillFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SkillStoreError>> + Send + 'a>>;
+#[cfg(target_arch = "wasm32")]
+pub type SkillFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SkillStoreError>> + 'a>>;
 
-pub trait SkillStore: Send + Sync + 'static {
+#[cfg(not(target_arch = "wasm32"))]
+pub trait SkillRuntime: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> SkillRuntime for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait SkillRuntime {}
+#[cfg(target_arch = "wasm32")]
+impl<T> SkillRuntime for T {}
+
+pub trait SkillStore: SkillRuntime + 'static {
     fn descriptor(&self) -> ComponentDescriptor;
     fn capabilities(&self) -> SkillStoreCapabilities;
     fn list(&self, query: SkillStoreQuery) -> SkillFuture<'_, Vec<SkillDescriptor>>;
