@@ -14,6 +14,7 @@ mina/
 │   ├── core/                 # agent-core：AgentLoop、稳定契约、Context/Memory/Skill
 │   ├── harness/              # agent-harness：Run runtime、Event/Job/Flow、QuickJS/ADF
 │   └── extension/            # agent-extension：Provider/Tool/Sandbox/Store/Tracing/ADF adapters
+│   └── multi/                # agent-multi：Sub-Pub 与多 Agent Pattern
 ├── contracts/tool/v1/       # C ABI 头文件与 JSON Schema
 └── docs/                     # 架构与协议设计
 ```
@@ -167,3 +168,16 @@ Tool failure 统一包含稳定 `code`、`category`、安全 `message`、`retrya
 - [跨环境 Workspace FS 契约与实现](./docs/15-workspace-filesystem.md)
 
 The browser runtime is available as the headless [`@mina/browser-agent` SDK](packages/browser-agent/README.md); `apps/wasm-agent` is its React demo. The host system prompt is embedded in WASM.
+
+### 多 Agent 调用链
+
+```text
+agent-core -> agent-harness -> agent-multi
+                              ├─ EventBus / Sub-Pub
+                              ├─ Supervisor / Discussion
+                              └─ SQLite Durable Bus
+```
+
+`agent-multi` 的内存总线用于本地与测试；SQLite 提供 replay、offset、ack
+和幂等发布。多 Agent 任务使用稳定的 message/correlation ID，并按至少一次
+投递语义实现幂等处理。

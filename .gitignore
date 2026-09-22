@@ -4,6 +4,7 @@
 
 # Node / Next.js
 node_modules/
+/.pnpm-store/
 .next/
 out/
 *.tsbuildinfo
@@ -21,3 +22,6 @@ out/
 .DS_Store
 .idea/
 .vscode/
+
+# Local research artifacts
+/_claude_rev/
