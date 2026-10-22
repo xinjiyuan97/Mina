@@ -166,6 +166,14 @@ pub fn digest_only_arguments(arguments: &Value) -> Value {
     digest_only_bytes(&encoded)
 }
 
+pub fn parse_tool_arguments(arguments: &str) -> serde_json::Result<Value> {
+    if arguments.trim().is_empty() {
+        Ok(json!({}))
+    } else {
+        serde_json::from_str(arguments)
+    }
+}
+
 #[must_use]
 pub fn digest_only_bytes(bytes: &[u8]) -> Value {
     let mut hasher = Sha256::new();

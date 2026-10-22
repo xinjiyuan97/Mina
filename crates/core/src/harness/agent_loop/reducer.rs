@@ -14,6 +14,7 @@ use super::{
     ToolCallStrategy, add_usage, digest_only_arguments, digest_only_bytes, rejection_message,
     step_limit_tool_error_content, tool_error_content,
 };
+use crate::harness::tool::parse_tool_arguments;
 use crate::harness::{
     AgentEvent, ApprovalDecision, ApprovalId, ApprovalResolution, EffectRequest, FinishReason,
     MachineError, ModelAttachment, ModelEvent, ModelMessage, ModelRequest, ModelToolCall,
@@ -960,7 +961,7 @@ fn prepare_call(
         )));
     };
     let arguments: Value =
-        match serde_json::from_str(&call.arguments) {
+        match parse_tool_arguments(&call.arguments) {
             Ok(arguments) => arguments,
             Err(_) => {
                 let event = (binding.argument_visibility == ToolArgumentVisibility::DigestOnly)
@@ -1658,7 +1659,7 @@ mod tests {
             },
             ModelEvent::ToolCallArgumentsDelta {
                 call_id: "call-1".into(),
-                delta: "{\"name\":\"a.md\"}".into(),
+                delta: "".into(),
             },
             ModelEvent::Completed {
                 finish_reason: FinishReason::ToolCall,
@@ -1691,6 +1692,10 @@ mod tests {
             transition.effects[0].kind,
             AgentLoopEffectKind::InvokeTool { .. }
         ));
+        let AgentLoopEffectKind::InvokeTool { ref call, .. } = transition.effects[0].kind else {
+            unreachable!();
+        };
+        assert_eq!(call.arguments, json!({}));
         let tool_id = effect_id(&transition);
         transition = AgentLoopReducer::dispatch(
             transition.state,
@@ -1709,6 +1714,27 @@ mod tests {
             transition.effects[0].kind,
             AgentLoopEffectKind::LoadToolSet { .. }
         ));
+    }
+
+    #[test]
+    fn parses_empty_tool_arguments_as_an_empty_object_and_rejects_malformed_json() {
+        for arguments in ["", "   ", "{}"] {
+            let call = ModelToolCall {
+                id: "call-1".into(),
+                name: "artifact_write".into(),
+                arguments: arguments.into(),
+            };
+            let (invocation, _) = prepare_call(&tool_set(), &call).expect("arguments should parse");
+            assert_eq!(invocation.arguments, json!({}));
+        }
+
+        let call = ModelToolCall {
+            id: "call-1".into(),
+            name: "artifact_write".into(),
+            arguments: "{".into(),
+        };
+        let error = prepare_call(&tool_set(), &call).expect_err("malformed JSON should reject");
+        assert_eq!(error.0.code, "invalid_tool_arguments");
     }
 
     #[test]

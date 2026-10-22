@@ -32,3 +32,6 @@ pub mod store;
 
 #[cfg(feature = "observability-tracing")]
 pub mod observability;
+
+#[cfg(feature = "agent-chat")]
+pub mod output;

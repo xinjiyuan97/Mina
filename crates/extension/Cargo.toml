@@ -41,6 +41,7 @@ sqlite = ["dep:rusqlite", "dep:tokio"]
 filesystem = ["dep:sha2", "dep:tokio", "dep:toml"]
 observability-tracing = ["dep:async-stream", "dep:futures-util", "dep:tokio", "dep:tracing"]
 context-model = ["dep:futures-util", "dep:sha2", "dep:tokio"]
+agent-chat = []
 full = [
     "adf",
     "openai",
@@ -53,7 +54,12 @@ full = [
     "context-model",
     "workspace-native",
     "workspace-skill",
+    "agent-chat",
 ]
+
+[[example]]
+name = "frame_shapes"
+required-features = ["agent-chat"]
 
 [dependencies]
 agent-core.workspace = true

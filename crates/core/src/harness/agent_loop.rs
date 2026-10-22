@@ -8,7 +8,7 @@ use async_stream::stream;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 
-use crate::harness::tool::{digest_only_arguments, digest_only_bytes};
+use crate::harness::tool::{digest_only_arguments, digest_only_bytes, parse_tool_arguments};
 use crate::harness::{
     Agent, AgentEvent, AgentEventStream, AgentMetadata, ApprovalDecision, ApprovalError,
     ApprovalId, ApprovalPort, ApprovalRequest, ApprovalResolution, FinishReason, ModelEvent,
@@ -714,7 +714,7 @@ fn prepare_legacy_call<T: ToolPort>(
         .map_or(ToolArgumentVisibility::DigestOnly, |binding| {
             binding.argument_visibility
         });
-    let arguments: serde_json::Value = match serde_json::from_str(&call.arguments) {
+    let arguments: serde_json::Value = match parse_tool_arguments(&call.arguments) {
         Ok(arguments) => arguments,
         Err(_) => {
             let events = if visibility == ToolArgumentVisibility::DigestOnly {
@@ -1186,7 +1186,7 @@ mod tests {
                     },
                     ModelEvent::ToolCallArgumentsDelta {
                         call_id: "call_1".into(),
-                        delta: "{}".into(),
+                        delta: "".into(),
                     },
                     ModelEvent::Usage {
                         usage: TokenUsage {
