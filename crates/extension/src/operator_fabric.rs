@@ -111,8 +111,14 @@ fn validate_events(events: &[FabricEvent], allow_empty: bool) -> Result<(), Fabr
         if bytes > MAX_BATCH_BYTES {
             return Err(invalid("batch byte limit"));
         }
+        let legacy_context = event.envelope.engine_version == EngineVersion::LegacyMachine
+            && event.topic == agent_core::context_operator::CONTEXT_TOPIC
+            && matches!(
+                event.envelope.event_type.as_str(),
+                "run.requested" | "context.requested" | "context.completed" | "context.failed"
+            );
         if event.envelope.delivery_class != DeliveryClass::Durable
-            || event.envelope.engine_version != EngineVersion::OperatorV1
+            || (event.envelope.engine_version != EngineVersion::OperatorV1 && !legacy_context)
         {
             return Err(invalid("only operator_v1 durable events are supported"));
         }
@@ -188,12 +194,18 @@ impl FabricState {
                     return Err(FabricError::Conflict);
                 }
             } else {
-                let previous = self
+                let previous_event = self
                     .events
                     .iter()
                     .rev()
-                    .find(|stored| same_partition(&stored.event, &event))
-                    .map_or(0, |stored| stored.event.envelope.operator_seq.0);
+                    .find(|stored| same_partition(&stored.event, &event));
+                if previous_event.is_some_and(|stored| {
+                    stored.event.envelope.engine_version != event.envelope.engine_version
+                }) {
+                    return Err(invalid("engine version cannot change within a run"));
+                }
+                let previous =
+                    previous_event.map_or(0, |stored| stored.event.envelope.operator_seq.0);
                 if previous.checked_add(1) != Some(event.envelope.operator_seq.0) {
                     return Err(invalid("non-contiguous partition sequence"));
                 }
@@ -229,6 +241,39 @@ impl FabricState {
 
     pub(crate) fn apply(&mut self, command: FabricCommand) -> Result<FabricReply, FabricError> {
         match command {
+            FabricCommand::ScanEvents {
+                topic,
+                event_type,
+                after,
+                limit: page_limit,
+            } => {
+                limit(page_limit)?;
+                key(&topic)?;
+                key(&event_type)?;
+                Ok(FabricReply::Replay(
+                    self.events
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, stored)| {
+                            stored.visible
+                                && *index as u64 + 1 > after
+                                && stored.event.topic == topic
+                                && stored.event.envelope.event_type == event_type
+                        })
+                        .take(page_limit)
+                        .map(|(index, stored)| ReplayItem {
+                            offset: index as u64 + 1,
+                            event: stored.event.clone(),
+                        })
+                        .collect(),
+                ))
+            }
+            FabricCommand::ReadEvent(event_id) => Ok(FabricReply::Event(
+                self.events
+                    .iter()
+                    .find(|stored| stored.visible && stored.event.envelope.event_id == event_id)
+                    .map(|stored| stored.event.clone()),
+            )),
             FabricCommand::Publish(event) => self.publish(vec![event], true),
             FabricCommand::PublishBatch(events) => self.publish(events, true),
             FabricCommand::Subscribe(spec) => {

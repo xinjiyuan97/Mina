@@ -8,7 +8,7 @@ use std::{
 
 use agent_core::adf::RunScopedJavaScriptPolicy;
 use agent_core::context::{
-    ContextArtifactStore, ContextBudget, ContextBuildRequest, ContextCompressor, ContextEngine,
+    ContextArtifactStore, ContextBudget, ContextCompressor, ContextEngine,
     DeterministicSummaryGenerator, FallbackSummaryGenerator, HeuristicTokenEstimator,
     HybridCompressor, NoopFailCompressor, SlidingWindowCompressor, SummaryGenerator,
     TokenEstimator,
@@ -40,8 +40,7 @@ use agent_core::observability::ObservationHook;
 use agent_core::sandbox::{ProcessSandbox, ProcessSandboxDescriptor};
 use agent_core::script::{ScriptLimits, ScriptRuntime, ScriptRuntimeDescriptor};
 use agent_core::skill::{
-    ComponentDescriptor, ResolveSkillsRequest, ResolvedSkill, SkillDescriptor, SkillId,
-    SkillOrchestrator, SkillStore,
+    ComponentDescriptor, SkillDescriptor, SkillId, SkillOrchestrator, SkillStore,
 };
 use agent_extension::adf::{InMemoryAdfArtifactStore, RunAdfToolSession};
 use agent_extension::context::ModelSummaryGenerator;
@@ -62,7 +61,7 @@ use agent_extension::workspace::{NativeWorkspaceFs, WorkspaceFs};
 use agent_harness::{
     ContextStrategy, EventRuntime, EventRuntimeConfig, FlowEffectRuntime, FlowEffectRuntimeConfig,
     Harness, HarnessConfig, HarnessError, JobRuntime, JobRuntimeConfig, OrchestrationConfig,
-    PlannedRun, QuickJsConfig, RunRuntime, RunRuntimeError, StartedRun,
+    QuickJsConfig, RunRuntime, RunRuntimeError, StartedRun,
     adf::JavaScriptAdfExecutor,
     script::{QuickJsRuntime, QuickJsRuntimeConfig},
 };
@@ -87,6 +86,8 @@ use tokio::{
 use tracing_subscriber::EnvFilter;
 
 use agent_harness as run_runtime;
+use agent_harness::context_operator::PreparedRun;
+mod admission;
 
 const MAX_BLOB_BYTES: usize = 10 * 1_048_576;
 const MAX_RUN_ATTACHMENTS: usize = 8;
@@ -99,6 +100,7 @@ type AppRuntimeAgent = ObservedMachine<ServerAgentLoop>;
 
 #[derive(Clone)]
 struct AppState {
+    admission: Arc<agent_harness::context_operator::AdmissionFacade>,
     runtime: RunRuntime<AppRuntimeAgent>,
     config: Arc<HarnessConfig>,
     approvals: InMemoryApprovalBroker,
@@ -109,8 +111,7 @@ struct AppState {
 
 struct OrchestrationRuntime {
     sessions: Arc<dyn SessionStore>,
-    context: ContextEngine,
-    skills: SkillOrchestrator,
+    skills: Arc<SkillOrchestrator>,
     memory_store: Arc<dyn MemoryStore>,
     memory_proposals: Arc<dyn MemoryProposalStore>,
     memory_extractor: Arc<dyn MemoryExtractor>,
@@ -826,12 +827,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         orchestration_config.skill_directory.clone(),
         "skills:filesystem-primary",
     ));
-    let skills = SkillOrchestrator::new(skill_store);
+    let skills = Arc::new(SkillOrchestrator::new(skill_store));
     let event_adapter =
         Arc::new(SqliteEventStore::open(&store_path, "events:sqlite-primary").await?);
     let event_store: Arc<dyn EventStore> = event_adapter.clone();
     let flow_store: Arc<dyn FlowStore> = event_adapter.clone();
-    let job_store: Arc<dyn JobStore> = event_adapter;
+    let job_store: Arc<dyn JobStore> = event_adapter.clone();
+    let admission = Arc::new(agent_harness::context_operator::AdmissionFacade::new(
+        event_adapter,
+        Arc::clone(&blobs),
+        Arc::new(agent_harness::context_operator::AgentContextPreparer {
+            context,
+            skills: Arc::clone(&skills),
+        }),
+    ));
+    admission.start_worker();
     let delivery_router: Arc<dyn DeliveryRouter> = Arc::new(ServerDeliveryRouter {
         memories: Arc::clone(&memory_store),
         proposals: Arc::clone(&memory_proposals),
@@ -863,7 +873,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = RunRuntime::new_durable(harness, store, flow_store, move |run_id| {
         approval_cleanup.remove_run(run_id);
     });
-    let recovered = runtime.recover_interrupted().await?;
+    let pending_context = admission
+        .requests()
+        .await?
+        .into_iter()
+        .map(|request| request.run_id)
+        .collect();
+    let recovered = runtime.recover_interrupted_except(&pending_context).await?;
     if recovered > 0 {
         tracing::warn!(
             recovered,
@@ -891,6 +907,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     start_session_finalization_worker(Arc::clone(&sessions));
 
     let state = AppState {
+        admission,
         runtime,
         config: Arc::clone(&config),
         approvals,
@@ -898,7 +915,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         blobs,
         orchestration: Arc::new(OrchestrationRuntime {
             sessions,
-            context,
             skills,
             memory_store,
             memory_proposals,
@@ -922,6 +938,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tool_runtime,
         }),
     };
+    admission::start_recovery_worker(state.clone());
     start_event_workers(events, flow_effects, jobs);
     let app = Router::new()
         .route("/healthz", get(health))
@@ -1457,6 +1474,10 @@ async fn create_run(
     State(state): State<AppState>,
     Json(request): Json<CreateRunRequest>,
 ) -> Response {
+    admission::owned(async move { create_run_owned(state, request).await }).await
+}
+
+async fn create_run_owned(state: AppState, request: CreateRunRequest) -> Response {
     let run_id = RunId::new();
     let max_steps = match effective_run_max_steps(&state, request.max_steps) {
         Ok(max_steps) => max_steps,
@@ -1483,7 +1504,7 @@ async fn create_run(
         Ok(prepared) => prepared,
         Err(error) => return error,
     };
-    let started = match state.runtime.start_planned(prepared.plan).await {
+    let started = match state.runtime.start_context_plan(prepared.plan, false).await {
         Ok(started) => started,
         Err(error) => return map_runtime_error(error),
     };
@@ -1496,12 +1517,6 @@ async fn create_run(
         Ok(response) => Json(response).into_response(),
         Err(error) => map_harness_error(error).into_response(),
     }
-}
-
-struct PreparedRun {
-    plan: PlannedRun,
-    context_fingerprint: String,
-    max_steps: u32,
 }
 
 struct PrepareRunRequest {
@@ -1518,145 +1533,7 @@ async fn prepare_run_plan(
     state: &AppState,
     request: PrepareRunRequest,
 ) -> Result<PreparedRun, Response> {
-    let PrepareRunRequest {
-        run_id,
-        input,
-        attachments,
-        explicit_skills,
-        max_steps,
-        session_id,
-        through_message_ordinal,
-    } = request;
-    if input.trim().is_empty() && attachments.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_input",
-            "input or attachments must not be empty",
-            false,
-        ));
-    }
-    let defaults = state
-        .orchestration
-        .config
-        .default_skills
-        .iter()
-        .map(|skill| (SkillId(skill.skill_id.clone()), skill.version.clone()))
-        .collect();
-    let explicit = explicit_skills
-        .into_iter()
-        .map(|skill| (SkillId(skill.skill_id), skill.version))
-        .collect();
-    let resolved_skills = state
-        .orchestration
-        .skills
-        .resolve(ResolveSkillsRequest {
-            explicit,
-            profile_defaults: defaults,
-            current_input: input.clone(),
-            max_skills: state.orchestration.config.max_skills,
-        })
-        .await
-        .map_err(|error| {
-            api_error(
-                StatusCode::BAD_REQUEST,
-                "skill_resolution_failed",
-                error.to_string(),
-                false,
-            )
-        })?;
-    let request_digest = request_digest(&input, &attachments, &resolved_skills);
-    let memory_scopes = if state.orchestration.config.memory_enabled {
-        let mut scopes = vec![MemoryScope(state.orchestration.config.memory_scope.clone())];
-        if let Some(session_id) = session_id {
-            scopes.push(MemoryScope(format!("session:{session_id}")));
-        }
-        scopes
-    } else {
-        vec![MemoryScope("__memory_disabled__".into())]
-    };
-    let pack = state
-        .orchestration
-        .context
-        .build(ContextBuildRequest {
-            run_id,
-            session_id,
-            through_message_ordinal,
-            current_input: input.clone(),
-            request_digest: request_digest.clone(),
-            agent_profile: state.orchestration.agent_profile.clone(),
-            agent_instruction: state.orchestration.agent_instruction.clone(),
-            model_profile: state.orchestration.model_profile.clone(),
-            resolved_skills,
-            memory_scopes,
-            available_tools: state
-                .orchestration
-                .tools
-                .iter()
-                .map(|tool| tool.name.clone())
-                .collect(),
-            max_memories: state.orchestration.config.max_memories,
-            budget: ContextBudget {
-                model_context_tokens: state.orchestration.model_context_tokens,
-                reserved_output_tokens: state.orchestration.reserved_output_tokens,
-                reserved_tool_schema_tokens: state.orchestration.config.reserved_tool_schema_tokens,
-                max_skill_tokens: state.orchestration.config.max_skill_tokens,
-                max_memory_tokens: state.orchestration.config.max_memory_tokens,
-                max_history_tokens: state.orchestration.config.max_history_tokens,
-            },
-            policy_version: state.orchestration.config.context_policy_version,
-            now_ms: run_runtime::unix_time_ms(),
-        })
-        .await
-        .map_err(|error| {
-            api_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "context_build_failed",
-                error.to_string(),
-                false,
-            )
-        })?;
-    let context_fingerprint = pack.fingerprint.clone();
-    let allow_run_adf = state.config.adf().enabled;
-    let manifest = serde_json::json!({
-        "schema_version": 1,
-        "context_fingerprint": pack.fingerprint,
-        "context_budget": pack.budget,
-        "skill_refs": pack.skill_refs,
-        "memory_refs": pack.memory_refs,
-        "artifact_refs": pack.artifact_refs,
-        "components": pack.component_descriptors,
-        "token_accounting": {
-            "provider_usage_preferred": true,
-            "fallback": "token_estimator"
-        },
-        "step_budget": {
-            "max_steps": max_steps,
-            "final_summary_step": true
-        },
-        "tool_grants": {
-            "static_tools": &pack.effective_tools,
-            "allow_run_adf": allow_run_adf,
-        },
-        "tool_runtime": {
-            "script": state.orchestration.tool_runtime.script_runtime.as_ref(),
-            "adf_enabled": allow_run_adf,
-        }
-    });
-    Ok(PreparedRun {
-        plan: PlannedRun {
-            run_id,
-            input,
-            attachments,
-            prior_messages: pack.messages,
-            allowed_tools: Some(pack.effective_tools),
-            allow_run_adf,
-            max_steps: Some(max_steps),
-            context_fingerprint: Some(context_fingerprint.clone()),
-            execution_manifest: Some(manifest),
-        },
-        context_fingerprint,
-        max_steps,
-    })
+    admission::prepare(state, request).await
 }
 
 async fn create_session(
@@ -1748,6 +1625,15 @@ async fn submit_session_run(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     Json(request): Json<SubmitSessionRunRequest>,
+) -> Response {
+    admission::owned(async move { submit_session_run_owned(state, session_id, request).await })
+        .await
+}
+
+async fn submit_session_run_owned(
+    state: AppState,
+    session_id: String,
+    request: SubmitSessionRunRequest,
 ) -> Response {
     let Some(session_id) = parse_session_id(&session_id) else {
         return invalid_session_id();
@@ -1853,6 +1739,9 @@ async fn submit_session_run(
     {
         Ok(prepared) => prepared,
         Err(response) => {
+            if response.status().is_server_error() {
+                return response;
+            }
             if let Ok(snapshot) = state
                 .runtime
                 .fail_persisted(
@@ -1876,7 +1765,7 @@ async fn submit_session_run(
         }
     };
     let context_fingerprint = prepared.context_fingerprint.clone();
-    let started = match state.runtime.start_persisted(prepared.plan).await {
+    let started = match state.runtime.start_context_plan(prepared.plan, true).await {
         Ok(started) => started,
         Err(error) => {
             if let Ok(snapshot) = state
@@ -2798,25 +2687,6 @@ fn map_run_max_steps_error(error: RunMaxStepsError) -> Response {
     )
 }
 
-fn request_digest(
-    input: &str,
-    attachments: &[ModelAttachment],
-    skills: &[ResolvedSkill],
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    for attachment in attachments {
-        hasher.update(attachment.blob_id.to_string().as_bytes());
-        hasher.update(attachment.media_type.as_bytes());
-    }
-    for skill in skills {
-        hasher.update((skill.locked.skill_id).0.as_bytes());
-        hasher.update(skill.locked.version.as_bytes());
-        hasher.update(skill.locked.digest.as_bytes());
-    }
-    format!("sha256:{:x}", hasher.finalize())
-}
-
 fn raw_request_hash(
     input: &str,
     attachments: &[ModelAttachment],
@@ -3144,7 +3014,7 @@ api_key = "test-key"
         let memory_proposals: Arc<dyn MemoryProposalStore> = memory_adapter.clone();
         let memory_retriever: Arc<dyn MemoryRetriever> = memory_adapter;
         let estimator: Arc<dyn TokenEstimator> = Arc::new(HeuristicTokenEstimator);
-        let blobs: Arc<dyn BlobStore> = Arc::new(FilesystemBlobStore::new("target/test-blobs"));
+        let blobs = admission::test_blobs();
         let hook: Arc<dyn ObservationHook> = Arc::new(TracingObservationHook);
         let (agent, tools, tool_runtime) = build_agent(
             &config,
@@ -3178,7 +3048,20 @@ api_key = "test-key"
             }),
             EventRuntimeConfig::default(),
         ));
+        let skills = Arc::new(SkillOrchestrator::new(skill_store));
+        let admission = Arc::new(agent_harness::context_operator::AdmissionFacade::new(
+            Arc::new(agent_extension::operator_fabric::MemoryFabric::default()),
+            Arc::clone(&blobs),
+            Arc::new(agent_harness::context_operator::AgentContextPreparer {
+                context,
+                skills: Arc::clone(&skills),
+            }),
+        ));
+        if tokio::runtime::Handle::try_current().is_ok() {
+            admission.start_worker();
+        }
         AppState {
+            admission,
             runtime: RunRuntime::new(
                 Harness::new(ObservedMachine::new(agent, hook)),
                 store,
@@ -3190,8 +3073,7 @@ api_key = "test-key"
             blobs,
             orchestration: Arc::new(OrchestrationRuntime {
                 sessions,
-                context,
-                skills: SkillOrchestrator::new(skill_store),
+                skills,
                 memory_store: Arc::clone(&memory_store),
                 memory_proposals,
                 memory_extractor: Arc::new(RuleMemoryExtractor),

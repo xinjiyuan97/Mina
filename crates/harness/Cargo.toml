@@ -29,7 +29,7 @@ toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-agent-extension = { workspace = true, features = ["adf", "builtin-tools", "sqlite"] }
+agent-extension = { workspace = true, features = ["adf", "builtin-tools", "sqlite", "filesystem"] }
 tempfile.workspace = true
 tokio.workspace = true
 

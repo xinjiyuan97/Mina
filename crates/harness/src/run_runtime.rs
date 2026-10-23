@@ -67,6 +67,7 @@ pub struct RunRuntime<A> {
     active_runs: ActiveRuns,
     on_finished: FinishHook,
     durable: Option<Arc<DurableRuntime>>,
+    context_starts: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<A> Clone for RunRuntime<A> {
@@ -77,6 +78,7 @@ impl<A> Clone for RunRuntime<A> {
             active_runs: Arc::clone(&self.active_runs),
             on_finished: Arc::clone(&self.on_finished),
             durable: self.durable.as_ref().map(Arc::clone),
+            context_starts: Arc::clone(&self.context_starts),
         }
     }
 }
@@ -96,6 +98,7 @@ where
             active_runs: ActiveRuns::default(),
             on_finished: Arc::new(on_finished),
             durable: None,
+            context_starts: Arc::default(),
         }
     }
 
@@ -120,6 +123,7 @@ where
                 activation_lease: FLOW_ACTIVATION_LEASE,
                 activation_heartbeat: FLOW_ACTIVATION_HEARTBEAT,
             })),
+            context_starts: Arc::default(),
         }
     }
 
@@ -181,6 +185,39 @@ where
         self.store.create_run(snapshot).await?;
 
         Ok(self.launch(execution))
+    }
+
+    /// P2-only idempotent bridge; the existing flow row is the durable start receipt.
+    pub async fn start_context_plan(
+        &self,
+        plan: PlannedRun,
+        persisted: bool,
+    ) -> Result<StartedRun, RunRuntimeError> {
+        let _guard = self.context_starts.lock().await;
+        let snapshot = self.store.get_run(plan.run_id).await?;
+        if snapshot.as_ref().is_some_and(RunSnapshot::is_terminal) {
+            let (_, events) = broadcast::channel(1);
+            return Ok(StartedRun {
+                run_id: plan.run_id,
+                events,
+            });
+        }
+        if let Some(events) = self.subscribe(plan.run_id) {
+            return Ok(StartedRun {
+                run_id: plan.run_id,
+                events,
+            });
+        }
+        if let Some(durable) = &self.durable
+            && durable.flows.get(plan.run_id).await?.is_some()
+        {
+            return Ok(self.register_machine_run(plan.run_id, RunCancellation::new()));
+        }
+        if persisted || snapshot.is_some() {
+            self.start_persisted(plan).await
+        } else {
+            self.start_planned(plan).await
+        }
     }
 
     pub async fn start_persisted(&self, plan: PlannedRun) -> Result<StartedRun, RunRuntimeError> {
@@ -919,6 +956,14 @@ where
     /// future is not serializable, so restart recovery is explicit failure,
     /// never an unsafe attempt to continue an unknown execution point.
     pub async fn recover_interrupted(&self) -> Result<usize, RunStoreError> {
+        self.recover_interrupted_except(&std::collections::HashSet::new())
+            .await
+    }
+
+    pub async fn recover_interrupted_except(
+        &self,
+        pending_context: &std::collections::HashSet<RunId>,
+    ) -> Result<usize, RunStoreError> {
         let unfinished = self.store.unfinished_runs().await?;
         let mut count = 0;
         for snapshot in unfinished {
@@ -964,6 +1009,9 @@ where
                     count += 1;
                     continue;
                 }
+            }
+            if pending_context.contains(&snapshot.run_id) {
+                continue;
             }
             self.store
                 .append_event(
@@ -1131,7 +1179,7 @@ mod tests {
         },
         harness::{AgentMachine, MachineStream, WakeFlowRun},
     };
-    use agent_extension::store::{InMemoryRunStore, SqliteEventStore};
+    use agent_extension::store::{InMemoryRunStore, SqliteEventStore, SqliteRunStore};
     use async_stream::stream as async_stream;
     use futures_util::stream;
     use serde_json::json;
@@ -1763,6 +1811,83 @@ mod tests {
             events.last().map(|event| &event.kind),
             Some(RunEventKind::RunCompleted { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn p2_context_bridge_concurrent_starts_and_reopen_reuse_the_flow_receipt() {
+        for persisted in [false, true] {
+            let directory = tempdir().expect("directory");
+            let path = directory.path().join("state.sqlite");
+            let run_id = RunId::new();
+            let plan = || PlannedRun {
+                run_id,
+                input: "hello".into(),
+                attachments: vec![],
+                prior_messages: vec![],
+                allowed_tools: Some(vec![]),
+                allow_run_adf: false,
+                max_steps: Some(10),
+                context_fingerprint: Some("fingerprint".into()),
+                execution_manifest: Some(serde_json::json!({"context_fingerprint":"fingerprint"})),
+            };
+            let checkpoint;
+            {
+                let store = Arc::new(SqliteRunStore::open(&path).await.expect("run store"));
+                let flows = Arc::new(
+                    SqliteEventStore::open(&path, "p2")
+                        .await
+                        .expect("flow store"),
+                );
+                if persisted {
+                    store
+                        .create_run(RunSnapshot::new(run_id, "hello", 1))
+                        .await
+                        .expect("session placeholder");
+                }
+                let runtime = RunRuntime::new_durable(
+                    Harness::new(DurableWaitMachine {
+                        approval_id: ApprovalId::new(),
+                    }),
+                    store,
+                    flows.clone(),
+                    |_| {},
+                );
+                let (first, second) = tokio::join!(
+                    runtime.start_context_plan(plan(), persisted),
+                    runtime.start_context_plan(plan(), persisted)
+                );
+                assert_eq!(first.expect("first start").run_id, run_id);
+                assert_eq!(second.expect("idempotent start").run_id, run_id);
+                checkpoint = flows
+                    .get(run_id)
+                    .await
+                    .expect("read")
+                    .expect("flow")
+                    .checkpoint;
+            }
+            let store = Arc::new(SqliteRunStore::open(&path).await.expect("reopen run store"));
+            let flows = Arc::new(
+                SqliteEventStore::open(&path, "p2")
+                    .await
+                    .expect("reopen flow store"),
+            );
+            let runtime = RunRuntime::new_durable(
+                Harness::new(DurableWaitMachine {
+                    approval_id: ApprovalId::new(),
+                }),
+                store,
+                flows.clone(),
+                |_| {},
+            );
+            assert_eq!(runtime.recover_interrupted().await.expect("recover"), 0);
+            runtime
+                .start_context_plan(plan(), persisted)
+                .await
+                .expect("replayed context completion");
+            let flow = flows.get(run_id).await.expect("read").expect("flow");
+            assert_eq!(flow.revision, 0);
+            assert_eq!(flow.checkpoint, checkpoint);
+        }
     }
 
     #[tokio::test]

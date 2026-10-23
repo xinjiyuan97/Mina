@@ -6,6 +6,7 @@
 
 pub mod adf;
 mod config;
+pub mod context_operator;
 mod event_runtime;
 mod flow_runtime;
 mod job_runtime;

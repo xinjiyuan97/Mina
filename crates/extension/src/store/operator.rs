@@ -31,6 +31,8 @@ fn transact(
     let read_only = matches!(
         command,
         FabricCommand::Replay { .. }
+            | FabricCommand::ReadEvent(_)
+            | FabricCommand::ScanEvents { .. }
             | FabricCommand::Offset { .. }
             | FabricCommand::Receipt(_)
             | FabricCommand::DeadLetters { .. }

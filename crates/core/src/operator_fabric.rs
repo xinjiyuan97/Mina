@@ -120,6 +120,13 @@ pub struct DeadLetter {
 
 #[derive(Debug, Clone)]
 pub enum FabricCommand {
+    ReadEvent(EventId),
+    ScanEvents {
+        topic: String,
+        event_type: String,
+        after: u64,
+        limit: usize,
+    },
     Publish(FabricEvent),
     PublishBatch(Vec<FabricEvent>),
     Subscribe(SubscriptionSpec),
@@ -165,6 +172,7 @@ pub enum FabricCommand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FabricReply {
+    Event(Option<FabricEvent>),
     Published(Vec<EventId>),
     Subscribed,
     Replay(Vec<ReplayItem>),

@@ -6,6 +6,7 @@
 
 pub mod adf;
 pub mod context;
+pub mod context_operator;
 pub mod event_runtime;
 pub mod harness;
 pub mod memory;
