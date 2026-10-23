@@ -9,6 +9,7 @@ mod config;
 mod event_runtime;
 mod flow_runtime;
 mod job_runtime;
+pub mod operator_compat;
 pub mod run_runtime;
 mod runtime;
 pub mod script;

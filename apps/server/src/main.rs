@@ -2993,6 +2993,9 @@ fn map_session_error(error: SessionStoreError) -> Response {
 }
 
 #[cfg(test)]
+mod p0_contract_tests;
+
+#[cfg(test)]
 mod tests {
     use agent_core::context::InMemoryContextArtifactStore;
     use agent_core::event_runtime::{
@@ -3089,7 +3092,7 @@ mod tests {
         }
     }
 
-    fn test_state() -> AppState {
+    pub(super) fn test_state() -> AppState {
         test_state_with_approvals(InMemoryApprovalBroker::default())
     }
 
@@ -3124,8 +3127,15 @@ api_key = "test-key"
         .expect("test config should parse")
     }
 
-    fn test_state_with_approvals(approvals: InMemoryApprovalBroker) -> AppState {
-        let config = Arc::new(test_config());
+    pub(super) fn test_state_with_approvals(approvals: InMemoryApprovalBroker) -> AppState {
+        test_state_with_config(test_config(), approvals)
+    }
+
+    pub(super) fn test_state_with_config(
+        config: HarnessConfig,
+        approvals: InMemoryApprovalBroker,
+    ) -> AppState {
+        let config = Arc::new(config);
         let state_store = Arc::new(InMemoryRunStore::default());
         let store: Arc<dyn RunStore> = state_store.clone();
         let sessions: Arc<dyn SessionStore> = state_store;

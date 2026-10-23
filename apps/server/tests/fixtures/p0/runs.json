@@ -1,0 +1,18 @@
+{
+  "non_stream": {
+    "finish_reason": "stop", "output": "hello", "run_id": "00000000-0000-0000-0000-000000000001",
+    "usage": {"input_tokens": 2, "output_tokens": 2, "source": "provider_reported", "total_tokens": 4}
+  },
+  "stream": [
+    {"id": 1, "event": "run_started", "data": {"run_id": "00000000-0000-0000-0000-000000000001", "seq": 1, "type": "run_started"}},
+    {"id": 2, "event": "tool_set_updated", "data": {
+      "run_id": "00000000-0000-0000-0000-000000000001", "seq": 2, "type": "tool_set_updated", "revision": 0,
+      "digest": "sha256:19e137d00eaed3e3f490ce7e451f06d9f7a8fa3bfea874459dd019847b0e4703", "dynamic_tools": [],
+      "tools": ["apply_patch", "docx_check", "edit", "exec_command", "get_current_time", "list_directory", "pptx_check", "read", "search", "shell_command", "write", "write_stdin", "xlsx_check"]
+    }},
+    {"id": 3, "event": "output_delta", "data": {"run_id": "00000000-0000-0000-0000-000000000001", "seq": 3, "type": "output_delta", "channel": "assistant_text", "delta": "hel"}},
+    {"id": 4, "event": "output_delta", "data": {"run_id": "00000000-0000-0000-0000-000000000001", "seq": 4, "type": "output_delta", "channel": "assistant_text", "delta": "lo"}},
+    {"id": 5, "event": "usage_updated", "data": {"run_id": "00000000-0000-0000-0000-000000000001", "seq": 5, "type": "usage_updated", "usage": {"input_tokens": 2, "output_tokens": 2, "source": "provider_reported", "total_tokens": 4}}},
+    {"id": 6, "event": "run_completed", "data": {"run_id": "00000000-0000-0000-0000-000000000001", "seq": 6, "type": "run_completed", "finish_reason": "stop"}}
+  ]
+}

@@ -1,0 +1,20 @@
+[
+  {"id":1,"event":"run_started","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":1,"type":"run_started"}},
+  {"id":2,"event":"run_waiting","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":2,"type":"run_waiting","checkpoint_revision":3,"wait_count":1}},
+  {"id":3,"event":"run_resumed","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":3,"type":"run_resumed","activation_id":"00000000-0000-0000-0000-000000000002","checkpoint_revision":3}},
+  {"id":4,"event":"reasoning_started","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":4,"type":"reasoning_started","redacted":true}},
+  {"id":5,"event":"output_delta","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":5,"type":"output_delta","channel":"assistant_text","delta":"hello\n你好"}},
+  {"id":6,"event":"reasoning_completed","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":6,"type":"reasoning_completed","redacted":true}},
+  {"id":7,"event":"usage_updated","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":7,"type":"usage_updated","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3,"source":"provider_reported"}}},
+  {"id":8,"event":"tool_set_updated","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":8,"type":"tool_set_updated","revision":4,"digest":"digest","tools":["tool"],"dynamic_tools":[]}},
+  {"id":9,"event":"tool_call_started","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":9,"type":"tool_call_started","call_id":"call","name":"tool"}},
+  {"id":10,"event":"tool_call_arguments_delta","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":10,"type":"tool_call_arguments_delta","call_id":"call","delta":"{\"key\":"}},
+  {"id":11,"event":"approval_requested","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":11,"type":"approval_requested","approval_id":"00000000-0000-0000-0000-000000000002","call_id":"call","tool_name":"tool","risk_level":"high","arguments":{"key":"value"}}},
+  {"id":12,"event":"approval_resolved","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":12,"type":"approval_resolved","approval_id":"00000000-0000-0000-0000-000000000002","call_id":"call","resolution":{"decision":"deny","reason":"not now"}}},
+  {"id":13,"event":"tool_execution_started","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":13,"type":"tool_execution_started","call_id":"call","arguments":{"key":"value"}}},
+  {"id":14,"event":"tool_execution_completed","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":14,"type":"tool_execution_completed","call_id":"call","output":"result"}},
+  {"id":15,"event":"tool_execution_failed","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":15,"type":"tool_execution_failed","call_id":"call","code":"failed","message":"failure","category":"unavailable","retryable":true,"retry_after_ms":100}},
+  {"id":16,"event":"run_cancelled","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":16,"type":"run_cancelled"}},
+  {"id":17,"event":"run_completed","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":17,"type":"run_completed","finish_reason":"stop"}},
+  {"id":18,"event":"run_failed","data":{"run_id":"00000000-0000-0000-0000-000000000001","seq":18,"type":"run_failed","code":"failed","message":"failure","retryable":false}}
+]

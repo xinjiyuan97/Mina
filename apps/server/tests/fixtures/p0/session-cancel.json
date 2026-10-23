@@ -1,0 +1,8 @@
+[
+  {"status": 202, "body": {"session_id": "00000000-0000-0000-0000-000000000001", "run_id": "00000000-0000-0000-0000-000000000001", "session_revision": 1, "replayed": false, "context_fingerprint": "<context-fingerprint>", "max_steps": 2}},
+  {"status": 202, "body": {"session_id": "00000000-0000-0000-0000-000000000001", "run_id": "00000000-0000-0000-0000-000000000001", "session_revision": 1, "replayed": true, "context_fingerprint": "<context-fingerprint>", "max_steps": 2}},
+  {"status": 409, "body": {"code": "session_conflict", "message": "idempotency key was reused with different input", "retryable": false}},
+  {"status": 409, "body": {"code": "session_conflict", "message": "session already has active run 00000000-0000-0000-0000-000000000001", "retryable": false}},
+  {"status": 202, "body": {"run_id": "00000000-0000-0000-0000-000000000001", "status": "cancellation_requested"}},
+  {"status": 409, "body": {"code": "run_not_active", "message": "the run is persisted but no longer active", "retryable": false}}
+]

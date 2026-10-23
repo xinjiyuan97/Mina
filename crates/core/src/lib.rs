@@ -10,6 +10,7 @@ pub mod event_runtime;
 pub mod harness;
 pub mod memory;
 pub mod observability;
+pub mod operator;
 pub mod sandbox;
 pub mod script;
 pub mod skill;
