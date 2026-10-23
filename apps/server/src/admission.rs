@@ -31,8 +31,17 @@ pub(super) async fn prepare(
         ));
     }
     let orchestration = &state.orchestration;
+    if !state.pipeline_engine.is_legacy() && !request.attachments.is_empty() {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_input_modality",
+            "operator_v1_text accepts text only",
+            false,
+        ));
+    }
     let config = &orchestration.config;
     let request = ContextRequest {
+        engine_version: state.pipeline_engine,
         request_hash: raw_request_hash(
             &request.input,
             &request.attachments,
@@ -63,11 +72,17 @@ pub(super) async fn prepare(
             agent_profile: orchestration.agent_profile.clone(),
             agent_instruction: orchestration.agent_instruction.clone(),
             model_profile: orchestration.model_profile.clone(),
-            available_tools: orchestration
-                .tools
-                .iter()
-                .map(|tool| tool.name.clone())
-                .collect(),
+            available_tools: if state.pipeline_engine
+                == agent_core::operator::EngineVersion::OperatorV1
+            {
+                vec![]
+            } else {
+                orchestration
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.clone())
+                    .collect()
+            },
             budget: ContextBudget {
                 model_context_tokens: orchestration.model_context_tokens,
                 reserved_output_tokens: orchestration.reserved_output_tokens,
@@ -77,15 +92,22 @@ pub(super) async fn prepare(
                 max_history_tokens: config.max_history_tokens,
             },
             policy_version: config.context_policy_version,
-            allow_run_adf: state.config.adf().enabled,
+            allow_run_adf: state.pipeline_engine.is_legacy() && state.config.adf().enabled,
             script_runtime: serde_json::json!(orchestration.tool_runtime.script_runtime),
         },
     };
-    state
+    let result = state
         .admission
-        .admit(request, Duration::from_secs(300))
-        .await
-        .map_err(map_error)
+        .admit(request.clone(), Duration::from_secs(300))
+        .await;
+    if !request.engine_version.is_legacy()
+        && let Err(AdmissionError::Preparation(error)) = &result
+    {
+        crate::pipeline::fail_context(state, &request, &error.code)
+            .await
+            .map_err(map_runtime_error)?;
+    }
+    result.map_err(map_error)
 }
 
 fn map_error(error: AdmissionError) -> Response {
@@ -129,17 +151,37 @@ pub(super) async fn recover_once(
     state: &AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for request in state.admission.requests().await? {
+        if !request.engine_version.is_legacy()
+            && let Some(pipeline) = &state.pipeline
+        {
+            if state
+                .runtime
+                .get_run(request.run_id)
+                .await?
+                .is_some_and(|run| run.is_terminal())
+            {
+                continue;
+            }
+            if pipeline
+                .store
+                .load(request.run_id)
+                .await?
+                .is_some_and(|record| record.lease_expires_at_ms > agent_harness::unix_time_ms())
+            {
+                continue;
+            }
+        }
         match state.admission.outcome(request.run_id).await? {
+            Some(ContextOutcome::Failed(failure)) if !request.engine_version.is_legacy() => {
+                crate::pipeline::fail_context(state, &request, &failure.code).await?;
+            }
             Some(ContextOutcome::Completed(_)) => {
                 let prepared = state
                     .admission
                     .wait(request.run_id, Duration::from_secs(5))
                     .await?;
                 let persisted = request.session_id.is_some();
-                state
-                    .runtime
-                    .start_context_plan(legacy_plan(request, prepared), persisted)
-                    .await?;
+                crate::pipeline::start(state, legacy_plan(request, prepared), persisted).await?;
             }
             Some(ContextOutcome::Failed(_)) if request.session_id.is_some() => {
                 let snapshot = state.runtime.get_run(request.run_id).await?;
@@ -549,6 +591,7 @@ mod tests {
                 state
                     .admission
                     .publish(ContextRequest {
+                        engine_version: Default::default(),
                         run_id,
                         session_id,
                         through_message_ordinal: session.then_some(1),

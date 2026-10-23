@@ -46,11 +46,18 @@ counter!(
 pub const ENVELOPE_SCHEMA_VERSION: u32 = 1;
 pub const PROJECTION_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineVersion {
+    #[default]
     LegacyMachine,
     OperatorV1,
+}
+
+impl EngineVersion {
+    pub fn is_legacy(&self) -> bool {
+        *self == Self::LegacyMachine
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

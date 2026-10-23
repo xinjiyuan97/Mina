@@ -195,6 +195,17 @@ where
     ) -> Result<StartedRun, RunRuntimeError> {
         let _guard = self.context_starts.lock().await;
         let snapshot = self.store.get_run(plan.run_id).await?;
+        if snapshot
+            .as_ref()
+            .and_then(|run| run.execution_manifest.as_ref())
+            .and_then(|manifest| manifest.get("engine_version"))
+            .and_then(serde_json::Value::as_str)
+            == Some("operator_v1")
+        {
+            return Err(RunRuntimeError::Machine(
+                "operator_v1 run cannot enter legacy".into(),
+            ));
+        }
         if snapshot.as_ref().is_some_and(RunSnapshot::is_terminal) {
             let (_, events) = broadcast::channel(1);
             return Ok(StartedRun {
@@ -221,6 +232,19 @@ where
     }
 
     pub async fn start_persisted(&self, plan: PlannedRun) -> Result<StartedRun, RunRuntimeError> {
+        if self
+            .store
+            .get_run(plan.run_id)
+            .await?
+            .and_then(|run| run.execution_manifest)
+            .as_ref()
+            .and_then(|manifest| manifest["engine_version"].as_str())
+            == Some("operator_v1")
+        {
+            return Err(RunRuntimeError::Machine(
+                "operator_v1 run cannot enter legacy".into(),
+            ));
+        }
         if self.durable.is_some() {
             return self.start_machine(plan, false).await;
         }
@@ -912,6 +936,10 @@ where
         self.store.get_run(run_id).await
     }
 
+    pub fn run_store(&self) -> Arc<dyn RunStore> {
+        self.store.clone()
+    }
+
     pub async fn events_after(
         &self,
         run_id: RunId,
@@ -927,6 +955,20 @@ where
         code: &str,
         message: &str,
     ) -> Result<RunSnapshot, RunRuntimeError> {
+        if self
+            .store
+            .get_run(run_id)
+            .await?
+            .and_then(|run| run.execution_manifest)
+            .and_then(|manifest| manifest.get("engine_version").cloned())
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            == Some("operator_v1")
+        {
+            return Err(RunRuntimeError::Machine(
+                "operator_v1 projection is exclusively owned".into(),
+            ));
+        }
         let snapshot = self
             .store
             .append_event(

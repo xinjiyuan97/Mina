@@ -33,6 +33,11 @@ pub struct ContextPolicy {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextRequest {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::operator::EngineVersion::is_legacy"
+    )]
+    pub engine_version: crate::operator::EngineVersion,
     pub run_id: RunId,
     pub session_id: Option<SessionId>,
     pub through_message_ordinal: Option<u64>,

@@ -88,6 +88,7 @@ use tracing_subscriber::EnvFilter;
 use agent_harness as run_runtime;
 use agent_harness::context_operator::PreparedRun;
 mod admission;
+mod pipeline;
 
 const MAX_BLOB_BYTES: usize = 10 * 1_048_576;
 const MAX_RUN_ATTACHMENTS: usize = 8;
@@ -100,6 +101,8 @@ type AppRuntimeAgent = ObservedMachine<ServerAgentLoop>;
 
 #[derive(Clone)]
 struct AppState {
+    pipeline: Option<Arc<agent_harness::pipeline::PipelineRuntime>>,
+    pipeline_engine: agent_core::operator::EngineVersion,
     admission: Arc<agent_harness::context_operator::AdmissionFacade>,
     runtime: RunRuntime<AppRuntimeAgent>,
     config: Arc<HarnessConfig>,
@@ -834,7 +837,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flow_store: Arc<dyn FlowStore> = event_adapter.clone();
     let job_store: Arc<dyn JobStore> = event_adapter.clone();
     let admission = Arc::new(agent_harness::context_operator::AdmissionFacade::new(
-        event_adapter,
+        event_adapter.clone(),
         Arc::clone(&blobs),
         Arc::new(agent_harness::context_operator::AgentContextPreparer {
             context,
@@ -907,6 +910,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     start_session_finalization_worker(Arc::clone(&sessions));
 
     let state = AppState {
+        pipeline: Some(Arc::new(pipeline::build(
+            &store_path,
+            sqlite_store.clone(),
+            blobs.clone(),
+            event_adapter.clone(),
+            &config,
+        )?)),
+        pipeline_engine: pipeline::configured_engine()?,
         admission,
         runtime,
         config: Arc::clone(&config),
@@ -1504,13 +1515,14 @@ async fn create_run_owned(state: AppState, request: CreateRunRequest) -> Respons
         Ok(prepared) => prepared,
         Err(error) => return error,
     };
-    let started = match state.runtime.start_context_plan(prepared.plan, false).await {
+    let started = match pipeline::start(&state, prepared.plan, false).await {
         Ok(started) => started,
         Err(error) => return map_runtime_error(error),
     };
 
     if request.stream {
-        return run_event_response(state.runtime, started.run_id, 0, true, Some(started.events));
+        let live = state.pipeline_engine.is_legacy().then_some(started.events);
+        return run_event_response(state.runtime, started.run_id, 0, true, live);
     }
 
     match wait_for_terminal(&state.runtime, started).await {
@@ -1765,7 +1777,7 @@ async fn submit_session_run_owned(
         }
     };
     let context_fingerprint = prepared.context_fingerprint.clone();
-    let started = match state.runtime.start_context_plan(prepared.plan, true).await {
+    let started = match pipeline::start(&state, prepared.plan, true).await {
         Ok(started) => started,
         Err(error) => {
             if let Ok(snapshot) = state
@@ -3061,6 +3073,8 @@ api_key = "test-key"
             admission.start_worker();
         }
         AppState {
+            pipeline: None,
+            pipeline_engine: Default::default(),
             admission,
             runtime: RunRuntime::new(
                 Harness::new(ObservedMachine::new(agent, hook)),

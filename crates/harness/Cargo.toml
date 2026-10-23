@@ -14,7 +14,7 @@ full = ["quickjs"]
 
 [dependencies]
 agent-core.workspace = true
-agent-extension.workspace = true
+agent-extension = { workspace = true, features = ["pipeline"] }
 async-stream.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true

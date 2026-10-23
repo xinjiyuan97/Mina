@@ -9,6 +9,7 @@ description = "External providers, tools, stores, sandboxes and observability ad
 
 [features]
 default = []
+pipeline = ["dep:tokio"]
 adf = ["dep:jsonschema", "dep:sha2", "dep:tokio"]
 openai = [
     "dep:async-stream",

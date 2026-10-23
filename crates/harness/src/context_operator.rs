@@ -36,6 +36,10 @@ pub struct PreparedRun {
 }
 
 impl AdmissionFacade {
+    pub fn fabric(&self) -> Arc<dyn OperatorFabric> {
+        self.fabric.clone()
+    }
+
     pub fn new(
         fabric: Arc<dyn OperatorFabric>,
         blobs: Arc<dyn BlobStore>,
@@ -294,9 +298,7 @@ impl ContextOperator {
 impl FabricHandler for ContextOperator {
     fn handle(&self, delivery: ClaimedDelivery) -> HandlerFuture<'_> {
         Box::pin(async move {
-            if delivery.event.envelope.event_type != CONTEXT_REQUESTED
-                || delivery.event.envelope.engine_version != EngineVersion::LegacyMachine
-            {
+            if delivery.event.envelope.event_type != CONTEXT_REQUESTED {
                 return Err("not a P2 Context request".into());
             }
             let payload: RequestPayload =
@@ -306,7 +308,8 @@ impl FabricHandler for ContextOperator {
                 .get(payload.request_ref)
                 .await
                 .map_err(|error| error.to_string())?;
-            if request.run_id != delivery.event.envelope.run_id
+            if request.engine_version != delivery.event.envelope.engine_version
+                || request.run_id != delivery.event.envelope.run_id
                 || request.request_hash != payload.request_hash
                 || request.session_id != delivery.event.envelope.session_id
                 || request.max_steps != payload.max_steps
@@ -370,7 +373,7 @@ fn event(
         topic: CONTEXT_TOPIC.into(),
         envelope: OperatorEnvelope {
             schema_version: 1,
-            engine_version: EngineVersion::LegacyMachine,
+            engine_version: request.engine_version,
             projection_version: 1,
             event_id: event_id(request.run_id, kind),
             event_type: kind.into(),
