@@ -31,6 +31,7 @@ fn transact(
     let read_only = matches!(
         command,
         FabricCommand::Replay { .. }
+            | FabricCommand::ReadCheckpoint(_)
             | FabricCommand::ReadEvent(_)
             | FabricCommand::ScanEvents { .. }
             | FabricCommand::Offset { .. }

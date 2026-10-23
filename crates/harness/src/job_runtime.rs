@@ -160,8 +160,15 @@ impl JobRuntime {
         for job in jobs {
             let job_id = job.command.job_id;
             let attempts = job.notification_attempts;
-            let event = job_event(&job, now_ms)?;
-            match self.events.publish(event).await {
+            let mut event = job_event(&job, now_ms)?;
+            let publication = async {
+                if let Some(previous) = self.events.get_event(event.event_id).await? {
+                    event.recorded_at_ms = previous.event.recorded_at_ms;
+                }
+                self.events.publish(event).await
+            }
+            .await;
+            match publication {
                 Ok(_) => {
                     self.store
                         .complete_notification(CompleteJobNotification {

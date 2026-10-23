@@ -1,15 +1,84 @@
 use super::*;
-use agent_core::{operator::EngineVersion, operator_fabric::OperatorFabric};
+#[cfg(test)]
+use agent_core::operator::EngineVersion;
+use agent_core::operator_fabric::OperatorFabric;
 use agent_extension::pipeline::SqlitePipelineStore;
 use agent_harness::PlannedRun;
 use agent_harness::pipeline::{PipelineRuntime, PipelineStart};
 
-pub(super) fn configured_engine() -> Result<EngineVersion, Box<dyn std::error::Error>> {
-    match env::var("MINA_ENGINE_PROFILE").as_deref() {
-        Err(env::VarError::NotPresent) | Ok("legacy") => Ok(EngineVersion::LegacyMachine),
-        Ok("operator_v1_text") => Ok(EngineVersion::OperatorV1),
-        _ => Err("MINA_ENGINE_PROFILE must be legacy or operator_v1_text".into()),
+pub(super) async fn resolve_operator_approval(
+    state: &AppState,
+    run_id: RunId,
+    approval_id: ApprovalId,
+    resolution: ApprovalResolution,
+) -> Option<Response> {
+    use agent_core::{operator_fabric::FabricError, tool_authorization::AuthorizationError};
+    let snapshot = match state.runtime.get_run(run_id).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return None,
+        Err(error) => return Some(map_store_error(error)),
+    };
+    if snapshot
+        .execution_manifest
+        .as_ref()
+        .and_then(|manifest| manifest["engine_version"].as_str())
+        != Some("operator_v1")
+    {
+        return None;
     }
+    let ingress = agent_harness::approval_operator::ApprovalIngress::new(state.admission.fabric());
+    Some(
+        match ingress
+            .resolve(
+                "local",
+                run_id,
+                approval_id,
+                "gateway:http",
+                resolution.clone(),
+                agent_harness::unix_time_ms(),
+            )
+            .await
+        {
+            Ok(changed) => Json(ResolveApprovalResponse {
+                run_id,
+                approval_id,
+                resolution,
+                replayed: !changed,
+            })
+            .into_response(),
+            Err(FabricError::NotFound) => api_error(
+                StatusCode::NOT_FOUND,
+                "approval_not_found",
+                "the approval does not exist for this run",
+                false,
+            ),
+            Err(FabricError::Conflict) => api_error(
+                StatusCode::CONFLICT,
+                "approval_already_resolved",
+                "the approval was already resolved with a different decision",
+                false,
+            ),
+            Err(FabricError::Invalid(message))
+                if message == AuthorizationError::Expired.to_string() =>
+            {
+                api_error(StatusCode::GONE, "approval_expired", message, false)
+            }
+            Err(FabricError::Invalid(message))
+                if message == AuthorizationError::Cancelled.to_string() =>
+            {
+                api_error(StatusCode::CONFLICT, "approval_cancelled", message, false)
+            }
+            Err(FabricError::Invalid(message)) => {
+                api_error(StatusCode::BAD_REQUEST, "invalid_approval", message, false)
+            }
+            Err(error) => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "approval_persistence_error",
+                error.to_string(),
+                true,
+            ),
+        },
+    )
 }
 
 pub(super) async fn fail_context(
@@ -17,6 +86,9 @@ pub(super) async fn fail_context(
     request: &agent_core::context_operator::ContextRequest,
     code: &str,
 ) -> Result<(), RunRuntimeError> {
+    if request.execution_profile.as_deref() == Some(agent_core::effect_pipeline::TOOLS_PROFILE) {
+        return crate::tools_pipeline::fail_context(state, request, code).await;
+    }
     let pipeline = state.pipeline.as_ref().ok_or_else(|| {
         RunRuntimeError::Machine("operator_v1 is unavailable; legacy fallback forbidden".into())
     })?;
@@ -83,6 +155,31 @@ pub(super) async fn start(
         .is_none_or(|request| request.engine_version.is_legacy())
     {
         return state.runtime.start_context_plan(plan, persisted).await;
+    }
+    if request
+        .as_ref()
+        .and_then(|request| request.execution_profile.as_deref())
+        == Some(agent_core::effect_pipeline::TOOLS_PROFILE)
+    {
+        return state
+            .tools_pipeline
+            .as_ref()
+            .ok_or_else(|| {
+                RunRuntimeError::Machine(
+                    "operator_v1_tools unavailable; legacy fallback forbidden".into(),
+                )
+            })?
+            .start(state, plan)
+            .await;
+    }
+    if request
+        .as_ref()
+        .and_then(|request| request.execution_profile.as_deref())
+        .is_some_and(|profile| profile != "operator_v1_text")
+    {
+        return Err(RunRuntimeError::Machine(
+            "unsupported persisted operator profile".into(),
+        ));
     }
     let pipeline = state.pipeline.clone().ok_or_else(|| {
         RunRuntimeError::Machine("operator_v1 is unavailable; legacy fallback forbidden".into())

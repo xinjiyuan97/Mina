@@ -38,6 +38,8 @@ pub struct ContextRequest {
         skip_serializing_if = "crate::operator::EngineVersion::is_legacy"
     )]
     pub engine_version: crate::operator::EngineVersion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<String>,
     pub run_id: RunId,
     pub session_id: Option<SessionId>,
     pub through_message_ordinal: Option<u64>,

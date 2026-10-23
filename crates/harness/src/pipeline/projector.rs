@@ -4,6 +4,17 @@ use agent_core::{harness::*, pipeline::*};
 pub struct RunEventProjector;
 
 impl RunEventProjector {
+    pub async fn append(runs: &dyn RunStore, events: Vec<RunEvent>) -> Result<(), PipelineError> {
+        runs.append_events(
+            events
+                .into_iter()
+                .map(|event| ObservedRunEvent::new(event, crate::unix_time_ms()))
+                .collect(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(storage)
+    }
     pub async fn project(
         store: &dyn PipelineStore,
         runs: &dyn RunStore,
@@ -18,7 +29,7 @@ impl RunEventProjector {
                     let channel = match segment.channel {
                         DeltaChannel::Text => OutputChannel::AssistantText,
                         DeltaChannel::Reasoning => OutputChannel::AssistantReasoning,
-                        DeltaChannel::ToolCall { .. } => {
+                        DeltaChannel::ToolCall { .. } | DeltaChannel::Control => {
                             return Err(PipelineError::UnsupportedProfile);
                         }
                     };
@@ -82,15 +93,7 @@ impl RunEventProjector {
                     result => result?,
                 }
             }
-            runs.append_events(
-                record
-                    .public_events
-                    .into_iter()
-                    .map(|event| ObservedRunEvent::new(event, crate::unix_time_ms()))
-                    .collect(),
-            )
-            .await
-            .map_err(storage)?;
+            Self::append(runs, record.public_events).await?;
             return Ok(());
         }
     }

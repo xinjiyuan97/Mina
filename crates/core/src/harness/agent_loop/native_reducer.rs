@@ -757,7 +757,7 @@ fn resolve_approval(
     })
 }
 
-fn resumed_tool_content(inbox: &[FlowInboxItem]) -> Result<String, MachineError> {
+pub fn resumed_tool_content(inbox: &[FlowInboxItem]) -> Result<String, MachineError> {
     if inbox.is_empty() {
         return Err(machine_error(
             "tool_resume_event_missing",

@@ -135,6 +135,7 @@ impl EventStore for SqliteEventStore {
                     if event.sequence <= subscription.cursor
                         || !scope_matches(subscription.definition.scope, &event)
                         || !subscription.definition.filter.matches(&event)
+                        || !subscription.definition.start_position.includes_recorded_time(event.event.recorded_at_ms)
                         || (subscription.definition.mode == SubscriptionMode::Once
                             && subscription_has_delivery(
                                 &transaction,
@@ -219,7 +220,7 @@ impl EventStore for SqliteEventStore {
                 let latest = latest_event_sequence(&transaction)?;
                 let cursor = match command.start_position {
                     StartPosition::Now => latest,
-                    StartPosition::Beginning => 0,
+                    StartPosition::Beginning | StartPosition::RecordedSince { .. } => 0,
                     StartPosition::After { sequence } => sequence,
                 };
                 let subscription = Subscription {
@@ -597,7 +598,7 @@ fn suspend_flow_blocking(
                 StartPosition::Now => {
                     latest_event_sequence(&transaction).map_err(flow_from_event)?
                 }
-                StartPosition::Beginning => 0,
+                StartPosition::Beginning | StartPosition::RecordedSince { .. } => 0,
                 StartPosition::After { sequence } => sequence,
             };
             let subscription = Subscription {
@@ -1437,6 +1438,10 @@ fn enqueue_historical_deliveries(
         )?;
         if scope_matches(subscription.definition.scope, &event)
             && subscription.definition.filter.matches(&event)
+            && subscription
+                .definition
+                .start_position
+                .includes_recorded_time(event.event.recorded_at_ms)
         {
             let delivery_id = DeliveryId {
                 subscription_id: subscription.definition.subscription_id,

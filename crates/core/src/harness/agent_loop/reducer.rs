@@ -213,6 +213,9 @@ pub enum AgentLoopInput {
         content: String,
     },
     Cancelled,
+    RuntimeFailed {
+        error: MachineError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -479,6 +482,12 @@ impl AgentLoopReducer {
                 outcome: AgentLoopOutcome::Cancelled,
             };
             return transition(state, Vec::new(), Vec::new());
+        }
+        if let AgentLoopInput::RuntimeFailed { error } = input {
+            if matches!(state.phase, AgentLoopPhase::Terminal { .. }) {
+                return transition(state, Vec::new(), Vec::new());
+            }
+            return fail(state, &error.code, &error.message, error.retryable);
         }
 
         match (state.phase.clone(), input) {

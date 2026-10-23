@@ -22,6 +22,7 @@ use crate::harness::{
 mod machine;
 mod native_reducer;
 mod reducer;
+pub use native_reducer::resumed_tool_content;
 
 pub use reducer::{
     AGENT_LOOP_REDUCER_PROTOCOL_VERSION, AgentLoopDispatch, AgentLoopEffect, AgentLoopEffectKind,
@@ -69,6 +70,12 @@ const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl<P, T> AgentLoop<P, T> {
+    pub fn model_port(&self) -> Arc<P> {
+        self.provider.clone()
+    }
+    pub fn tool_port(&self) -> Arc<T> {
+        self.tools.clone()
+    }
     #[must_use]
     pub fn new(
         provider: P,

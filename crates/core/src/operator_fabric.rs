@@ -12,6 +12,20 @@ pub const MAX_EVENT_BYTES: usize = 64 * 1024;
 pub const MAX_BATCH_BYTES: usize = 1024 * 1024;
 pub const MAX_BATCH_ITEMS: usize = 128;
 pub const MAX_KEY_BYTES: usize = 256;
+pub const MAX_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FabricCheckpoint {
+    pub version: u64,
+    pub value: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckpointWrite {
+    pub key: String,
+    pub expected: Option<u64>,
+    pub value: Value,
+}
 
 pub type FabricFuture<'scope> =
     Pin<Box<dyn Future<Output = Result<FabricReply, FabricError>> + Send + 'scope>>;
@@ -120,6 +134,23 @@ pub struct DeadLetter {
 
 #[derive(Debug, Clone)]
 pub enum FabricCommand {
+    TransactMany {
+        checkpoints: Vec<CheckpointWrite>,
+        outbox: Vec<FabricEvent>,
+        delivery: Option<(DeliveryLease, i64)>,
+    },
+    GuardedTransact {
+        lease: DeliveryLease,
+        now_ms: i64,
+        checkpoint: CheckpointWrite,
+        outbox: Vec<FabricEvent>,
+    },
+    ReadCheckpoint(String),
+    Transact {
+        checkpoint: CheckpointWrite,
+        outbox: Vec<FabricEvent>,
+        delivery: Option<(DeliveryLease, i64)>,
+    },
     ReadEvent(EventId),
     ScanEvents {
         topic: String,
@@ -141,6 +172,14 @@ pub enum FabricCommand {
         subscription: String,
     },
     Claim {
+        worker: String,
+        now_ms: i64,
+        lease_ms: i64,
+        limit: usize,
+        max_attempts: u32,
+    },
+    ClaimForConsumer {
+        consumer: String,
         worker: String,
         now_ms: i64,
         lease_ms: i64,
@@ -172,6 +211,7 @@ pub enum FabricCommand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FabricReply {
+    Checkpoint(Option<FabricCheckpoint>),
     Event(Option<FabricEvent>),
     Published(Vec<EventId>),
     Subscribed,

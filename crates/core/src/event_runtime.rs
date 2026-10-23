@@ -219,6 +219,18 @@ pub enum StartPosition {
     Now,
     Beginning,
     After { sequence: u64 },
+    RecordedSince { recorded_at_ms: i64 },
+}
+
+impl StartPosition {
+    pub fn includes_recorded_time(self, recorded_at_ms: i64) -> bool {
+        match self {
+            Self::RecordedSince {
+                recorded_at_ms: lower_bound,
+            } => recorded_at_ms >= lower_bound,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

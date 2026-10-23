@@ -88,7 +88,12 @@ use tracing_subscriber::EnvFilter;
 use agent_harness as run_runtime;
 use agent_harness::context_operator::PreparedRun;
 mod admission;
+#[cfg(test)]
+mod p4_approval_tests;
+#[cfg(test)]
+mod p4_tools_tests;
 mod pipeline;
+mod tools_pipeline;
 
 const MAX_BLOB_BYTES: usize = 10 * 1_048_576;
 const MAX_RUN_ATTACHMENTS: usize = 8;
@@ -103,6 +108,8 @@ type AppRuntimeAgent = ObservedMachine<ServerAgentLoop>;
 struct AppState {
     pipeline: Option<Arc<agent_harness::pipeline::PipelineRuntime>>,
     pipeline_engine: agent_core::operator::EngineVersion,
+    pipeline_profile: tools_pipeline::EngineProfile,
+    tools_pipeline: Option<Arc<tools_pipeline::ToolsServerPipeline>>,
     admission: Arc<agent_harness::context_operator::AdmissionFacade>,
     runtime: RunRuntime<AppRuntimeAgent>,
     config: Arc<HarnessConfig>,
@@ -772,6 +779,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&blobs),
     )?;
     let agent_metadata = agent.metadata();
+    let operator_model = agent.model_port();
+    let operator_tools = agent.tool_port();
     let engine = agent_engine_info();
     tracing::info!(
         agent = agent_metadata.name,
@@ -845,11 +854,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     ));
     admission.start_worker();
-    let delivery_router: Arc<dyn DeliveryRouter> = Arc::new(ServerDeliveryRouter {
+    let legacy_router: Arc<dyn DeliveryRouter> = Arc::new(ServerDeliveryRouter {
         memories: Arc::clone(&memory_store),
         proposals: Arc::clone(&memory_proposals),
         flows: Some(Arc::clone(&flow_store)),
     });
+    let wait_bridge = Arc::new(agent_harness::pipeline::EffectWaitBridge::new(
+        event_adapter.clone(),
+        event_adapter.clone(),
+        event_adapter.clone(),
+    ));
+    let delivery_router: Arc<dyn DeliveryRouter> =
+        Arc::new(tools_pipeline::EngineDeliveryRouter::new(
+            sqlite_store.clone(),
+            legacy_router,
+            wait_bridge.clone(),
+        ));
     let events = Arc::new(EventRuntime::new(
         event_store,
         delivery_router,
@@ -857,7 +877,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let jobs = Arc::new(JobRuntime::new(
         job_store,
-        Arc::new(ServerJobRouter),
+        wait_bridge.job_router(Arc::new(ServerJobRouter)),
         Arc::clone(&events),
         JobRuntimeConfig::default(),
     ));
@@ -909,6 +929,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     start_session_finalization_worker(Arc::clone(&sessions));
 
+    let profile = tools_pipeline::configured_profile()?;
+    let tools_pipeline = Arc::new(tools_pipeline::ToolsServerPipeline::new(
+        Arc::new(
+            agent_harness::pipeline::ToolsPipelineRuntime::new(
+                event_adapter.clone(),
+                operator_model,
+                operator_tools,
+            )
+            .with_blobs(blobs.clone())
+            .with_projection(sqlite_store.clone())
+            .with_wait_ports(event_adapter.clone(), event_adapter.clone()),
+        ),
+        sqlite_store.clone(),
+    ));
     let state = AppState {
         pipeline: Some(Arc::new(pipeline::build(
             &store_path,
@@ -917,7 +951,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             event_adapter.clone(),
             &config,
         )?)),
-        pipeline_engine: pipeline::configured_engine()?,
+        pipeline_engine: profile.engine(),
+        pipeline_profile: profile,
+        tools_pipeline: Some(tools_pipeline),
         admission,
         runtime,
         config: Arc::clone(&config),
@@ -951,7 +987,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     admission::start_recovery_worker(state.clone());
     start_event_workers(events, flow_effects, jobs);
-    let app = Router::new()
+    let app = app_router(state);
+
+    let address = env::var("MINA_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
+    let listener = TcpListener::bind(&address).await?;
+    let local_address = listener.local_addr()?;
+    tracing::info!(address = %local_address, "mina server listening");
+    let serve_result = axum::serve(listener, app).await;
+    let observation_result = observation_worker.shutdown().await;
+    serve_result?;
+    observation_result?;
+    Ok(())
+}
+
+fn app_router(state: AppState) -> Router {
+    Router::new()
         .route("/healthz", get(health))
         .route("/api/v1/info", get(info))
         .route("/api/v1/debug/agent", get(inspect_agent))
@@ -985,18 +1035,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(resolve_memory_approval),
         )
         .layer(DefaultBodyLimit::max(MAX_BLOB_BYTES))
-        .with_state(state);
-
-    let address = env::var("MINA_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
-    let listener = TcpListener::bind(&address).await?;
-    let local_address = listener.local_addr()?;
-    tracing::info!(address = %local_address, "mina server listening");
-
-    let serve_result = axum::serve(listener, app).await;
-    let observation_result = observation_worker.shutdown().await;
-    serve_result?;
-    observation_result?;
-    Ok(())
+        .with_state(state)
 }
 
 fn build_agent(
@@ -2364,6 +2403,12 @@ async fn resolve_approval(
         reason,
     };
 
+    if let Some(response) =
+        pipeline::resolve_operator_approval(&state, run_id, approval_id, resolution.clone()).await
+    {
+        return response;
+    }
+
     match state
         .approvals
         .resolve(run_id, approval_id, resolution.clone())
@@ -2495,6 +2540,9 @@ async fn cancel_run(State(state): State<AppState>, Path(run_id): Path<String>) -
     let Some(run_id) = parse_run_id(&run_id) else {
         return invalid_run_id();
     };
+    if let Some(response) = tools_pipeline::cancel(&state, run_id).await {
+        return response;
+    }
 
     match state.runtime.cancel_durable(run_id).await {
         Ok(true) => {
@@ -3075,6 +3123,8 @@ api_key = "test-key"
         AppState {
             pipeline: None,
             pipeline_engine: Default::default(),
+            pipeline_profile: tools_pipeline::EngineProfile::Legacy,
+            tools_pipeline: None,
             admission,
             runtime: RunRuntime::new(
                 Harness::new(ObservedMachine::new(agent, hook)),

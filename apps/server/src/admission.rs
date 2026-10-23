@@ -31,7 +31,8 @@ pub(super) async fn prepare(
         ));
     }
     let orchestration = &state.orchestration;
-    if !state.pipeline_engine.is_legacy() && !request.attachments.is_empty() {
+    let profile = crate::tools_pipeline::effective_profile(state);
+    if profile == crate::tools_pipeline::EngineProfile::Text && !request.attachments.is_empty() {
         return Err(api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "unsupported_input_modality",
@@ -42,6 +43,7 @@ pub(super) async fn prepare(
     let config = &orchestration.config;
     let request = ContextRequest {
         engine_version: state.pipeline_engine,
+        execution_profile: (!state.pipeline_engine.is_legacy()).then(|| profile.as_str().into()),
         request_hash: raw_request_hash(
             &request.input,
             &request.attachments,
@@ -72,9 +74,7 @@ pub(super) async fn prepare(
             agent_profile: orchestration.agent_profile.clone(),
             agent_instruction: orchestration.agent_instruction.clone(),
             model_profile: orchestration.model_profile.clone(),
-            available_tools: if state.pipeline_engine
-                == agent_core::operator::EngineVersion::OperatorV1
-            {
+            available_tools: if profile == crate::tools_pipeline::EngineProfile::Text {
                 vec![]
             } else {
                 orchestration
@@ -92,7 +92,8 @@ pub(super) async fn prepare(
                 max_history_tokens: config.max_history_tokens,
             },
             policy_version: config.context_policy_version,
-            allow_run_adf: state.pipeline_engine.is_legacy() && state.config.adf().enabled,
+            allow_run_adf: profile != crate::tools_pipeline::EngineProfile::Text
+                && state.config.adf().enabled,
             script_runtime: serde_json::json!(orchestration.tool_runtime.script_runtime),
         },
     };
@@ -151,9 +152,7 @@ pub(super) async fn recover_once(
     state: &AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for request in state.admission.requests().await? {
-        if !request.engine_version.is_legacy()
-            && let Some(pipeline) = &state.pipeline
-        {
+        if !request.engine_version.is_legacy() {
             if state
                 .runtime
                 .get_run(request.run_id)
@@ -162,11 +161,16 @@ pub(super) async fn recover_once(
             {
                 continue;
             }
-            if pipeline
-                .store
-                .load(request.run_id)
-                .await?
-                .is_some_and(|record| record.lease_expires_at_ms > agent_harness::unix_time_ms())
+            if let Some(pipeline) = &state.pipeline
+                && request.execution_profile.as_deref()
+                    != Some(agent_core::effect_pipeline::TOOLS_PROFILE)
+                && pipeline
+                    .store
+                    .load(request.run_id)
+                    .await?
+                    .is_some_and(|record| {
+                        record.lease_expires_at_ms > agent_harness::unix_time_ms()
+                    })
             {
                 continue;
             }
@@ -592,6 +596,7 @@ mod tests {
                     .admission
                     .publish(ContextRequest {
                         engine_version: Default::default(),
+                        execution_profile: None,
                         run_id,
                         session_id,
                         through_message_ordinal: session.then_some(1),

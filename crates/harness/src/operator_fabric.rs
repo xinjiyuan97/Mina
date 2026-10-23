@@ -46,6 +46,27 @@ impl FabricRuntime {
         handler: &dyn FabricHandler,
         clock: impl Fn() -> i64,
     ) -> Result<FabricTickReport, FabricError> {
+        self.tick_scoped(store, handler, clock, None).await
+    }
+
+    pub async fn tick_for_consumer(
+        &self,
+        store: &dyn OperatorFabric,
+        handler: &dyn FabricHandler,
+        clock: impl Fn() -> i64,
+        consumer: &str,
+    ) -> Result<FabricTickReport, FabricError> {
+        self.tick_scoped(store, handler, clock, Some(consumer))
+            .await
+    }
+
+    async fn tick_scoped(
+        &self,
+        store: &dyn OperatorFabric,
+        handler: &dyn FabricHandler,
+        clock: impl Fn() -> i64,
+        consumer: Option<&str>,
+    ) -> Result<FabricTickReport, FabricError> {
         let config = &self.config;
         let capabilities = store.capabilities();
         if !capabilities.atomic_batch
@@ -69,16 +90,24 @@ impl FabricRuntime {
             dispatched: self.dispatch(store).await?,
             ..FabricTickReport::default()
         };
-        let FabricReply::Claimed(deliveries) = store
-            .execute(FabricCommand::Claim {
+        let command = match consumer {
+            Some(consumer) => FabricCommand::ClaimForConsumer {
+                consumer: consumer.into(),
                 worker: config.worker.clone(),
                 now_ms: clock(),
                 lease_ms: config.lease_ms,
                 limit: config.claim_limit,
                 max_attempts: config.max_attempts,
-            })
-            .await?
-        else {
+            },
+            None => FabricCommand::Claim {
+                worker: config.worker.clone(),
+                now_ms: clock(),
+                lease_ms: config.lease_ms,
+                limit: config.claim_limit,
+                max_attempts: config.max_attempts,
+            },
+        };
+        let FabricReply::Claimed(deliveries) = store.execute(command).await? else {
             return Err(protocol_error());
         };
         for delivery in deliveries {

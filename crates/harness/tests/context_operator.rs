@@ -43,6 +43,7 @@ impl ContextPreparer for Preparer {
 fn request() -> ContextRequest {
     ContextRequest {
         engine_version: Default::default(),
+        execution_profile: None,
         run_id: RunId::new(),
         session_id: None,
         through_message_ordinal: None,

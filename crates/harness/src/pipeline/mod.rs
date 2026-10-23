@@ -1,12 +1,20 @@
 mod coordinator;
+mod effect_coordinator;
+mod effect_model;
+mod effect_output;
+mod effect_wait;
 mod model;
 mod output;
 mod projector;
+mod tools_runtime;
 
 pub use coordinator::RunCoordinator;
+pub use effect_coordinator::ToolsRunCoordinator;
+pub use effect_wait::EffectWaitBridge;
 pub use model::ModelOperator;
 pub use output::ModelOutputAggregator;
 pub use projector::RunEventProjector;
+pub use tools_runtime::ToolsPipelineRuntime;
 
 use agent_core::operator_fabric::{FabricCommand, FabricEvent, OperatorFabric};
 use agent_core::{event_runtime::EventId, harness::*, operator::*, pipeline::*};
@@ -194,7 +202,7 @@ pub(super) async fn load(
         .ok_or_else(|| storage("missing operator run"))
 }
 
-pub(super) async fn put<T: Serialize>(
+pub(super) async fn put<T: Serialize + ?Sized>(
     blobs: &dyn BlobStore,
     value: &T,
 ) -> Result<BlobId, PipelineError> {

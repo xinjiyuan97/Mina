@@ -11,6 +11,22 @@ pub const BATCH_ITEMS: usize = 128;
 pub const BATCH_BYTES: usize = 32 * 1024;
 pub const BATCH_WINDOW: Duration = Duration::from_millis(40);
 
+pub(super) fn batch_end(journal: &[DeltaItem], through: usize) -> Result<usize, PipelineError> {
+    let mut end = through;
+    let mut bytes = 0;
+    while end < journal.len() && end - through < BATCH_ITEMS {
+        let size = serde_json::to_vec(&journal[end])
+            .map_err(super::storage)?
+            .len();
+        if end > through && bytes + size > BATCH_BYTES {
+            break;
+        }
+        bytes += size;
+        end += 1;
+    }
+    Ok(end)
+}
+
 pub struct ModelOutputAggregator {
     store: Arc<dyn PipelineStore>,
     blobs: Arc<dyn BlobStore>,
@@ -84,22 +100,14 @@ impl ModelOutputAggregator {
             if journal.iter().enumerate().any(|(index, item)| {
                 item.delta_seq != index as u64 + 1
                     || item.invocation_id != token.invocation_id
-                    || matches!(item.channel, DeltaChannel::ToolCall { .. })
+                    || matches!(
+                        item.channel,
+                        DeltaChannel::ToolCall { .. } | DeltaChannel::Control
+                    )
             }) {
                 return Err(PipelineError::Conflict);
             }
-            let mut end = through;
-            let mut bytes = 0;
-            while end < journal.len() && end - through < BATCH_ITEMS {
-                let size = serde_json::to_vec(&journal[end])
-                    .map_err(super::storage)?
-                    .len();
-                if end > through && bytes + size > BATCH_BYTES {
-                    break;
-                }
-                bytes += size;
-                end += 1;
-            }
+            let end = batch_end(journal, through)?;
             let merged = segments(&journal[through..end]);
             let batch = OutputBatch {
                 batch_id: format!("{}:{}:{}", token.invocation_id, through + 1, end),

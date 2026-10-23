@@ -5,6 +5,7 @@
 //! dispatch, and optional embedded script engines.
 
 pub mod adf;
+pub mod approval_operator;
 mod config;
 pub mod context_operator;
 mod event_runtime;
@@ -16,6 +17,8 @@ pub mod pipeline;
 pub mod run_runtime;
 mod runtime;
 pub mod script;
+pub mod tool_operator;
+pub mod tool_preparation;
 
 pub use config::{
     AdfConfig, AgentConfig, AgentKind, ApprovalConfig, ConfigError, ConfiguredSkill,

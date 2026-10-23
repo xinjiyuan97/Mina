@@ -7,6 +7,7 @@
 pub mod adf;
 pub mod context;
 pub mod context_operator;
+pub mod effect_pipeline;
 pub mod event_runtime;
 pub mod harness;
 pub mod memory;
@@ -18,3 +19,6 @@ pub mod sandbox;
 pub mod script;
 pub mod skill;
 pub mod tool;
+pub mod tool_authorization;
+pub mod tool_operator;
+pub mod tool_preparation;

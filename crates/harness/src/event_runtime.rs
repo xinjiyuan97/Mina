@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use agent_core::event_runtime::{
     ClaimDeliveries, ClaimTimers, CompleteDelivery, DeliveryRouter, EventComponentDescriptor,
-    EventError, EventStore, PublishEvent, PublishResult, RetryDelivery, ScheduleOnce, Subscription,
-    Timer,
+    EventEnvelope, EventError, EventId, EventStore, PublishEvent, PublishResult, RetryDelivery,
+    ScheduleOnce, Subscription, Timer,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +61,10 @@ impl EventRuntime {
 
     pub async fn publish(&self, command: PublishEvent) -> Result<PublishResult, EventError> {
         self.store.publish(command).await
+    }
+
+    pub async fn get_event(&self, event_id: EventId) -> Result<Option<EventEnvelope>, EventError> {
+        self.store.get_event(event_id).await
     }
 
     pub async fn subscribe(

@@ -26,12 +26,15 @@ mod single_turn;
 mod title;
 mod tool;
 
+pub(crate) use tool::digest_only_arguments;
+
 pub use agent_loop::{
     AGENT_LOOP_CHECKPOINT_SCHEMA_VERSION, AGENT_LOOP_REDUCER_PROTOCOL_VERSION, AgentLoop,
     AgentLoopDispatch, AgentLoopEffect, AgentLoopEffectKind, AgentLoopInput, AgentLoopOutcome,
     AgentLoopReducer, AgentLoopReducerConfig, AgentLoopReducerState, AgentLoopStart,
     AgentLoopStartDispatch, AgentLoopTransition, ModelInvocationPurpose, PortableToolError,
     ToolCallStrategy, ToolInvocation, ToolInvocationResult, ToolValidation, ToolValidationRequest,
+    resumed_tool_content,
 };
 pub use approval::{
     ApprovalDecision, ApprovalError, ApprovalFuture, ApprovalId, ApprovalPort, ApprovalRequest,

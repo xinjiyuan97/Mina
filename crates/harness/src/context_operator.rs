@@ -72,6 +72,12 @@ impl AdmissionFacade {
     }
 
     pub async fn publish(&self, request: ContextRequest) -> Result<(), FabricError> {
+        if request.execution_profile.as_deref().is_some_and(|profile| {
+            request.engine_version.is_legacy()
+                || !matches!(profile, "operator_v1_text" | "operator_v1_tools")
+        }) {
+            return Err(FabricError::Invalid("engine/profile mismatch".into()));
+        }
         if request.request_hash.is_empty() || request.max_steps == 0 {
             return Err(FabricError::Invalid(
                 "missing request hash or step budget".into(),
@@ -202,7 +208,12 @@ impl AdmissionFacade {
             },
         };
         let report = runtime
-            .tick(self.fabric.as_ref(), &self.operator, unix_time_ms)
+            .tick_for_consumer(
+                self.fabric.as_ref(),
+                &self.operator,
+                unix_time_ms,
+                CONTEXT_CONSUMER,
+            )
             .await?;
         self.changed.notify_waiters();
         Ok(report)

@@ -41,6 +41,8 @@ pub(crate) fn storage(error: impl std::fmt::Display) -> FabricError {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct FabricState {
+    #[serde(default)]
+    checkpoints: std::collections::BTreeMap<String, FabricCheckpoint>,
     events: Vec<StoredEvent>,
     subscriptions: Vec<StoredSubscription>,
     receipts: Vec<Receipt>,
@@ -240,7 +242,177 @@ impl FabricState {
     }
 
     pub(crate) fn apply(&mut self, command: FabricCommand) -> Result<FabricReply, FabricError> {
+        self.apply_scoped(command, None)
+    }
+
+    fn apply_scoped(
+        &mut self,
+        command: FabricCommand,
+        consumer: Option<&str>,
+    ) -> Result<FabricReply, FabricError> {
         match command {
+            FabricCommand::TransactMany {
+                mut checkpoints,
+                outbox,
+                delivery,
+            } => {
+                limit(checkpoints.len())?;
+                let mut keys = std::collections::BTreeSet::new();
+                let mut bytes = 0_usize;
+                for checkpoint in &checkpoints {
+                    if !keys.insert(&checkpoint.key) {
+                        return Err(invalid("duplicate checkpoint write"));
+                    }
+                    bytes = bytes.saturating_add(
+                        serde_json::to_vec(&checkpoint.value)
+                            .map_err(storage)?
+                            .len(),
+                    );
+                }
+                if bytes > MAX_CHECKPOINT_BYTES {
+                    return Err(invalid("checkpoint transaction byte limit"));
+                }
+                let last = checkpoints
+                    .pop()
+                    .ok_or_else(|| invalid("empty checkpoint transaction"))?;
+                for checkpoint in checkpoints {
+                    self.apply(FabricCommand::Transact {
+                        checkpoint,
+                        outbox: vec![],
+                        delivery: None,
+                    })?;
+                }
+                self.apply(FabricCommand::Transact {
+                    checkpoint: last,
+                    outbox,
+                    delivery,
+                })
+            }
+            FabricCommand::ClaimForConsumer {
+                consumer,
+                worker,
+                now_ms,
+                lease_ms,
+                limit,
+                max_attempts,
+            } => {
+                key(&consumer)?;
+                self.apply_scoped(
+                    FabricCommand::Claim {
+                        worker,
+                        now_ms,
+                        lease_ms,
+                        limit,
+                        max_attempts,
+                    },
+                    Some(&consumer),
+                )
+            }
+            FabricCommand::GuardedTransact {
+                lease,
+                now_ms,
+                checkpoint,
+                outbox,
+            } => {
+                let index = self.validate_lease(&lease, now_ms)?;
+                if self.subscriptions[index].offset >= lease.offset {
+                    return Err(FabricError::Fenced);
+                }
+                let source = self
+                    .stream(index)
+                    .into_iter()
+                    .find(|item| item.offset == lease.offset)
+                    .ok_or(FabricError::AckHole)?
+                    .event;
+                if outbox.iter().any(|event| !same_partition(&source, event)) {
+                    return Err(invalid("outbox belongs to another run"));
+                }
+                self.apply(FabricCommand::Transact {
+                    checkpoint,
+                    outbox,
+                    delivery: None,
+                })
+            }
+            FabricCommand::ReadCheckpoint(identity) => {
+                key(&identity)?;
+                Ok(FabricReply::Checkpoint(
+                    self.checkpoints.get(&identity).cloned(),
+                ))
+            }
+            FabricCommand::Transact {
+                checkpoint,
+                mut outbox,
+                delivery,
+            } => {
+                key(&checkpoint.key)?;
+                if self
+                    .checkpoints
+                    .get(&checkpoint.key)
+                    .map(|record| record.version)
+                    != checkpoint.expected
+                {
+                    return Err(FabricError::Fenced);
+                }
+                if serde_json::to_vec(&checkpoint.value)
+                    .map_err(storage)?
+                    .len()
+                    > MAX_CHECKPOINT_BYTES
+                {
+                    return Err(invalid("checkpoint byte limit"));
+                }
+                let version = checkpoint
+                    .expected
+                    .map_or(Some(0), |version| version.checked_add(1))
+                    .ok_or_else(|| invalid("checkpoint version overflow"))?;
+                let mut previous = outbox.first().map_or(0, |first| {
+                    self.events
+                        .iter()
+                        .rev()
+                        .find(|stored| same_partition(&stored.event, first))
+                        .map_or(0, |stored| stored.event.envelope.operator_seq.0)
+                });
+                for event in &mut outbox {
+                    if event.envelope.operator_seq.0 != 0 {
+                        return Err(invalid("transaction sequences must be assigned by fabric"));
+                    }
+                    if self
+                        .events
+                        .iter()
+                        .any(|stored| stored.event.envelope.event_id == event.envelope.event_id)
+                    {
+                        return Err(FabricError::Conflict);
+                    }
+                    previous = previous
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("sequence overflow"))?;
+                    event.envelope.operator_seq.0 = previous;
+                }
+                if let Some((lease, now_ms)) = delivery {
+                    let index = self.validate_lease(&lease, now_ms)?;
+                    let source = self
+                        .stream(index)
+                        .into_iter()
+                        .find(|item| item.offset == lease.offset)
+                        .ok_or(FabricError::AckHole)?
+                        .event;
+                    if outbox.iter().any(|event| !same_partition(&source, event)) {
+                        return Err(invalid("outbox belongs to another run"));
+                    }
+                    self.apply(FabricCommand::Commit {
+                        lease, now_ms,
+                        result: serde_json::json!({"checkpoint_key":checkpoint.key,"checkpoint_version":version}),
+                        outbox,
+                    })?;
+                } else if !outbox.is_empty() {
+                    self.publish(outbox, false)?;
+                }
+                let record = FabricCheckpoint {
+                    version,
+                    value: checkpoint.value,
+                };
+                self.checkpoints.insert(checkpoint.key, record.clone());
+                Ok(FabricReply::Checkpoint(Some(record)))
+            }
             FabricCommand::ScanEvents {
                 topic,
                 event_type,
@@ -344,6 +516,9 @@ impl FabricState {
                         break;
                     }
                     let current = &self.subscriptions[index];
+                    if consumer.is_some_and(|consumer| consumer != current.spec.consumer) {
+                        continue;
+                    }
                     if current.due_at_ms > now_ms
                         || current.lease.as_ref().is_some_and(|lease| {
                             lease.offset > current.offset && lease.expires_at_ms > now_ms

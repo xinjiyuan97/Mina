@@ -178,6 +178,66 @@ pub enum DeltaChannel {
     Text,
     Reasoning,
     ToolCall { call_id: String },
+    Control,
+}
+
+pub fn model_delta(
+    invocation: &str,
+    sequence: u64,
+    event: &crate::harness::ModelEvent,
+) -> Result<DeltaItem, PipelineError> {
+    use crate::harness::ModelEvent;
+    let (channel, fragment) = match event {
+        ModelEvent::TextDelta { delta } => (DeltaChannel::Text, delta.clone()),
+        ModelEvent::ReasoningDelta { delta } => (DeltaChannel::Reasoning, delta.clone()),
+        ModelEvent::ToolCallArgumentsDelta { call_id, delta } => (
+            DeltaChannel::ToolCall {
+                call_id: call_id.clone(),
+            },
+            delta.clone(),
+        ),
+        ModelEvent::Completed { .. } | ModelEvent::Failed { .. } => {
+            return Err(PipelineError::Conflict);
+        }
+        _ => (
+            DeltaChannel::Control,
+            serde_json::to_string(event)
+                .map_err(|error| PipelineError::Storage(error.to_string()))?,
+        ),
+    };
+    Ok(DeltaItem {
+        invocation_id: invocation.into(),
+        delta_seq: sequence,
+        channel,
+        fragment,
+    })
+}
+
+pub fn delta_event(item: &DeltaItem) -> Result<crate::harness::ModelEvent, PipelineError> {
+    use crate::harness::ModelEvent;
+    match &item.channel {
+        DeltaChannel::Text => Ok(ModelEvent::TextDelta {
+            delta: item.fragment.clone(),
+        }),
+        DeltaChannel::Reasoning => Ok(ModelEvent::ReasoningDelta {
+            delta: item.fragment.clone(),
+        }),
+        DeltaChannel::ToolCall { call_id } => Ok(ModelEvent::ToolCallArgumentsDelta {
+            call_id: call_id.clone(),
+            delta: item.fragment.clone(),
+        }),
+        DeltaChannel::Control => {
+            let event = serde_json::from_str(&item.fragment)
+                .map_err(|error| PipelineError::Storage(error.to_string()))?;
+            if matches!(
+                event,
+                ModelEvent::Completed { .. } | ModelEvent::Failed { .. }
+            ) {
+                return Err(PipelineError::Conflict);
+            }
+            Ok(event)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,6 +401,7 @@ pub fn segments(items: &[DeltaItem]) -> Vec<OutputSegment> {
     for item in items {
         if let Some(last) = result.last_mut()
             && last.channel == item.channel
+            && item.channel != DeltaChannel::Control
             && last.last_seq + 1 == item.delta_seq
         {
             last.last_seq = item.delta_seq;

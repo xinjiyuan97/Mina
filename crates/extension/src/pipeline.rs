@@ -4,6 +4,9 @@ use tokio::sync::mpsc;
 pub const DATA_CAPACITY: usize = 32;
 pub const MAX_MESSAGE_ITEMS: usize = 128;
 
+mod artifacts;
+pub use artifacts::FabricBlobStore;
+
 #[derive(Clone)]
 pub struct DeltaSender(mpsc::Sender<Vec<DeltaItem>>);
 pub struct DeltaReceiver(mpsc::Receiver<Vec<DeltaItem>>);

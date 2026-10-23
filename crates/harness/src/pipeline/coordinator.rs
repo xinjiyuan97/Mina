@@ -241,7 +241,7 @@ impl RunCoordinator {
                             DeltaChannel::Reasoning => Some(ModelEvent::ReasoningDelta {
                                 delta: item.fragment.clone(),
                             }),
-                            DeltaChannel::ToolCall { .. } => None,
+                            DeltaChannel::ToolCall { .. } | DeltaChannel::Control => None,
                         })
                         .collect::<Vec<_>>();
                     if let Some(usage) = final_artifact.usage {
