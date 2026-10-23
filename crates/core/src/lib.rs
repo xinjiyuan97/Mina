@@ -11,6 +11,7 @@ pub mod harness;
 pub mod memory;
 pub mod observability;
 pub mod operator;
+pub mod operator_fabric;
 pub mod sandbox;
 pub mod script;
 pub mod skill;

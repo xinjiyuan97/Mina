@@ -1,0 +1,17 @@
+New Fabric files: forbidden execution-symbol search
+rg exit=1 (1 means no matches)
+
+Production references to new module
+crates/harness/src/operator_fabric.rs:3:use agent_core::operator_fabric::*;
+crates/core/src/lib.rs:14:pub mod operator_fabric;
+crates/harness/src/lib.rs:13:pub mod operator_fabric;
+crates/extension/src/operator_fabric.rs:7:    operator_fabric::*,
+crates/extension/src/store/operator.rs:2:use crate::operator_fabric::{FabricState, storage};
+crates/extension/src/store/operator.rs:3:use agent_core::operator_fabric::*;
+crates/extension/src/store/operator.rs:10:            ..crate::operator_fabric::MemoryFabric::default().capabilities()
+crates/extension/src/store/operator.rs:48:            "SELECT state_json FROM workflow_operator_fabric_v1 WHERE singleton = 1",
+crates/extension/src/store/operator.rs:61:        transaction.execute("INSERT INTO workflow_operator_fabric_v1 (singleton, state_json) VALUES (1, ?1) ON CONFLICT(singleton) DO UPDATE SET state_json = excluded.state_json", [encoded]).map_err(storage)?;
+crates/extension/src/lib.rs:15:pub mod operator_fabric;
+crates/extension/src/store/event.rs:2054:         CREATE TABLE IF NOT EXISTS workflow_operator_fabric_v1 (
+
+Protected path diff

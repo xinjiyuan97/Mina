@@ -2051,6 +2051,10 @@ fn migrate(connection: &Connection) -> Result<(), EventError> {
     connection
         .execute_batch(
             "BEGIN IMMEDIATE;
+         CREATE TABLE IF NOT EXISTS workflow_operator_fabric_v1 (
+             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+             state_json TEXT NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS workflow_events (
             sequence INTEGER PRIMARY KEY AUTOINCREMENT,
             event_id TEXT NOT NULL UNIQUE,

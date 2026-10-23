@@ -12,6 +12,7 @@ pub mod context;
 #[cfg(feature = "adf")]
 pub mod adf;
 
+pub mod operator_fabric;
 pub mod provider;
 
 #[cfg(feature = "workspace")]

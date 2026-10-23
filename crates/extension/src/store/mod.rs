@@ -9,6 +9,8 @@ mod job;
 #[cfg(feature = "sqlite")]
 mod memory;
 #[cfg(feature = "sqlite")]
+mod operator;
+#[cfg(feature = "sqlite")]
 mod run;
 #[cfg(feature = "filesystem")]
 mod skill;

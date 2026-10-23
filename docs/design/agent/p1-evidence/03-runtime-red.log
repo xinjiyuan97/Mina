@@ -1,0 +1,45 @@
+   Compiling agent-core v0.1.0 (/data/work/Mina/crates/core)
+   Compiling agent-extension v0.1.0 (/data/work/Mina/crates/extension)
+   Compiling agent-harness v0.1.0 (/data/work/Mina/crates/harness)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.89s
+     Running tests/operator_fabric_runtime.rs (target/debug/deps/operator_fabric_runtime-dc1501922c185897)
+
+running 4 tests
+test coordinator_backoff_then_dlq ... FAILED
+test coordinator_commits_once_for_duplicate_deliveries ... FAILED
+test coordinator_checks_time_after_handler ... FAILED
+test coordinator_sqlite_receipt_survives_reopen ... FAILED
+
+failures:
+
+---- coordinator_backoff_then_dlq stdout ----
+
+thread 'coordinator_backoff_then_dlq' (746) panicked at crates/harness/tests/operator_fabric_runtime.rs:78:61:
+retry: Storage("P1 RED: coordinator not implemented")
+
+---- coordinator_commits_once_for_duplicate_deliveries stdout ----
+
+thread 'coordinator_commits_once_for_duplicate_deliveries' (748) panicked at crates/harness/tests/operator_fabric_runtime.rs:65:63:
+tick: Storage("P1 RED: coordinator not implemented")
+
+---- coordinator_checks_time_after_handler stdout ----
+
+thread 'coordinator_checks_time_after_handler' (747) panicked at crates/harness/tests/operator_fabric_runtime.rs:90:98:
+expired handler: Storage("P1 RED: coordinator not implemented")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- coordinator_sqlite_receipt_survives_reopen stdout ----
+
+thread 'coordinator_sqlite_receipt_survives_reopen' (749) panicked at crates/harness/tests/operator_fabric_runtime.rs:104:61:
+commit: Storage("P1 RED: coordinator not implemented")
+
+
+failures:
+    coordinator_backoff_then_dlq
+    coordinator_checks_time_after_handler
+    coordinator_commits_once_for_duplicate_deliveries
+    coordinator_sqlite_receipt_survives_reopen
+
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p agent-harness --test operator_fabric_runtime`

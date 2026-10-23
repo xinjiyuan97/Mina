@@ -1,0 +1,33 @@
+   Compiling agent-extension v0.1.0 (/data/work/Mina/crates/extension)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.01s
+     Running tests/operator_fabric_contract.rs (target/debug/deps/operator_fabric_contract-930451f6e8e496c3)
+
+running 2 tests
+test memory::outbox_batch_visibility ... FAILED
+test sqlite::outbox_batch_visibility ... FAILED
+
+failures:
+
+---- memory::outbox_batch_visibility stdout ----
+
+thread 'memory::outbox_batch_visibility' (140) panicked at crates/extension/tests/operator_fabric_contract.rs:216:5:
+assertion `left == right` failed
+  left: Dispatched(1)
+ right: Dispatched(2)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- sqlite::outbox_batch_visibility stdout ----
+
+thread 'sqlite::outbox_batch_visibility' (141) panicked at crates/extension/tests/operator_fabric_contract.rs:216:5:
+assertion `left == right` failed
+  left: Dispatched(1)
+ right: Dispatched(2)
+
+
+failures:
+    memory::outbox_batch_visibility
+    sqlite::outbox_batch_visibility
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 19 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p agent-extension --test operator_fabric_contract`
