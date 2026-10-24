@@ -35,6 +35,11 @@ pub struct PreparedRun {
     pub max_steps: u32,
 }
 
+pub struct ScannedRequest {
+    pub run_id: RunId,
+    pub request: Result<ContextRequest, FabricError>,
+}
+
 impl AdmissionFacade {
     pub fn fabric(&self) -> Arc<dyn OperatorFabric> {
         self.fabric.clone()
@@ -139,6 +144,14 @@ impl AdmissionFacade {
     }
 
     pub async fn requests(&self) -> Result<Vec<ContextRequest>, FabricError> {
+        self.scan_requests()
+            .await?
+            .into_iter()
+            .map(|entry| entry.request)
+            .collect()
+    }
+
+    pub async fn scan_requests(&self) -> Result<Vec<ScannedRequest>, FabricError> {
         let mut requests = Vec::new();
         let mut after = 0;
         loop {
@@ -159,9 +172,14 @@ impl AdmissionFacade {
             }
             for item in page {
                 after = item.offset;
-                let payload: RequestPayload =
-                    serde_json::from_value(item.event.envelope.payload).map_err(storage)?;
-                requests.push(self.get(payload.request_ref).await?);
+                let run_id = item.event.envelope.run_id;
+                let request = async {
+                    let payload: RequestPayload =
+                        serde_json::from_value(item.event.envelope.payload).map_err(storage)?;
+                    self.get(payload.request_ref).await
+                }
+                .await;
+                requests.push(ScannedRequest { run_id, request });
             }
         }
         Ok(requests)

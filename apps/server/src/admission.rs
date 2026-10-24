@@ -129,9 +129,7 @@ async fn replay_attachments_match(
                     }
                     false
                 }
-                AttachmentNameInput::Null if original.name.is_some() => return false,
-                AttachmentNameInput::Omitted => original.name.is_some(),
-                AttachmentNameInput::Null => false,
+                AttachmentNameInput::Omitted | AttachmentNameInput::Null => original.name.is_some(),
             }
         };
         if needs_name_metadata || (original.size_bytes.is_none() && input.size_bytes.is_some()) {
@@ -321,9 +319,13 @@ pub(super) async fn recover_once(
     state: &AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut first_error = None;
-    for request in state.admission.requests().await? {
-        let run_id = request.run_id;
-        if let Err(error) = recover_request(state, request).await {
+    for entry in state.admission.scan_requests().await? {
+        let run_id = entry.run_id;
+        let result = match entry.request {
+            Ok(request) => recover_request(state, request).await,
+            Err(error) => Err(error.into()),
+        };
+        if let Err(error) = result {
             tracing::error!(%run_id, code = "run_recovery_failed", "run recovery failed; continuing scan");
             first_error.get_or_insert(error);
         }

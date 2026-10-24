@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "p6_second_review_tests.rs"]
+mod second_review;
 use agent_harness::{
     context_operator::legacy_plan,
     pipeline::{PipelineRuntime, PipelineStart},

@@ -29,6 +29,8 @@
   同时参与新请求 hash，覆盖 Session reservation 到 Context publication 的窗口。
   旧记录默认 None 并省略序列化，旧 hash/digest 不重写。旧 name 缺失来源信息时保守校验，
   必要时读取 Blob 名称元数据，无法确认则拒绝，不推测原请求。
+  对旧记录的 null/omitted：若规范名称非空，必须确认它等于 Blob 的存储名称才接受；
+  不能把请求别名删除为 null/omitted，也不能将旧 null 一律判为冲突。新记录仍严格区分三态。
 
 ## 完整链路与身份
 
@@ -45,6 +47,10 @@
    已存在 text ledger 使用持久 reducer.config 恢复，不使用当前默认 model/output limit；
    input、有序附件、prior history、context fingerprint 仍参与原 start digest 校验。
    恢复扫描隔离每条 Run 的恢复错误，继续处理后续 Run，最后返回首个错误供监控报告。
+   `scan_requests` 按事件返回 envelope run_id 及请求解码/加载结果，坏 payload、缺失或损坏
+   artifact 不阻止后续条目枚举。启动阶段同样使用该接口，并把坏 Run 保留在 pending 集合中，
+   避免被 legacy interrupted 清理误终结；错误通过固定日志代码报告，不丢弃原持久事实。
+   需要完整请求集合的 `requests` 接口仍遇错返回 Err；Fabric 页读取整体失败仍是扫描错误。
 6. reducer 生成 ModelRequest，当前附件和历史附件在后续工具轮中保留。
    model.requested 事件只有 request_ref；artifact 为含引用的 JSON，不含输入二进制。
 7. text ModelOperator 比较 artifact 与 reducer 的 pending InvokeModel；tools ModelOperator

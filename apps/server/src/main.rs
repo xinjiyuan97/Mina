@@ -908,10 +908,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         approval_cleanup.remove_run(run_id);
     });
     let pending_context = admission
-        .requests()
+        .scan_requests()
         .await?
         .into_iter()
-        .map(|request| request.run_id)
+        .map(|entry| {
+            if entry.request.is_err() {
+                tracing::error!(run_id = %entry.run_id, code = "run_recovery_failed",
+                    "corrupt admission retained for recovery; continuing startup");
+            }
+            entry.run_id
+        })
         .collect();
     let recovered = runtime.recover_interrupted_except(&pending_context).await?;
     if recovered > 0 {
