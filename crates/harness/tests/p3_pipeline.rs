@@ -16,6 +16,142 @@ struct FakeModel {
     calls: Arc<AtomicUsize>,
     tool: bool,
 }
+
+#[tokio::test]
+async fn p6_model_artifact_must_match_durable_reducer_request() {
+    let directory = tempfile::tempdir().expect("temp");
+    let path = directory.path().join("runs.db");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let blobs: Arc<dyn BlobStore> =
+        Arc::new(FilesystemBlobStore::new(directory.path().join("blobs")));
+    let store = Arc::new(SqlitePipelineStore::open(&path).expect("ledger"));
+    let runs = Arc::new(SqliteRunStore::open(&path).await.expect("runs"));
+    let runtime = PipelineRuntime::new(
+        store.clone(),
+        runs,
+        blobs.clone(),
+        Arc::new(FakeModel {
+            calls: calls.clone(),
+            tool: false,
+        }),
+    );
+    let run_id = RunId::new();
+    let mut start = PipelineStart::text(run_id, "hello", "fake");
+    start.start.attachments.push(ModelAttachment {
+        blob_id: BlobId::new(),
+        media_type: "image/png".into(),
+        name: None,
+        size_bytes: None,
+    });
+    runtime.admit(start).await.expect("admit");
+    let reference = store
+        .load(run_id)
+        .await
+        .expect("load")
+        .expect("record")
+        .model_request_ref
+        .expect("ref");
+    let object = blobs.get(reference).await.expect("get").expect("object");
+    let mut changed: ModelRequest = serde_json::from_slice(&object.data).expect("request");
+    changed.messages.last_mut().expect("user").attachments[0].blob_id = BlobId::new();
+    std::fs::write(
+        directory
+            .path()
+            .join("blobs")
+            .join(format!("{reference}.blob")),
+        serde_json::to_vec(&changed).expect("serialize"),
+    )
+    .expect("inject tampered artifact");
+    assert!(matches!(
+        runtime.drive(run_id).await,
+        Err(PipelineError::Conflict)
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn p6_pending_model_reopen_reference_only_and_old_text_checkpoint() {
+    struct Capture(std::sync::Mutex<Vec<ModelRequest>>);
+    impl ModelPort for Capture {
+        fn stream(&self, request: ModelRequest) -> ModelEventStream {
+            self.0.lock().expect("lock").push(request);
+            Box::pin(stream::iter([ModelEvent::Completed {
+                finish_reason: FinishReason::Stop,
+            }]))
+        }
+    }
+    for multimodal in [false, true] {
+        let directory = tempfile::tempdir().expect("temp");
+        let path = directory.path().join("runs.db");
+        let blobs: Arc<dyn BlobStore> =
+            Arc::new(FilesystemBlobStore::new(directory.path().join("blobs")));
+        let model = Arc::new(Capture(std::sync::Mutex::new(vec![])));
+        let run_id = RunId::new();
+        let mut start = PipelineStart::text(run_id, "", "fake");
+        if multimodal {
+            for name in ["first.png", "second.png"] {
+                let blob = blobs
+                    .put(PutBlob {
+                        media_type: "image/png".into(),
+                        name: Some(name.into()),
+                        data: b"P6_PRIVATE_BINARY_SENTINEL".to_vec(),
+                        created_at_ms: 1,
+                    })
+                    .await
+                    .expect("blob");
+                start.start.attachments.push(ModelAttachment {
+                    blob_id: blob.blob_id,
+                    media_type: blob.media_type,
+                    name: blob.name,
+                    size_bytes: Some(blob.size_bytes),
+                });
+            }
+        } else {
+            let mut old = serde_json::to_value(&start.start).expect("json");
+            old.as_object_mut().expect("object").remove("attachments");
+            start.start = serde_json::from_value(old).expect("old text start");
+        }
+        {
+            let store = Arc::new(SqlitePipelineStore::open(&path).expect("ledger"));
+            let runs = Arc::new(SqliteRunStore::open(&path).await.expect("runs"));
+            let runtime = PipelineRuntime::new(store.clone(), runs, blobs.clone(), model.clone());
+            runtime
+                .admit(start.clone())
+                .await
+                .expect("admit pending model");
+            let record = store.load(run_id).await.expect("load").expect("record");
+            assert_eq!(record.ledger.phase, RunPhase::AwaitingModel);
+            let reference = record.model_request_ref.expect("request ref");
+            let artifact = blobs.get(reference).await.expect("blob").expect("artifact");
+            let request: ModelRequest =
+                serde_json::from_slice(&artifact.data).expect("request artifact");
+            assert_eq!(
+                request.messages.last().expect("user").attachments,
+                start.start.attachments
+            );
+            let fact = record
+                .facts
+                .iter()
+                .find(|event| event.event_type == "model.requested")
+                .expect("fact");
+            assert_eq!(fact.payload["request_ref"], serde_json::json!(reference));
+            let serialized = serde_json::to_string(&record).expect("serialize");
+            assert!(!serialized.contains("P6_PRIVATE_BINARY_SENTINEL"));
+            assert!(!serialized.contains("base64"));
+        }
+        let store = Arc::new(SqlitePipelineStore::open(&path).expect("reopen ledger"));
+        let runs = Arc::new(SqliteRunStore::open(&path).await.expect("reopen runs"));
+        let runtime = PipelineRuntime::new(store, runs, blobs, model.clone());
+        runtime.admit(start.clone()).await.expect("replay");
+        runtime.drive(run_id).await.expect("resume model");
+        let captured = model.0.lock().expect("capture");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].messages.last().expect("user").attachments,
+            start.start.attachments
+        );
+    }
+}
 impl ModelPort for FakeModel {
     fn stream(&self, _: ModelRequest) -> ModelEventStream {
         self.calls.fetch_add(1, Ordering::SeqCst);

@@ -470,9 +470,10 @@ impl ContextPreparer for AgentContextPreparer {
                 })?;
             let mut hasher = Sha256::new();
             hasher.update(request.input.as_bytes());
-            for attachment in &request.attachments {
-                hasher.update(attachment.blob_id.to_string().as_bytes());
-                hasher.update(attachment.media_type.as_bytes());
+            if !request.attachments.is_empty() {
+                hasher.update(b"\0attachments:v1\0");
+                hasher
+                    .update(serde_json::to_vec(&request.attachments).expect("attachment identity"));
             }
             for skill in &resolved_skills {
                 hasher.update(skill.locked.skill_id.0.as_bytes());

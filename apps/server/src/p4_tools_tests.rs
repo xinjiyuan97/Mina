@@ -386,7 +386,7 @@ impl ToolPort for Tools {
 
 async fn fixture(
     path: &std::path::Path,
-    model: Arc<Model>,
+    model: Arc<dyn ModelPort>,
     tools: Arc<Tools>,
 ) -> (AppState, tokio::task::JoinHandle<()>) {
     let mut state = tests::test_state();
@@ -451,6 +451,9 @@ async fn fixture(
     ));
     (state, context_worker)
 }
+
+#[path = "p6_tests.rs"]
+mod p6;
 
 fn parse_frame(frame: &str) -> Option<Value> {
     let data = frame.lines().find_map(|line| line.strip_prefix("data: "))?;

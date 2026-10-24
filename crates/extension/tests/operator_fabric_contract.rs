@@ -493,6 +493,65 @@ async fn p5_retention_inventory_protects_active_outbox_and_checkpoint_references
     ));
 }
 
+#[tokio::test]
+async fn p6_retention_protects_attachment_and_session_blob_roots() {
+    use agent_core::harness::{BlobId, ContentPart, ModelAttachment};
+    let store = MemoryFabric::default();
+    let active = BlobId::new();
+    let session = BlobId::new();
+    for blob in [active, session] {
+        store
+            .execute(FabricCommand::Transact {
+                checkpoint: CheckpointWrite {
+                    key: format!("pipeline-artifact:{blob}"),
+                    expected: None,
+                    value: json!({"metadata":{"blob_id":blob,"created_at_ms":0},"chunks":1}),
+                },
+                outbox: vec![],
+                delivery: None,
+            })
+            .await
+            .expect("manifest");
+    }
+    store.execute(FabricCommand::Transact {
+        checkpoint: CheckpointWrite { key: "p6-active-context".into(), expected: None,
+            value: json!({"attachments":[ModelAttachment { blob_id: active, media_type: "image/png".into(), name: None, size_bytes: Some(3) }]}) },
+        outbox: vec![], delivery: None,
+    }).await.expect("context checkpoint");
+    let part = ContentPart::BlobRef {
+        blob_id: session,
+        media_type: "application/pdf".into(),
+        name: None,
+        size_bytes: Some(3),
+    };
+    let ContentPart::BlobRef { blob_id, .. } = part else {
+        panic!("blob ref")
+    };
+    let FabricReply::Retention(report) = store
+        .execute(FabricCommand::InspectRetention {
+            now_ms: 1000,
+            grace_ms: 1,
+            external_roots: vec![blob_id],
+        })
+        .await
+        .expect("inspect")
+    else {
+        panic!("inventory")
+    };
+    assert_eq!(report.protected_artifacts, 2);
+    assert!(report.orphan_candidates.is_empty());
+    for blob in [active, session] {
+        assert!(matches!(
+            store
+                .execute(FabricCommand::ReadCheckpoint(format!(
+                    "pipeline-artifact:{blob}"
+                )))
+                .await,
+            Ok(FabricReply::Checkpoint(Some(_)))
+        ));
+    }
+}
+
 fn subscription(name: &str) -> SubscriptionSpec {
     SubscriptionSpec {
         consumer: "consumer".into(),

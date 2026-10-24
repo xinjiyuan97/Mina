@@ -18,6 +18,86 @@ pub(super) async fn owned(
     }
 }
 
+pub(super) async fn session_inputs(
+    state: &AppState,
+    session_id: SessionId,
+    request: &SubmitSessionRunRequest,
+    max_steps: u32,
+) -> Result<(ResolvedBlobInputs, String), Response> {
+    let existing = state
+        .orchestration
+        .sessions
+        .run_for_idempotency_key(session_id, request.idempotency_key.clone())
+        .await
+        .map_err(map_session_error)?;
+    if let Some(run_id) = existing {
+        let saved = state.admission.request(run_id).await.map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "admission_unavailable",
+                "persisted admission could not be read",
+                true,
+            )
+        })?;
+        if let Some(saved) = saved {
+            let identity_matches =
+                request.attachments.len() == saved.attachments.len()
+                    && request.attachments.iter().zip(&saved.attachments).all(
+                        |(input, original)| {
+                            input.blob_id == original.blob_id
+                                && input
+                                    .media_type
+                                    .as_ref()
+                                    .is_none_or(|mime| mime == &original.media_type)
+                                && input
+                                    .name
+                                    .as_ref()
+                                    .is_none_or(|name| original.name.as_ref() == Some(name))
+                                && input.size_bytes.is_none_or(|size| {
+                                    original.size_bytes.is_none_or(|stored| size == stored)
+                                })
+                        },
+                    );
+            let skills = saved
+                .explicit_skills
+                .iter()
+                .map(|(id, version)| SkillChoice {
+                    skill_id: id.0.clone(),
+                    version: version.clone(),
+                })
+                .collect::<Vec<_>>();
+            if !identity_matches
+                || raw_request_hash(
+                    &request.input,
+                    &saved.attachments,
+                    &request.skills,
+                    max_steps,
+                ) != raw_request_hash(&saved.input, &saved.attachments, &skills, saved.max_steps)
+            {
+                return Err(map_session_error(SessionStoreError::IdempotencyConflict));
+            }
+            return Ok((
+                ResolvedBlobInputs {
+                    model: saved.attachments,
+                    content: vec![],
+                },
+                saved.request_hash,
+            ));
+        }
+    }
+    let resolved = resolve_blob_inputs(state, request.attachments.clone())
+        .await
+        .map_err(|error| {
+            if existing.is_some() && error.status().is_client_error() {
+                map_session_error(SessionStoreError::IdempotencyConflict)
+            } else {
+                error
+            }
+        })?;
+    let hash = raw_request_hash(&request.input, &resolved.model, &request.skills, max_steps);
+    Ok((resolved, hash))
+}
+
 pub(super) async fn prepare(
     state: &AppState,
     request: PrepareRunRequest,
@@ -36,14 +116,6 @@ pub(super) async fn prepare(
         .map(|id| id.to_string())
         .unwrap_or_else(|| request.run_id.to_string());
     let profile = state.rollout.select(state.pipeline_profile, &identity);
-    if profile != crate::tools_pipeline::EngineProfile::Legacy && !request.attachments.is_empty() {
-        return Err(api_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "unsupported_input_modality",
-            "operator_v1 accepts text only",
-            false,
-        ));
-    }
     let config = &orchestration.config;
     let request = ContextRequest {
         engine_version: profile.engine(),

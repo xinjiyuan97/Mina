@@ -785,6 +785,39 @@ mod tests {
     use std::convert::Infallible;
 
     use super::*;
+
+    #[tokio::test]
+    async fn p6_chat_input_matrix() {
+        for (mime, kind) in [
+            ("image/png", Some("image_url")),
+            ("audio/wav", Some("input_audio")),
+            ("audio/mpeg", Some("input_audio")),
+            ("application/pdf", Some("file")),
+            ("application/octet-stream", Some("file")),
+            ("video/mp4", None),
+            ("audio/ogg", None),
+            ("image/svg+xml", None),
+        ] {
+            let (request, store, _directory) = crate::provider::attachment::fixture(mime).await;
+            let result = ChatCompletionRequest::from_model_request(&request, Some(&store)).await;
+            if let Some(kind) = kind {
+                let body = serde_json::to_value(result.expect("supported")).expect("json");
+                assert_eq!(body["messages"][0]["content"][0]["type"], kind);
+            } else {
+                assert!(result.is_err(), "must reject {mime}");
+            }
+            for role in [ModelRole::System, ModelRole::Assistant, ModelRole::Tool] {
+                let mut invalid = request.clone();
+                invalid.messages[0].role = role;
+                invalid.messages[0].tool_call_id = Some("call".into());
+                assert!(
+                    ChatCompletionRequest::from_model_request(&invalid, Some(&store))
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
     use agent_core::harness::{
         BlobId, BlobMetadata, BlobObject, BlobStoreError, BlobStoreFuture, ModelAttachment,
         PutBlob, RunId,
@@ -915,6 +948,7 @@ mod tests {
                     blob_id,
                     media_type: "image/png".into(),
                     name: Some("screen.png".into()),
+                    size_bytes: None,
                 }],
             )],
             tools: Vec::new(),

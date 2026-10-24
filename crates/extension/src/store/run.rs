@@ -192,6 +192,20 @@ impl InMemoryRunStore {
 }
 
 impl SessionStore for InMemoryRunStore {
+    fn run_for_idempotency_key(
+        &self,
+        session_id: SessionId,
+        key: String,
+    ) -> SessionStoreFuture<'_, Option<RunId>> {
+        Box::pin(async move {
+            Ok(self
+                .lock_sessions()?
+                .get(&session_id)
+                .and_then(|session| session.runs.get(&key))
+                .map(|run| run.run_id))
+        })
+    }
+
     fn create_session(&self, command: CreateSession) -> SessionStoreFuture<'_, SessionSnapshot> {
         Box::pin(async move {
             let mut sessions = self.lock_sessions()?;
@@ -767,6 +781,24 @@ impl RunStore for SqliteRunStore {
 }
 
 impl SessionStore for SqliteRunStore {
+    fn run_for_idempotency_key(
+        &self,
+        session_id: SessionId,
+        key: String,
+    ) -> SessionStoreFuture<'_, Option<RunId>> {
+        let connection = Arc::clone(&self.connection);
+        Box::pin(async move {
+            run_session_blocking(move || {
+                let connection = lock_session_connection(&connection)?;
+                let run_id: Option<String> = connection.query_row(
+                    "SELECT run_id FROM session_runs WHERE session_id = ?1 AND idempotency_key = ?2",
+                    params![session_id.to_string(), key], |row| row.get(0),
+                ).optional().map_err(|error| session_sql_error("read session idempotency", error))?;
+                run_id.map(|id| id.parse().map_err(|_| SessionStoreError::backend("invalid stored run id"))).transpose()
+            }).await
+        })
+    }
+
     fn create_session(&self, command: CreateSession) -> SessionStoreFuture<'_, SessionSnapshot> {
         let connection = Arc::clone(&self.connection);
         Box::pin(async move {

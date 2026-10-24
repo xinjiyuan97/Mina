@@ -47,6 +47,8 @@ pub struct ModelAttachment {
     pub media_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
 }
 
 /// One normalized conversation message. Provider adapters map this shape to

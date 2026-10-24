@@ -1321,10 +1321,10 @@ async fn upload_blob(
             }),
         )
             .into_response(),
-        Err(error) => api_error(
+        Err(_) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "blob_store_error",
-            error.to_string(),
+            "attachment storage is unavailable",
             true,
         ),
     }
@@ -1349,11 +1349,11 @@ async fn download_blob(State(state): State<AppState>, Path(blob_id): Path<String
                 false,
             );
         }
-        Err(error) => {
+        Err(_) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "blob_store_error",
-                error.to_string(),
+                "attachment storage is unavailable",
                 true,
             );
         }
@@ -1707,10 +1707,11 @@ async fn submit_session_run_owned(
         Ok(max_steps) => max_steps,
         Err(error) => return map_run_max_steps_error(error),
     };
-    let attachments = match resolve_blob_inputs(&state, request.attachments).await {
-        Ok(attachments) => attachments,
-        Err(error) => return error,
-    };
+    let (attachments, hash) =
+        match admission::session_inputs(&state, session_id, &request, max_steps).await {
+            Ok(resolved) => resolved,
+            Err(error) => return error,
+        };
     if request.input.trim().is_empty() && attachments.model.is_empty() {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -1721,12 +1722,6 @@ async fn submit_session_run_owned(
     }
     let run_id = RunId::new();
     let now_ms = run_runtime::unix_time_ms();
-    let hash = raw_request_hash(
-        &request.input,
-        &attachments.model,
-        &request.skills,
-        max_steps,
-    );
     let mut input_parts = Vec::with_capacity(attachments.content.len() + 1);
     if !request.input.is_empty() {
         input_parts.push(ContentPart::text(request.input.clone()));
@@ -2665,11 +2660,11 @@ async fn resolve_blob_inputs(
             .blobs
             .get(input.blob_id)
             .await
-            .map_err(|error| {
+            .map_err(|_| {
                 api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "blob_store_error",
-                    error.to_string(),
+                    "attachment storage is unavailable",
                     true,
                 )
             })?
@@ -2688,6 +2683,13 @@ async fn resolve_blob_inputs(
             || input
                 .size_bytes
                 .is_some_and(|size_bytes| size_bytes != object.metadata.size_bytes)
+            || input.name.as_ref().is_some_and(|name| {
+                object
+                    .metadata
+                    .name
+                    .as_ref()
+                    .is_some_and(|stored| name != stored)
+            })
         {
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
@@ -2696,8 +2698,30 @@ async fn resolve_blob_inputs(
                 false,
             ));
         }
+        if object.metadata.size_bytes > MAX_BLOB_BYTES as u64 {
+            return Err(api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "blob_too_large",
+                "attachment exceeds the file size limit",
+                false,
+            ));
+        }
+        if input.name.as_ref().is_some_and(|name| name.len() > 512) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_blob_name",
+                "attachment name must not exceed 512 bytes",
+                false,
+            ));
+        }
         let modality = input_modality(&object.metadata.media_type);
-        if !allowed.contains(&modality) {
+        if !allowed.contains(&modality)
+            || (modality == Modality::Image
+                && !matches!(
+                    object.metadata.media_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                ))
+        {
             return Err(api_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "unsupported_input_modality",
@@ -2713,6 +2737,7 @@ async fn resolve_blob_inputs(
             blob_id: object.metadata.blob_id,
             media_type: object.metadata.media_type.clone(),
             name: name.clone(),
+            size_bytes: Some(object.metadata.size_bytes),
         });
         content.push(ContentPart::BlobRef {
             blob_id: object.metadata.blob_id,
@@ -2721,6 +2746,14 @@ async fn resolve_blob_inputs(
             size_bytes: Some(object.metadata.size_bytes),
         });
     }
+    tracing::info!(
+        attachment_count = model.len(),
+        attachment_total_bytes = model
+            .iter()
+            .filter_map(|attachment| attachment.size_bytes)
+            .sum::<u64>(),
+        "attachments validated"
+    );
     Ok(ResolvedBlobInputs { model, content })
 }
 
@@ -2772,9 +2805,9 @@ fn raw_request_hash(
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     hasher.update(max_steps.to_le_bytes());
-    for attachment in attachments {
-        hasher.update(attachment.blob_id.to_string().as_bytes());
-        hasher.update(attachment.media_type.as_bytes());
+    if !attachments.is_empty() {
+        hasher.update(b"\0attachments:v1\0");
+        hasher.update(serde_json::to_vec(attachments).expect("attachment identity"));
     }
     for skill in skills {
         hasher.update(skill.skill_id.as_bytes());

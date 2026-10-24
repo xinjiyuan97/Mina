@@ -118,6 +118,182 @@ fn request() -> ContextRequest {
 }
 
 #[tokio::test]
+async fn p6_pending_context_reopen_preserves_order_and_conflicts() {
+    use agent_core::harness::{BlobId, ModelAttachment};
+    let directory = tempfile::tempdir().expect("temp");
+    let path = directory.path().join("context.db");
+    let blobs = Arc::new(FilesystemBlobStore::new(directory.path().join("blobs")));
+    let preparer = Arc::new(Preparer(AtomicUsize::new(0)));
+    let mut request = request();
+    request.engine_version = agent_core::operator::EngineVersion::OperatorV1;
+    request.execution_profile = Some("operator_v1_tools".into());
+    request.attachments = ["first.png", "second.png"]
+        .into_iter()
+        .map(|name| ModelAttachment {
+            blob_id: BlobId::new(),
+            media_type: "image/png".into(),
+            name: Some(name.into()),
+            size_bytes: None,
+        })
+        .collect();
+    {
+        let fabric = Arc::new(SqliteEventStore::open(&path, "p6").await.expect("open"));
+        let facade = AdmissionFacade::new(fabric, blobs.clone(), preparer.clone());
+        facade
+            .publish(request.clone())
+            .await
+            .expect("pending context");
+        assert_eq!(preparer.0.load(Ordering::SeqCst), 0);
+    }
+    let fabric = Arc::new(SqliteEventStore::open(&path, "p6").await.expect("reopen"));
+    let facade = AdmissionFacade::new(fabric, blobs, preparer);
+    let saved = facade
+        .request(request.run_id)
+        .await
+        .expect("read")
+        .expect("request");
+    assert_eq!(saved.attachments, request.attachments);
+    facade.publish(saved.clone()).await.expect("replay");
+    for field in 0..4 {
+        let mut changed = saved.clone();
+        match field {
+            0 => changed.attachments.reverse(),
+            1 => changed.attachments[0].blob_id = BlobId::new(),
+            2 => changed.attachments[0].media_type = "image/jpeg".into(),
+            _ => changed.attachments[0].name = Some("other.png".into()),
+        }
+        assert!(matches!(
+            facade.publish(changed).await,
+            Err(FabricError::Conflict)
+        ));
+    }
+    facade.tick().await.expect("prepare persisted request");
+    let prepared = facade
+        .wait(saved.run_id, Duration::from_secs(1))
+        .await
+        .expect("outcome");
+    assert_eq!(
+        legacy_plan(saved, prepared).attachments,
+        request.attachments
+    );
+}
+
+#[tokio::test]
+async fn p6_session_history_and_attachment_name_fingerprint() {
+    use agent_core::harness::*;
+    use agent_core::skill::SkillOrchestrator;
+    use agent_extension::store::{FilesystemSkillStore, InMemoryMemoryStore, SqliteRunStore};
+    let directory = tempfile::tempdir().expect("temp");
+    let path = directory.path().join("session.db");
+    let session_id = SessionId::new();
+    let attachments: Vec<_> = ["first.png", "second.pdf"]
+        .into_iter()
+        .map(|name| ModelAttachment {
+            blob_id: BlobId::new(),
+            media_type: if name.ends_with("png") {
+                "image/png"
+            } else {
+                "application/pdf"
+            }
+            .into(),
+            name: Some(name.into()),
+            size_bytes: None,
+        })
+        .collect();
+    {
+        let sessions = SqliteRunStore::open(&path).await.expect("open");
+        let session = sessions
+            .create_session(CreateSession {
+                session_id,
+                agent_profile: "test".into(),
+                title: None,
+                created_at_ms: 1,
+            })
+            .await
+            .expect("session");
+        let run_id = RunId::new();
+        sessions
+            .begin_run(
+                BeginSessionRun {
+                    session_id,
+                    run_id,
+                    expected_revision: session.revision,
+                    idempotency_key: "first".into(),
+                    request_hash: "first".into(),
+                    created_at_ms: 2,
+                    input: attachments
+                        .iter()
+                        .map(|attachment| ContentPart::BlobRef {
+                            blob_id: attachment.blob_id,
+                            media_type: attachment.media_type.clone(),
+                            name: attachment.name.clone(),
+                            size_bytes: None,
+                        })
+                        .collect(),
+                },
+                RunSnapshot::new(run_id, "", 2),
+            )
+            .await
+            .expect("persist attachment only user");
+    }
+    let sessions = Arc::new(SqliteRunStore::open(&path).await.expect("reopen"));
+    let history = sessions
+        .messages(session_id, None, 10)
+        .await
+        .expect("history");
+    assert_eq!(history.len(), 1);
+    assert!(
+        history[0]
+            .content
+            .iter()
+            .all(|part| matches!(part, ContentPart::BlobRef { .. }))
+    );
+    let context = ContextEngine::new(
+        sessions,
+        Arc::new(InMemoryMemoryStore::default()),
+        Arc::new(SlidingWindowCompressor::new(Arc::new(
+            HeuristicTokenEstimator,
+        ))),
+        Arc::new(InMemoryContextArtifactStore::default()),
+    );
+    let preparer = AgentContextPreparer {
+        context,
+        skills: Arc::new(SkillOrchestrator::new(Arc::new(FilesystemSkillStore::new(
+            directory.path().join("skills"),
+            "test",
+        )))),
+    };
+    let mut current = request();
+    current.session_id = Some(session_id);
+    current.through_message_ordinal = Some(1);
+    current.attachments = attachments.clone();
+    let prepared = preparer
+        .prepare(current.clone())
+        .await
+        .expect("next context");
+    assert_eq!(
+        prepared
+            .pack
+            .messages
+            .iter()
+            .find(|message| message.role == ModelRole::User)
+            .expect("historical user")
+            .attachments,
+        attachments
+    );
+    current.attachments[0].name = Some("renamed.png".into());
+    let changed = preparer.prepare(current).await.expect("changed context");
+    assert_ne!(
+        prepared.request_digest, changed.request_digest,
+        "name must bind admission digest"
+    );
+    assert_ne!(
+        prepared.pack.fingerprint, changed.pack.fingerprint,
+        "name must bind context fingerprint"
+    );
+}
+
+#[tokio::test]
 async fn p2_durable_request_survives_waiter_cancel_and_sqlite_reopen() {
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("events.sqlite");
@@ -529,12 +705,32 @@ async fn p2_large_input_is_referenced_and_engine_cannot_switch() {
 
 #[tokio::test]
 async fn p2_claimed_uncommitted_context_reopens_and_reclaims_expired_lease() {
+    claimed_context_reopen(request()).await;
+}
+
+#[tokio::test]
+async fn p6_claimed_uncommitted_context_reopens_and_reclaims_expired_lease() {
+    let mut request = request();
+    request.engine_version = agent_core::operator::EngineVersion::OperatorV1;
+    request.execution_profile = Some("operator_v1_tools".into());
+    request.attachments = ["first.png", "second.png"]
+        .into_iter()
+        .map(|name| agent_core::harness::ModelAttachment {
+            blob_id: agent_core::harness::BlobId::new(),
+            media_type: "image/png".into(),
+            name: Some(name.into()),
+            size_bytes: None,
+        })
+        .collect();
+    claimed_context_reopen(request).await;
+}
+
+async fn claimed_context_reopen(request: ContextRequest) {
     use agent_harness::operator_fabric::FabricHandler;
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("events.sqlite");
     let blobs = Arc::new(FilesystemBlobStore::new(directory.path().join("blobs")));
     let preparer = Arc::new(Preparer(AtomicUsize::new(0)));
-    let request = request();
     let old_lease;
     {
         let fabric = Arc::new(SqliteEventStore::open(&path, "test").await.expect("open"));
@@ -580,6 +776,15 @@ async fn p2_claimed_uncommitted_context_reopens_and_reclaims_expired_lease() {
     }
     let fabric = Arc::new(SqliteEventStore::open(&path, "test").await.expect("reopen"));
     let facade = AdmissionFacade::new(fabric.clone(), blobs, preparer.clone());
+    assert_eq!(
+        facade
+            .request(request.run_id)
+            .await
+            .expect("read")
+            .expect("request")
+            .attachments,
+        request.attachments
+    );
     facade.tick().await.expect("reclaim expired lease");
     assert!(
         facade

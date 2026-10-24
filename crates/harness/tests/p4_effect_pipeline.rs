@@ -12,6 +12,185 @@ use std::sync::{
 };
 
 struct FakeModel(AtomicUsize);
+
+#[tokio::test]
+async fn p6_pending_model_abort_reopen_and_tool_round_preserve_inputs() {
+    struct Multimodal {
+        calls: AtomicUsize,
+        expected: Vec<ModelAttachment>,
+        entered: tokio::sync::Notify,
+    }
+    impl ModelPort for Multimodal {
+        fn stream(&self, request: ModelRequest) -> ModelEventStream {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                request
+                    .messages
+                    .iter()
+                    .find(|message| message.role == ModelRole::User)
+                    .expect("user")
+                    .attachments,
+                self.expected
+            );
+            if call == 0 {
+                self.entered.notify_one();
+                return Box::pin(stream::pending());
+            }
+            let events = if call == 1 {
+                vec![
+                    ModelEvent::ToolCallStarted {
+                        call_id: "read".into(),
+                        name: "read".into(),
+                    },
+                    ModelEvent::ToolCallArgumentsDelta {
+                        call_id: "read".into(),
+                        delta: "{}".into(),
+                    },
+                    ModelEvent::Completed {
+                        finish_reason: FinishReason::ToolCall,
+                    },
+                ]
+            } else {
+                assert!(
+                    request
+                        .messages
+                        .iter()
+                        .any(|message| message.role == ModelRole::Tool)
+                );
+                vec![ModelEvent::Completed {
+                    finish_reason: FinishReason::Stop,
+                }]
+            };
+            Box::pin(stream::iter(events))
+        }
+    }
+    let directory = tempfile::tempdir().expect("temp");
+    let path = directory.path().join("events.db");
+    let blobs: Arc<dyn BlobStore> = Arc::new(agent_extension::store::FilesystemBlobStore::new(
+        directory.path().join("blobs"),
+    ));
+    let mut start = PipelineStart::text(RunId::new(), "", "fake").start;
+    start.config.allowed_tools = None;
+    start.config.max_steps = 3;
+    start.config.tool_timeout_ms = 1000;
+    for name in ["first.png", "second.png"] {
+        let blob = blobs
+            .put(PutBlob {
+                media_type: "image/png".into(),
+                name: Some(name.into()),
+                data: vec![1, 2, 3],
+                created_at_ms: 0,
+            })
+            .await
+            .expect("blob");
+        start.attachments.push(ModelAttachment {
+            blob_id: blob.blob_id,
+            media_type: blob.media_type,
+            name: blob.name,
+            size_bytes: Some(blob.size_bytes),
+        });
+    }
+    let model = Arc::new(Multimodal {
+        calls: AtomicUsize::new(0),
+        expected: start.attachments.clone(),
+        entered: tokio::sync::Notify::new(),
+    });
+    struct ReadTool;
+    impl ToolPort for ReadTool {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition::new(
+                "read",
+                "read",
+                json!({"type":"object"}),
+            )]
+        }
+        fn call(&self, _: ToolCallRequest) -> ToolCallFuture {
+            Box::pin(async { Ok(ToolOutput::text("read")) })
+        }
+    }
+    let tools = Arc::new(ReadTool);
+    let run_id = start.run_id;
+    {
+        let fabric = Arc::new(SqliteEventStore::open(&path, "p6").await.expect("open"));
+        let runtime = ToolsPipelineRuntime::new(fabric, model.clone(), tools.clone())
+            .with_blobs(blobs.clone());
+        runtime
+            .admit("local", start.clone(), 0)
+            .await
+            .expect("admit");
+        let worker = tokio::spawn(async move {
+            for _ in 0..20 {
+                runtime.tick("local", run_id, || 1).await.expect("tick");
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), model.entered.notified())
+            .await
+            .expect("pending model");
+        worker.abort();
+        assert!(worker.await.expect_err("abort").is_cancelled());
+    }
+    let fabric = Arc::new(SqliteEventStore::open(&path, "p6").await.expect("reopen"));
+    let runtime = ToolsPipelineRuntime::new(fabric, model.clone(), tools.clone()).with_blobs(blobs);
+    assert_eq!(
+        runtime
+            .load("local", run_id)
+            .await
+            .expect("persisted")
+            .start
+            .attachments,
+        start.attachments
+    );
+    runtime
+        .admit("local", start.clone(), 200_000)
+        .await
+        .expect("idempotent");
+    for _ in 0..40 {
+        if runtime
+            .tick("local", run_id, || 200_000)
+            .await
+            .expect("reclaim")
+            .eq(&0)
+        {
+            break;
+        }
+    }
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        runtime
+            .load("local", run_id)
+            .await
+            .expect("interrupted")
+            .reducer
+            .outcome(),
+        AgentLoopOutcome::Failed { .. }
+    ));
+    start.run_id = RunId::new();
+    let run_id = start.run_id;
+    runtime
+        .admit("local", start, 200_000)
+        .await
+        .expect("new run");
+    for _ in 0..40 {
+        if runtime
+            .tick("local", run_id, || 200_000)
+            .await
+            .expect("tool round")
+            .eq(&0)
+        {
+            break;
+        }
+    }
+    assert_eq!(model.calls.load(Ordering::SeqCst), 3);
+    assert!(matches!(
+        runtime
+            .load("local", run_id)
+            .await
+            .expect("terminal")
+            .reducer
+            .outcome(),
+        AgentLoopOutcome::Complete { .. }
+    ));
+}
 impl ModelPort for FakeModel {
     fn stream(&self, request: ModelRequest) -> ModelEventStream {
         let turn = self.0.fetch_add(1, Ordering::SeqCst);

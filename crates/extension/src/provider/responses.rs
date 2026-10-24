@@ -323,6 +323,13 @@ async fn append_message_items(
     message: &ModelMessage,
     blob_store: Option<&Arc<dyn BlobStore>>,
 ) -> Result<(), ModelError> {
+    if message.role != ModelRole::User && !message.attachments.is_empty() {
+        return Err(ModelError::new(
+            ModelErrorKind::InvalidRequest,
+            "binary input is only supported on user messages",
+            false,
+        ));
+    }
     if message.role == ModelRole::Tool {
         let Some(call_id) = &message.tool_call_id else {
             return Err(protocol_error("tool result is missing its call id"));
@@ -343,13 +350,6 @@ async fn append_message_items(
         content.push(json!({"type": content_type, "text": message.content}));
     }
     for attachment in &message.attachments {
-        if message.role != ModelRole::User {
-            return Err(ModelError::new(
-                ModelErrorKind::InvalidRequest,
-                "binary input is only supported on user messages",
-                false,
-            ));
-        }
         let object = load_blob(blob_store, attachment).await?;
         if object.metadata.media_type.starts_with("image/") {
             content.push(json!({
@@ -582,6 +582,60 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[tokio::test]
+    async fn p6_responses_input_matrix() {
+        for mime in [
+            "image/png",
+            "application/pdf",
+            "audio/wav",
+            "video/mp4",
+            "application/octet-stream",
+        ] {
+            let (request, store, _directory) = crate::provider::attachment::fixture(mime).await;
+            let body = responses_request(&request, Some(&store))
+                .await
+                .expect("supported");
+            assert_eq!(
+                body["input"][0]["content"][0]["type"],
+                if mime.starts_with("image/") {
+                    "input_image"
+                } else {
+                    "input_file"
+                }
+            );
+            for role in [ModelRole::System, ModelRole::Assistant, ModelRole::Tool] {
+                let mut invalid = request.clone();
+                invalid.messages[0].role = role;
+                invalid.messages[0].tool_call_id = Some("call".into());
+                assert!(
+                    responses_request(&invalid, Some(&store)).await.is_err(),
+                    "{role:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn p6_rejects_tool_attachments() {
+        let mut message = ModelMessage::tool_result("call", "result");
+        message
+            .attachments
+            .push(agent_core::harness::ModelAttachment {
+                blob_id: agent_core::harness::BlobId::new(),
+                media_type: "image/png".into(),
+                name: None,
+                size_bytes: None,
+            });
+        let request = ModelRequest {
+            run_id: RunId::new(),
+            model: "fake".into(),
+            messages: vec![message],
+            tools: vec![],
+            max_output_tokens: None,
+        };
+        assert!(responses_request(&request, None).await.is_err());
+    }
 
     #[tokio::test]
     async fn maps_provider_neutral_messages_to_responses_input_items() {

@@ -503,6 +503,12 @@ pub type SessionStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, SessionStoreError>> + Send + 'a>>;
 
 pub trait SessionStore: Send + Sync + 'static {
+    fn run_for_idempotency_key(
+        &self,
+        session_id: SessionId,
+        key: String,
+    ) -> SessionStoreFuture<'_, Option<RunId>>;
+
     fn create_session(&self, command: CreateSession) -> SessionStoreFuture<'_, SessionSnapshot>;
 
     fn list_sessions(

@@ -3,6 +3,8 @@
 日期：2026-10-23。基线：P4 `f849523`，分支 `feat/event-driven-operator-pipeline`。
 本文补充总设计与 P0–P4 文档，不覆盖它们的历史验收记录。
 
+P6 输入扩展及新增恢复/附件身份边界见 `p6-multimodal-inputs.md`；P5 的历史验收结论保留。
+
 ## 1. 新 admission 路由
 
 | 配置 | 默认 | 语义 |

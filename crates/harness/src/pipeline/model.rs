@@ -58,6 +58,12 @@ impl ModelOperator {
             record.model_request_ref.ok_or(PipelineError::Conflict)?,
         )
         .await?;
+        if !record.reducer.pending_effects().iter().any(|effect| {
+            effect.effect_id == token.effect_id
+                && matches!(&effect.kind, AgentLoopEffectKind::InvokeModel { request: expected, .. } if expected == &request)
+        }) {
+            return Err(PipelineError::Conflict);
+        }
         if !request.tools.is_empty() {
             return self
                 .save(

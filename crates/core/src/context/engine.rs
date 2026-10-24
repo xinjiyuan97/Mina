@@ -133,11 +133,12 @@ impl ContextEngine {
                             blob_id,
                             media_type,
                             name,
-                            ..
+                            size_bytes,
                         } => Some(ModelAttachment {
                             blob_id: *blob_id,
                             media_type: media_type.clone(),
                             name: name.clone(),
+                            size_bytes: *size_bytes,
                         }),
                         _ => None,
                     })
@@ -147,6 +148,11 @@ impl ContextEngine {
                     ConversationRole::Assistant => ModelRole::Assistant,
                     ConversationRole::SystemNote => ModelRole::System,
                 };
+                if role != ModelRole::User && !attachments.is_empty() {
+                    return Err(ContextError::Invalid(
+                        "binary input is only supported on user messages".into(),
+                    ));
+                }
                 candidates.push(ContextItem {
                     item_id: format!("session:{}:{}", session_id, message.ordinal),
                     role,

@@ -193,7 +193,6 @@ pub(super) async fn start(
         .as_ref()
         .is_none_or(|tools| !tools.is_empty())
         || plan.allow_run_adf
-        || !plan.attachments.is_empty()
     {
         return Err(RunRuntimeError::Machine(
             "unsupported operator_v1 profile".into(),
@@ -204,21 +203,14 @@ pub(super) async fn start(
     start.context_sequence = 3;
     start.session_id = request.as_ref().and_then(|request| request.session_id);
     start.start.prior_messages = plan.prior_messages;
+    start.start.attachments = plan.attachments;
     start.start.context_fingerprint = plan.context_fingerprint;
     start.start.config.max_output_tokens = state.config.default_model().max_output_tokens;
     start.start.config.max_steps = plan.max_steps.unwrap_or(1);
-    if pipeline
-        .store
-        .load(run_id)
+    pipeline
+        .admit(start)
         .await
-        .map_err(|error| RunRuntimeError::Persistence(error.to_string()))?
-        .is_none()
-    {
-        pipeline
-            .admit(start)
-            .await
-            .map_err(|error| RunRuntimeError::Persistence(error.to_string()))?;
-    }
+        .map_err(|error| RunRuntimeError::Persistence(error.to_string()))?;
     let (sender, events) = broadcast::channel(256);
     tokio::spawn(async move {
         let mut cursor = 0;

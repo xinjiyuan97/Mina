@@ -117,6 +117,8 @@ impl ToolsServerPipeline {
             Ok(record) => {
                 if record.profile != TOOLS_PROFILE
                     || record.start.input != plan.input
+                    || record.start.attachments != plan.attachments
+                    || record.start.prior_messages != plan.prior_messages
                     || record.start.context_fingerprint != plan.context_fingerprint
                     || record.admission_failure.as_deref() != failure
                 {
