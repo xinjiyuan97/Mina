@@ -41,23 +41,7 @@ pub(super) async fn session_inputs(
         })?;
         if let Some(saved) = saved {
             let identity_matches =
-                request.attachments.len() == saved.attachments.len()
-                    && request.attachments.iter().zip(&saved.attachments).all(
-                        |(input, original)| {
-                            input.blob_id == original.blob_id
-                                && input
-                                    .media_type
-                                    .as_ref()
-                                    .is_none_or(|mime| mime == &original.media_type)
-                                && input
-                                    .name
-                                    .as_ref()
-                                    .is_none_or(|name| original.name.as_ref() == Some(name))
-                                && input.size_bytes.is_none_or(|size| {
-                                    original.size_bytes.is_none_or(|stored| size == stored)
-                                })
-                        },
-                    );
+                replay_attachments_match(state, &request.attachments, &saved).await;
             let skills = saved
                 .explicit_skills
                 .iter()
@@ -80,6 +64,7 @@ pub(super) async fn session_inputs(
                 ResolvedBlobInputs {
                     model: saved.attachments,
                     content: vec![],
+                    names: saved.attachment_names,
                 },
                 saved.request_hash,
             ));
@@ -94,8 +79,77 @@ pub(super) async fn session_inputs(
                 error
             }
         })?;
-    let hash = raw_request_hash(&request.input, &resolved.model, &request.skills, max_steps);
+    let hash = attachment_request_hash(
+        &request.input,
+        &resolved.model,
+        &request.skills,
+        max_steps,
+        resolved.names.as_deref(),
+    );
     Ok((resolved, hash))
+}
+
+async fn replay_attachments_match(
+    state: &AppState,
+    inputs: &[BlobInput],
+    saved: &ContextRequest,
+) -> bool {
+    use agent_core::context_operator::AttachmentNameInput;
+    if inputs.len() != saved.attachments.len()
+        || saved
+            .attachment_names
+            .as_ref()
+            .is_some_and(|names| names.len() != inputs.len())
+    {
+        return false;
+    }
+    for (index, (input, original)) in inputs.iter().zip(&saved.attachments).enumerate() {
+        if input.blob_id != original.blob_id
+            || input
+                .media_type
+                .as_ref()
+                .is_some_and(|mime| mime != &original.media_type)
+            || input
+                .size_bytes
+                .zip(original.size_bytes)
+                .is_some_and(|(size, stored)| size != stored)
+        {
+            return false;
+        }
+        let needs_name_metadata = if let Some(names) = &saved.attachment_names {
+            if names[index] != input.name {
+                return false;
+            }
+            false
+        } else {
+            match &input.name {
+                AttachmentNameInput::Named(name) => {
+                    if original.name.as_ref() != Some(name) {
+                        return false;
+                    }
+                    false
+                }
+                AttachmentNameInput::Null if original.name.is_some() => return false,
+                AttachmentNameInput::Omitted => original.name.is_some(),
+                AttachmentNameInput::Null => false,
+            }
+        };
+        if needs_name_metadata || (original.size_bytes.is_none() && input.size_bytes.is_some()) {
+            let Ok(Some(object)) = state.blobs.get(original.blob_id).await else {
+                return false;
+            };
+            if object.metadata.blob_id != original.blob_id
+                || object.metadata.media_type != original.media_type
+                || input
+                    .size_bytes
+                    .is_some_and(|size| size != object.metadata.size_bytes)
+                || (needs_name_metadata && object.metadata.name != original.name)
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub(super) async fn prepare(
@@ -120,17 +174,19 @@ pub(super) async fn prepare(
     let request = ContextRequest {
         engine_version: profile.engine(),
         execution_profile: (!profile.engine().is_legacy()).then(|| profile.as_str().into()),
-        request_hash: raw_request_hash(
+        request_hash: attachment_request_hash(
             &request.input,
             &request.attachments,
             &request.explicit_skills,
             request.max_steps,
+            request.attachment_names.as_deref(),
         ),
         run_id: request.run_id,
         session_id: request.session_id,
         through_message_ordinal: request.through_message_ordinal,
         input: request.input,
         attachments: request.attachments,
+        attachment_names: request.attachment_names,
         explicit_skills: request
             .explicit_skills
             .into_iter()
@@ -264,86 +320,100 @@ pub(super) fn start_recovery_worker(state: AppState) {
 pub(super) async fn recover_once(
     state: &AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut first_error = None;
     for request in state.admission.requests().await? {
+        let run_id = request.run_id;
+        if let Err(error) = recover_request(state, request).await {
+            tracing::error!(%run_id, code = "run_recovery_failed", "run recovery failed; continuing scan");
+            first_error.get_or_insert(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+async fn recover_request(
+    state: &AppState,
+    request: ContextRequest,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if state
+        .runtime
+        .get_run(request.run_id)
+        .await?
+        .as_ref()
+        .and_then(|run| run.execution_manifest.as_ref())
+        .is_some_and(|manifest| {
+            agent_core::operator::validate_execution_manifest(manifest).is_err()
+        })
+    {
+        tracing::error!(
+            code = "unsupported_run_version",
+            run_id = %request.run_id,
+            "run quarantined; manifest retained"
+        );
+        return Ok(());
+    }
+    if !request.engine_version.is_legacy() {
         if state
             .runtime
             .get_run(request.run_id)
             .await?
-            .as_ref()
-            .and_then(|run| run.execution_manifest.as_ref())
-            .is_some_and(|manifest| {
-                agent_core::operator::validate_execution_manifest(manifest).is_err()
-            })
+            .is_some_and(|run| run.is_terminal())
         {
-            tracing::error!(
-                code = "unsupported_run_version",
-                run_id = %request.run_id,
-                "run quarantined; manifest retained"
-            );
-            continue;
+            return Ok(());
         }
-        if !request.engine_version.is_legacy() {
-            if state
-                .runtime
-                .get_run(request.run_id)
+        if let Some(pipeline) = &state.pipeline
+            && request.execution_profile.as_deref()
+                != Some(agent_core::effect_pipeline::TOOLS_PROFILE)
+            && pipeline
+                .store
+                .load(request.run_id)
                 .await?
-                .is_some_and(|run| run.is_terminal())
-            {
-                continue;
-            }
-            if let Some(pipeline) = &state.pipeline
-                && request.execution_profile.as_deref()
-                    != Some(agent_core::effect_pipeline::TOOLS_PROFILE)
-                && pipeline
-                    .store
-                    .load(request.run_id)
-                    .await?
-                    .is_some_and(|record| {
-                        record.lease_expires_at_ms > agent_harness::unix_time_ms()
-                    })
-            {
-                continue;
-            }
+                .is_some_and(|record| record.lease_expires_at_ms > agent_harness::unix_time_ms())
+        {
+            return Ok(());
         }
-        match state.admission.outcome(request.run_id).await? {
-            Some(ContextOutcome::Failed(failure)) if !request.engine_version.is_legacy() => {
-                crate::pipeline::fail_context(state, &request, &failure.code).await?;
-            }
-            Some(ContextOutcome::Completed(_)) => {
-                let prepared = state
-                    .admission
-                    .wait(request.run_id, Duration::from_secs(5))
-                    .await?;
-                let persisted = request.session_id.is_some();
-                tracing::info!(engine = ?request.engine_version,
+    }
+    match state.admission.outcome(request.run_id).await? {
+        Some(ContextOutcome::Failed(failure)) if !request.engine_version.is_legacy() => {
+            crate::pipeline::fail_context(state, &request, &failure.code).await?;
+        }
+        Some(ContextOutcome::Completed(_)) => {
+            let prepared = state
+                .admission
+                .wait(request.run_id, Duration::from_secs(5))
+                .await?;
+            let persisted = request.session_id.is_some();
+            tracing::info!(engine = ?request.engine_version,
                     profile = request.execution_profile.as_deref().unwrap_or("legacy"),
                     recovery_attempt_count = 1, "recovering persisted admission");
-                crate::pipeline::start(state, legacy_plan(request, prepared), persisted).await?;
-            }
-            Some(ContextOutcome::Failed(_)) if request.session_id.is_some() => {
-                let snapshot = state.runtime.get_run(request.run_id).await?;
-                if snapshot.as_ref().is_some_and(|run| !run.is_terminal()) {
-                    let snapshot = state
-                        .runtime
-                        .fail_persisted(
-                            request.run_id,
-                            "context_build_failed",
-                            "context orchestration failed",
-                        )
-                        .await?;
-                    state
-                        .orchestration
-                        .sessions
-                        .finalize_run(FinalizeSessionRun {
-                            session_id: request.session_id.expect("session request"),
-                            run: snapshot,
-                            finalized_at_ms: run_runtime::unix_time_ms(),
-                        })
-                        .await?;
-                }
-            }
-            _ => {}
+            crate::pipeline::start(state, legacy_plan(request, prepared), persisted).await?;
         }
+        Some(ContextOutcome::Failed(_)) if request.session_id.is_some() => {
+            let snapshot = state.runtime.get_run(request.run_id).await?;
+            if snapshot.as_ref().is_some_and(|run| !run.is_terminal()) {
+                let snapshot = state
+                    .runtime
+                    .fail_persisted(
+                        request.run_id,
+                        "context_build_failed",
+                        "context orchestration failed",
+                    )
+                    .await?;
+                state
+                    .orchestration
+                    .sessions
+                    .finalize_run(FinalizeSessionRun {
+                        session_id: request.session_id.expect("session request"),
+                        run: snapshot,
+                        finalized_at_ms: run_runtime::unix_time_ms(),
+                    })
+                    .await?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -728,6 +798,7 @@ mod tests {
                 state
                     .admission
                     .publish(ContextRequest {
+                        attachment_names: None,
                         engine_version: Default::default(),
                         execution_profile: None,
                         run_id,

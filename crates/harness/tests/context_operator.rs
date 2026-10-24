@@ -82,6 +82,7 @@ impl ContextPreparer for Preparer {
 
 fn request() -> ContextRequest {
     ContextRequest {
+        attachment_names: None,
         engine_version: Default::default(),
         execution_profile: None,
         run_id: RunId::new(),

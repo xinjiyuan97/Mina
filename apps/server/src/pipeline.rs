@@ -207,6 +207,14 @@ pub(super) async fn start(
     start.start.context_fingerprint = plan.context_fingerprint;
     start.start.config.max_output_tokens = state.config.default_model().max_output_tokens;
     start.start.config.max_steps = plan.max_steps.unwrap_or(1);
+    if let Some(record) = pipeline
+        .store
+        .load(run_id)
+        .await
+        .map_err(|error| RunRuntimeError::Persistence(error.to_string()))?
+    {
+        start.start.config = record.reducer.config;
+    }
     pipeline
         .admit(start)
         .await

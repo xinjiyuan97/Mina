@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "p6_review_tests.rs"]
+mod review;
+
 struct Capture(tokio::sync::mpsc::UnboundedSender<ModelRequest>);
 impl ModelPort for Capture {
     fn stream(&self, request: ModelRequest) -> ModelEventStream {
@@ -61,6 +64,7 @@ fn prepare_request(
     attachments: Vec<ModelAttachment>,
 ) -> PrepareRunRequest {
     PrepareRunRequest {
+        attachment_names: None,
         run_id,
         input: input.into(),
         attachments,

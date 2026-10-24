@@ -143,6 +143,7 @@ async fn p6_real_process_kill_pending_context_and_model() {
             });
         }
         let request = ContextRequest {
+            attachment_names: None,
             engine_version: agent_core::operator::EngineVersion::OperatorV1,
             execution_profile: Some("operator_v1_text".into()),
             request_hash: "p6-process".into(),

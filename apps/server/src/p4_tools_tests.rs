@@ -45,6 +45,7 @@ async fn p5_canary_applies_only_to_new_admissions_after_rollback() {
     state.rollout =
         crate::rollout::Rollout::parse(Some("0"), Some(&original.to_string())).expect("rollout");
     let input = |run_id| PrepareRunRequest {
+        attachment_names: None,
         run_id,
         input: "canary".into(),
         attachments: vec![],
@@ -121,6 +122,7 @@ async fn p5_session_backlog_rejection_releases_the_session_without_execution() {
     prepare_run_plan(
         &state,
         PrepareRunRequest {
+            attachment_names: None,
             run_id: original,
             input: "template".into(),
             attachments: vec![],

@@ -22,7 +22,13 @@
 - SessionStore 新增只读 `run_for_idempotency_key`，SQLite 使用既有索引/表，无迁移。
   已存在 key 优先读取持久化 admission，比对原附件身份并使用原 request hash；相同重放不依赖
   BlobStore 当前可用性或新 profile 配置。变化返回 409，不吞掉 MIME/name/Blob 的变化。
-  admission 尚未写入的短窗口和早期历史记录仍走已有存储验证；后端故障不伪装成身份冲突。
+  admission 尚未写入的短窗口仍走已有存储验证。历史附件 size 未知而重放显式提供 size 时，
+  必须使用可信 Blob 元数据确认；无法确认则返回 409，不能把 None 当作通配符。
+  完全相同的新请求重放不重新读取输入 Blob，但持久化 admission artifact 仍必须可读。
+- ContextRequest 新增可选 `attachment_names`，区分请求 name 的 omitted、null、Named 三种状态；
+  同时参与新请求 hash，覆盖 Session reservation 到 Context publication 的窗口。
+  旧记录默认 None 并省略序列化，旧 hash/digest 不重写。旧 name 缺失来源信息时保守校验，
+  必要时读取 Blob 名称元数据，无法确认则拒绝，不推测原请求。
 
 ## 完整链路与身份
 
@@ -36,6 +42,9 @@
    都保存有序附件。text profile 的名称仍表示单次无工具执行，不再表示只允许文本输入。
 5. coordinator 保存 start/reducer；reopen 比较附件及历史消息，不能因相同文本/fingerprint
    复用另一个附件集合。text ledger 通过 start digest 校验；tools ledger 保留完整 start。
+   已存在 text ledger 使用持久 reducer.config 恢复，不使用当前默认 model/output limit；
+   input、有序附件、prior history、context fingerprint 仍参与原 start digest 校验。
+   恢复扫描隔离每条 Run 的恢复错误，继续处理后续 Run，最后返回首个错误供监控报告。
 6. reducer 生成 ModelRequest，当前附件和历史附件在后续工具轮中保留。
    model.requested 事件只有 request_ref；artifact 为含引用的 JSON，不含输入二进制。
 7. text ModelOperator 比较 artifact 与 reducer 的 pending InvokeModel；tools ModelOperator

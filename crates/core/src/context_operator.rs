@@ -46,9 +46,28 @@ pub struct ContextRequest {
     pub request_hash: String,
     pub input: String,
     pub attachments: Vec<ModelAttachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_names: Option<Vec<AttachmentNameInput>>,
     pub explicit_skills: Vec<(SkillId, String)>,
     pub max_steps: u32,
     pub policy: ContextPolicy,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttachmentNameInput {
+    #[default]
+    Omitted,
+    Null,
+    Named(String),
+}
+
+impl AttachmentNameInput {
+    pub fn as_ref(&self) -> Option<&String> {
+        match self {
+            Self::Named(name) => Some(name),
+            Self::Omitted | Self::Null => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

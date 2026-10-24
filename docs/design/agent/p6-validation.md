@@ -44,7 +44,8 @@ artifact 首版注入改变了文件长度，既有 BlobStore 已拒绝；改成
 这些保护在初次运行已是 GREEN，不人为破坏实现来制造 RED：
 
 - pending Context 的持久引用、顺序与四类身份冲突；claimed/uncommitted Context 的 lease 回收与旧 ACK fencing。
-- pending Model 的 artifact/event 引用对应、SQLite reopen、旧 text start 缺失 attachments 的兼容读取。
+- pending Model 的 artifact/event 引用对应、SQLite reopen。旧版兼容证据已在 review 修复中替换为
+  P5 原 writer 生成的固定 SQLite/reducer/artifact/digest fixture，参见 `p6-review-validation.md`。
 - P5 outbox/checkpoint/external Session roots 的 retention dry-run 保护；本轮没有 Blob 删除任务。
 - Session BlobRef 历史恢复。新增 name digest 断言暴露的是身份哈希缺口，而不是历史读取缺口。
 
@@ -66,7 +67,7 @@ artifact 首版注入改变了文件长度，既有 BlobStore 已拒绝；改成
 | 6–7 profile/MIME 与附件验证错误 | p6_blob_validation_contract |
 | 8 幂等与身份冲突 | hash、Context publish、pipeline start、Session HTTP handler；离线/配置变化重放 |
 | 10 legacy 不回归 | workspace legacy checkpoint/recovery 测试与 smoke legacy 图片输入 |
-| 11 旧纯文本 checkpoint | 缺失 attachments 的 start 反序列化、pending ledger reopen；workspace P3/P5 兼容测试 |
+| 11 旧纯文本 checkpoint | `p6_old_fixture` 直接读取真实 P5 SQLite/reducer/artifact/digest，不经当前 writer 重建 |
 | 12 持久层/SSE 无二进制 | request artifact/事实断言；smoke 扫 SQLite/WAL/日志/Session wire，排除唯一 BlobStore 目录 |
 | 13 Provider 矩阵 | 三 adapter 的 p6 matrix、非法角色测试与本地 mock SSE |
 

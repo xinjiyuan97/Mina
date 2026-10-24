@@ -70,7 +70,7 @@ async fn p6_model_artifact_must_match_durable_reducer_request() {
 }
 
 #[tokio::test]
-async fn p6_pending_model_reopen_reference_only_and_old_text_checkpoint() {
+async fn p6_pending_model_reopen_reference_only_text_and_multimodal() {
     struct Capture(std::sync::Mutex<Vec<ModelRequest>>);
     impl ModelPort for Capture {
         fn stream(&self, request: ModelRequest) -> ModelEventStream {
@@ -106,10 +106,6 @@ async fn p6_pending_model_reopen_reference_only_and_old_text_checkpoint() {
                     size_bytes: Some(blob.size_bytes),
                 });
             }
-        } else {
-            let mut old = serde_json::to_value(&start.start).expect("json");
-            old.as_object_mut().expect("object").remove("attachments");
-            start.start = serde_json::from_value(old).expect("old text start");
         }
         {
             let store = Arc::new(SqlitePipelineStore::open(&path).expect("ledger"));

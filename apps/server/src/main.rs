@@ -633,10 +633,20 @@ struct BlobInput {
     blob_id: BlobId,
     #[serde(default)]
     media_type: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_attachment_name")]
+    name: agent_core::context_operator::AttachmentNameInput,
     #[serde(default)]
     size_bytes: Option<u64>,
+}
+
+fn deserialize_attachment_name<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<agent_core::context_operator::AttachmentNameInput, D::Error> {
+    use agent_core::context_operator::AttachmentNameInput;
+    Ok(match Option::<String>::deserialize(deserializer)? {
+        Some(name) => AttachmentNameInput::Named(name),
+        None => AttachmentNameInput::Null,
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1544,6 +1554,7 @@ async fn create_run_owned(state: AppState, request: CreateRunRequest) -> Respons
             run_id,
             input: request.input,
             attachments: attachments.model,
+            attachment_names: attachments.names,
             explicit_skills: request.skills,
             max_steps,
             session_id: None,
@@ -1580,6 +1591,7 @@ struct PrepareRunRequest {
     run_id: RunId,
     input: String,
     attachments: Vec<ModelAttachment>,
+    attachment_names: Option<Vec<agent_core::context_operator::AttachmentNameInput>>,
     explicit_skills: Vec<SkillChoice>,
     max_steps: u32,
     session_id: Option<SessionId>,
@@ -1781,6 +1793,7 @@ async fn submit_session_run_owned(
             run_id,
             input: request.input.clone(),
             attachments: attachments.model,
+            attachment_names: attachments.names,
             explicit_skills: request.skills,
             max_steps,
             session_id: Some(session_id),
@@ -2621,6 +2634,7 @@ fn effective_run_max_steps(
 struct ResolvedBlobInputs {
     model: Vec<ModelAttachment>,
     content: Vec<ContentPart>,
+    names: Option<Vec<agent_core::context_operator::AttachmentNameInput>>,
 }
 
 async fn resolve_blob_inputs(
@@ -2639,9 +2653,11 @@ async fn resolve_blob_inputs(
         return Ok(ResolvedBlobInputs {
             model: Vec::new(),
             content: Vec::new(),
+            names: None,
         });
     }
     let allowed = &state.config.default_model().modalities.input;
+    let names = Some(inputs.iter().map(|input| input.name.clone()).collect());
     let mut model = Vec::with_capacity(inputs.len());
     let mut content = Vec::with_capacity(inputs.len());
     for input in inputs {
@@ -2732,7 +2748,11 @@ async fn resolve_blob_inputs(
                 false,
             ));
         }
-        let name = object.metadata.name.clone().or(input.name);
+        let name = object
+            .metadata
+            .name
+            .clone()
+            .or_else(|| input.name.as_ref().cloned());
         model.push(ModelAttachment {
             blob_id: object.metadata.blob_id,
             media_type: object.metadata.media_type.clone(),
@@ -2754,7 +2774,11 @@ async fn resolve_blob_inputs(
             .sum::<u64>(),
         "attachments validated"
     );
-    Ok(ResolvedBlobInputs { model, content })
+    Ok(ResolvedBlobInputs {
+        model,
+        content,
+        names,
+    })
 }
 
 fn input_modality(media_type: &str) -> Modality {
@@ -2790,6 +2814,26 @@ fn map_run_max_steps_error(error: RunMaxStepsError) -> Response {
         ),
         false,
     )
+}
+
+fn attachment_request_hash(
+    input: &str,
+    attachments: &[ModelAttachment],
+    skills: &[SkillChoice],
+    max_steps: u32,
+    names: Option<&[agent_core::context_operator::AttachmentNameInput]>,
+) -> String {
+    let original = raw_request_hash(input, attachments, skills, max_steps);
+    match names {
+        Some(names) => {
+            let mut hasher = Sha256::new();
+            hasher.update(original.as_bytes());
+            hasher.update(b"\0attachment-names:v1\0");
+            hasher.update(serde_json::to_vec(names).expect("attachment name identity"));
+            format!("sha256:{:x}", hasher.finalize())
+        }
+        None => original,
+    }
 }
 
 fn raw_request_hash(
