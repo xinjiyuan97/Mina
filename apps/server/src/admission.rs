@@ -31,19 +31,23 @@ pub(super) async fn prepare(
         ));
     }
     let orchestration = &state.orchestration;
-    let profile = crate::tools_pipeline::effective_profile(state);
-    if profile == crate::tools_pipeline::EngineProfile::Text && !request.attachments.is_empty() {
+    let identity = request
+        .session_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| request.run_id.to_string());
+    let profile = state.rollout.select(state.pipeline_profile, &identity);
+    if profile != crate::tools_pipeline::EngineProfile::Legacy && !request.attachments.is_empty() {
         return Err(api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "unsupported_input_modality",
-            "operator_v1_text accepts text only",
+            "operator_v1 accepts text only",
             false,
         ));
     }
     let config = &orchestration.config;
     let request = ContextRequest {
-        engine_version: state.pipeline_engine,
-        execution_profile: (!state.pipeline_engine.is_legacy()).then(|| profile.as_str().into()),
+        engine_version: profile.engine(),
+        execution_profile: (!profile.engine().is_legacy()).then(|| profile.as_str().into()),
         request_hash: raw_request_hash(
             &request.input,
             &request.attachments,
@@ -97,10 +101,14 @@ pub(super) async fn prepare(
             script_runtime: serde_json::json!(orchestration.tool_runtime.script_runtime),
         },
     };
+    let started_at = std::time::Instant::now();
     let result = state
         .admission
         .admit(request.clone(), Duration::from_secs(300))
         .await;
+    tracing::info!(engine = ?request.engine_version, profile = profile.as_str(),
+        admission_latency_ms = started_at.elapsed().as_millis() as u64,
+        success = result.is_ok(), "admission finished");
     if !request.engine_version.is_legacy()
         && let Err(AdmissionError::Preparation(error)) = &result
     {
@@ -127,6 +135,12 @@ fn map_error(error: AdmissionError) -> Response {
             "context preparation is still pending",
             true,
         ),
+        AdmissionError::Fabric(agent_core::operator_fabric::FabricError::Capacity) => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admission_backlog_full",
+            "retry admission later",
+            true,
+        ),
         AdmissionError::Fabric(error) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "context_admission_failed",
@@ -139,10 +153,37 @@ fn map_error(error: AdmissionError) -> Response {
 pub(super) fn start_recovery_worker(state: AppState) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut ticks = 0_u64;
         loop {
             interval.tick().await;
-            if let Err(error) = recover_once(&state).await {
-                tracing::error!(%error, "P2 Context legacy bridge recovery failed");
+            if ticks.is_multiple_of(60) {
+                use agent_core::operator_fabric::{FabricCommand, FabricReply};
+                if let Ok(FabricReply::Retention(report)) = state
+                    .admission
+                    .fabric()
+                    .execute(FabricCommand::InspectRetention {
+                        now_ms: agent_harness::unix_time_ms(),
+                        grace_ms: 86_400_000,
+                        external_roots: vec![],
+                    })
+                    .await
+                {
+                    tracing::info!(
+                        outbox_backlog = report.outbox_backlog,
+                        oldest_outbox_age_ms = report.oldest_outbox_age_ms,
+                        dlq_count = report.dead_letters,
+                        lease_reclaim_count = report.lease_reclaims,
+                        active_leases = report.active_leases,
+                        "operator ledger health"
+                    );
+                }
+            }
+            ticks = ticks.wrapping_add(1);
+            if recover_once(&state).await.is_err() {
+                tracing::error!(
+                    code = "recovery_failed",
+                    "admission recovery failed; persisted facts retained"
+                );
             }
         }
     });
@@ -152,6 +193,23 @@ pub(super) async fn recover_once(
     state: &AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for request in state.admission.requests().await? {
+        if state
+            .runtime
+            .get_run(request.run_id)
+            .await?
+            .as_ref()
+            .and_then(|run| run.execution_manifest.as_ref())
+            .is_some_and(|manifest| {
+                agent_core::operator::validate_execution_manifest(manifest).is_err()
+            })
+        {
+            tracing::error!(
+                code = "unsupported_run_version",
+                run_id = %request.run_id,
+                "run quarantined; manifest retained"
+            );
+            continue;
+        }
         if !request.engine_version.is_legacy() {
             if state
                 .runtime
@@ -185,6 +243,9 @@ pub(super) async fn recover_once(
                     .wait(request.run_id, Duration::from_secs(5))
                     .await?;
                 let persisted = request.session_id.is_some();
+                tracing::info!(engine = ?request.engine_version,
+                    profile = request.execution_profile.as_deref().unwrap_or("legacy"),
+                    recovery_attempt_count = 1, "recovering persisted admission");
                 crate::pipeline::start(state, legacy_plan(request, prepared), persisted).await?;
             }
             Some(ContextOutcome::Failed(_)) if request.session_id.is_some() => {

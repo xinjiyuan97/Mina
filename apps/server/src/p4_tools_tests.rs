@@ -29,6 +29,170 @@ fn tools_profile_is_explicit_and_default_and_text_are_unchanged() {
     assert!(parse_profile(Some("operator_v1")).is_err());
 }
 
+#[tokio::test]
+async fn p5_canary_applies_only_to_new_admissions_after_rollback() {
+    let directory = tempfile::tempdir().expect("temp");
+    let model = Arc::new(Model {
+        calls: AtomicUsize::new(0),
+        release: Arc::new(Notify::new()),
+    });
+    let tools = Arc::new(Tools {
+        suspend: false,
+        calls: AtomicUsize::new(0),
+    });
+    let (mut state, worker) = fixture(directory.path(), model, tools).await;
+    let original = RunId::new();
+    state.rollout =
+        crate::rollout::Rollout::parse(Some("0"), Some(&original.to_string())).expect("rollout");
+    let input = |run_id| PrepareRunRequest {
+        run_id,
+        input: "canary".into(),
+        attachments: vec![],
+        explicit_skills: vec![],
+        max_steps: 3,
+        session_id: None,
+        through_message_ordinal: None,
+    };
+    let prepared = prepare_run_plan(&state, input(original))
+        .await
+        .expect("admit operator");
+    state.rollout = crate::rollout::Rollout::parse(Some("0"), None).expect("rollback");
+    state.pipeline_profile = crate::tools_pipeline::EngineProfile::Legacy;
+    let new_run = RunId::new();
+    prepare_run_plan(&state, input(new_run))
+        .await
+        .expect("new admission stays legacy");
+    assert!(
+        state
+            .admission
+            .request(new_run)
+            .await
+            .expect("request")
+            .expect("saved")
+            .engine_version
+            .is_legacy()
+    );
+    let pinned = state
+        .admission
+        .request(original)
+        .await
+        .expect("request")
+        .expect("saved");
+    assert_eq!(
+        pinned.execution_profile.as_deref(),
+        Some("operator_v1_tools")
+    );
+    pipeline::start(&state, prepared.plan, false)
+        .await
+        .expect("old run drains on original engine");
+    let snapshot = state
+        .runtime
+        .get_run(original)
+        .await
+        .expect("snapshot")
+        .expect("run");
+    let manifest = snapshot.execution_manifest.expect("manifest");
+    assert_eq!(manifest["engine_version"], "operator_v1");
+    assert_eq!(manifest["profile"], "operator_v1_tools");
+    assert_eq!(manifest["projection_version"], 1);
+    state
+        .tools_pipeline
+        .as_ref()
+        .expect("pipeline")
+        .stop_workers()
+        .await;
+    worker.abort();
+    let _ = worker.await;
+}
+
+#[tokio::test]
+async fn p5_session_backlog_rejection_releases_the_session_without_execution() {
+    let directory = tempfile::tempdir().expect("temp");
+    let model = Arc::new(Model {
+        calls: AtomicUsize::new(0),
+        release: Arc::new(Notify::new()),
+    });
+    let tools = Arc::new(Tools {
+        suspend: false,
+        calls: AtomicUsize::new(0),
+    });
+    let (mut state, worker) = fixture(directory.path(), model.clone(), tools.clone()).await;
+    let original = RunId::new();
+    prepare_run_plan(
+        &state,
+        PrepareRunRequest {
+            run_id: original,
+            input: "template".into(),
+            attachments: vec![],
+            explicit_skills: vec![],
+            max_steps: 3,
+            session_id: None,
+            through_message_ordinal: None,
+        },
+    )
+    .await
+    .expect("prepare template");
+    worker.abort();
+    let _ = worker.await;
+    let mut request = state
+        .admission
+        .request(original)
+        .await
+        .expect("request")
+        .expect("saved");
+    for _ in 0..128 {
+        request.run_id = RunId::new();
+        state
+            .admission
+            .publish(request.clone())
+            .await
+            .expect("fill pending queue");
+    }
+    let sessions = Arc::new(
+        SqliteRunStore::open(directory.path().join("runs.db"))
+            .await
+            .expect("sessions"),
+    );
+    Arc::get_mut(&mut state.orchestration)
+        .expect("unique state")
+        .sessions = sessions.clone();
+    let session_id = SessionId::new();
+    let session = sessions
+        .create_session(CreateSession {
+            session_id,
+            agent_profile: "agent-loop".into(),
+            title: None,
+            created_at_ms: 0,
+        })
+        .await
+        .expect("session");
+    let response = submit_session_run_owned(
+        state,
+        session_id.to_string(),
+        SubmitSessionRunRequest {
+            input: "backpressure".into(),
+            attachments: vec![],
+            expected_revision: session.revision,
+            idempotency_key: "capacity-attempt".into(),
+            max_steps: Some(3),
+            skills: vec![],
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let session = sessions
+        .get_session(session_id)
+        .await
+        .expect("session")
+        .expect("saved");
+    assert!(
+        session.active_run_id.is_none(),
+        "capacity rejection must not leave a busy session"
+    );
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tools.calls.load(Ordering::SeqCst), 0);
+}
+
 struct Prepared;
 impl ContextPreparer for Prepared {
     fn prepare(&self, request: ContextRequest) -> PrepareFuture<'_> {
@@ -257,7 +421,6 @@ async fn fixture(
         Arc::new(Prepared),
     ));
     let context_worker = state.admission.start_worker();
-    state.pipeline_engine = agent_core::operator::EngineVersion::OperatorV1;
     state.pipeline_profile = crate::tools_pipeline::EngineProfile::Tools;
     Arc::get_mut(&mut state.orchestration)
         .expect("unique orchestration")
@@ -307,6 +470,110 @@ fn parse_frame(frame: &str) -> Option<Value> {
         event["type"].as_str().expect("type")
     );
     Some(event)
+}
+
+#[tokio::test]
+async fn p5_slow_sse_repairs_lag_and_disconnect_replays_numeric_cursor() {
+    let directory = tempfile::tempdir().expect("temp");
+    let model = Arc::new(Model {
+        calls: AtomicUsize::new(0),
+        release: Arc::new(Notify::new()),
+    });
+    let tools = Arc::new(Tools {
+        suspend: false,
+        calls: AtomicUsize::new(0),
+    });
+    let (state, worker) = fixture(directory.path(), model.clone(), tools.clone()).await;
+    let run_id = RunId::new();
+    let store = state.runtime.run_store();
+    store
+        .create_run(RunSnapshot::new(run_id, "slow", 0))
+        .await
+        .expect("run");
+    store
+        .append_event(RunEvent::new(run_id, 1, RunEventKind::RunStarted), 0)
+        .await
+        .expect("start");
+    let (sender, receiver) = broadcast::channel(2);
+    let response = run_event_response(state.runtime.clone(), run_id, 0, true, Some(receiver));
+    let mut body = response.into_body().into_data_stream();
+    let first = body.next().await.expect("first").expect("body");
+    let first = String::from_utf8(first.to_vec()).expect("UTF8");
+    assert_eq!(parse_frame(first.trim()).expect("frame")["seq"], 1);
+    let mut events = Vec::new();
+    for sequence in 2..=1025 {
+        events.push(RunEvent::new(
+            run_id,
+            sequence,
+            RunEventKind::OutputDelta {
+                channel: OutputChannel::AssistantText,
+                delta: "x".into(),
+            },
+        ));
+    }
+    events.push(RunEvent::new(
+        run_id,
+        1026,
+        RunEventKind::RunCompleted {
+            finish_reason: FinishReason::Stop,
+        },
+    ));
+    store
+        .append_events(
+            events
+                .iter()
+                .cloned()
+                .map(|event| ObservedRunEvent::new(event, 1))
+                .collect(),
+        )
+        .await
+        .expect("producer commits while consumer does not poll");
+    for event in events {
+        sender.send(event).expect("receiver still exists");
+    }
+    assert_eq!(
+        store
+            .get_run(run_id)
+            .await
+            .expect("snapshot")
+            .expect("run")
+            .last_seq,
+        1026
+    );
+    let mut wire = first;
+    while let Some(chunk) = body.next().await {
+        wire.push_str(std::str::from_utf8(&chunk.expect("chunk")).expect("UTF8"));
+    }
+    let frames: Vec<_> = wire.split("\n\n").filter_map(parse_frame).collect();
+    assert_eq!(frames.len(), 1026);
+    for (index, event) in frames.iter().enumerate() {
+        assert_eq!(event["seq"], index + 1);
+    }
+    let (address, server) = serve(state.clone()).await;
+    let replay = reqwest::Client::new()
+        .get(format!(
+            "{address}/api/v1/runs/{run_id}/events?follow=false"
+        ))
+        .header("Last-Event-ID", "511")
+        .send()
+        .await
+        .expect("reconnect")
+        .text()
+        .await
+        .expect("body");
+    assert_eq!(
+        replay
+            .split("\n\n")
+            .filter_map(parse_frame)
+            .collect::<Vec<_>>(),
+        frames[511..]
+    );
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tools.calls.load(Ordering::SeqCst), 0);
+    server.abort();
+    let _ = server.await;
+    worker.abort();
+    let _ = worker.await;
 }
 
 async fn serve(state: AppState) -> (String, tokio::task::JoinHandle<()>) {
@@ -398,7 +665,6 @@ async fn tools_server_reopens_pending_approval_or_wait_and_cancel_only_publishes
 
         let (mut state, context_worker) =
             fixture(directory.path(), model.clone(), tools.clone()).await;
-        state.pipeline_engine = agent_core::operator::EngineVersion::LegacyMachine;
         state.pipeline_profile = crate::tools_pipeline::EngineProfile::Legacy;
         admission::recover_once(&state)
             .await
@@ -614,7 +880,6 @@ async fn tools_http_sse_approval_and_wait_live_equal_sqlite_replay_and_last_even
         let _ = context_worker.await;
         drop(state);
         let (mut reopened, context_worker) = fixture(directory.path(), model.clone(), tools).await;
-        reopened.pipeline_engine = agent_core::operator::EngineVersion::LegacyMachine;
         reopened.pipeline_profile = crate::tools_pipeline::EngineProfile::Legacy;
         admission::recover_once(&reopened)
             .await

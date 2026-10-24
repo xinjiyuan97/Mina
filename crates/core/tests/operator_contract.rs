@@ -3,6 +3,31 @@ use std::any::TypeId;
 use agent_core::operator::*;
 use serde_json::{Value, json};
 
+#[test]
+fn p5_manifest_reader_accepts_historical_versions_and_rejects_unknowns() {
+    for manifest in [
+        json!({}),
+        json!({"engine_version":"legacy_machine"}),
+        json!({"engine_version":"operator_v1", "projection_version":1}),
+        json!({"engine_version":"operator_v1", "projection_version":1,"profile":"operator_v1_tools"}),
+    ] {
+        assert!(validate_execution_manifest(&manifest).is_ok());
+    }
+    for manifest in [
+        json!({"engine_version":"operator_v2"}),
+        json!({"engine_version":"operator_v1","projection_version":2}),
+        json!({"engine_version":"operator_v1","projection_version":1,"profile":"unknown"}),
+        json!({"engine_version":null}),
+        json!({"projection_version":999}),
+        json!({"schema_version":999}),
+    ] {
+        assert_eq!(
+            validate_execution_manifest(&manifest),
+            Err("unsupported_run_version")
+        );
+    }
+}
+
 fn wire() -> Value {
     json!({
         "schema_version": 1, "engine_version": "operator_v1", "projection_version": 1,

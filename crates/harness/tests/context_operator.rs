@@ -12,6 +12,46 @@ use std::{
 };
 
 struct Preparer(AtomicUsize);
+
+struct ExcessiveReferences;
+impl ContextPreparer for ExcessiveReferences {
+    fn prepare(&self, request: ContextRequest) -> PrepareFuture<'_> {
+        Box::pin(async move {
+            let mut prepared = Preparer(AtomicUsize::new(0)).prepare(request).await?;
+            prepared.pack.artifact_refs = (0..129)
+                .map(|_| ContextArtifactRef {
+                    artifact_id: ContextArtifactId::new(),
+                    content_digest: "digest".into(),
+                })
+                .collect();
+            Ok(prepared)
+        })
+    }
+}
+
+#[tokio::test]
+async fn p5_excessive_artifact_references_fail_context_durably() {
+    let directory = tempfile::tempdir().expect("temp");
+    let store = Arc::new(
+        SqliteEventStore::open(directory.path().join("events.db"), "p5")
+            .await
+            .expect("open"),
+    );
+    let facade = AdmissionFacade::new(
+        store,
+        Arc::new(FilesystemBlobStore::new(directory.path().join("blobs"))),
+        Arc::new(ExcessiveReferences),
+    );
+    let request = request();
+    facade.publish(request.clone()).await.expect("publish");
+    facade.tick().await.expect("tick");
+    let Some(ContextOutcome::Failed(failure)) =
+        facade.outcome(request.run_id).await.expect("outcome")
+    else {
+        panic!("must fail context")
+    };
+    assert_eq!(failure.code, "context_resource_limit");
+}
 impl ContextPreparer for Preparer {
     fn prepare(&self, _request: ContextRequest) -> PrepareFuture<'_> {
         self.0.fetch_add(1, Ordering::SeqCst);

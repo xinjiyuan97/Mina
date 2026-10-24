@@ -4,6 +4,10 @@
 
 当前仓库没有一次性创建下述所有 crate，而是先按同样的依赖方向落地最小纵向切片。已实现结构见 [单次任务运行时](./04-single-task-runtime.md)。
 
+事件算子迁移已保留 legacy/native 与 operator 双 reader：Server 只为新 admission 做确定性灰度，
+Harness 按持久 engine/profile 恢复，extension 提供事务与保守保留清单。详见
+[P5 灰度与恢复运维](./design/agent/p5-rollout-recovery-operations.md)。默认仍为 legacy，不做副作用 shadow。
+
 ## 1. 设计结论
 
 Mina 建议先实现为**模块化单体**，而不是一开始就拆成多个服务：HTTP 服务、CLI 和桌面端共享同一个 `GatewayApi`；Gateway 通过稳定的命令/事件协议驱动 Agent；Agent 只负责推理与执行状态机；模型服务、远端代理等上游能力通过 `UpstreamPort` 注入。

@@ -41,6 +41,8 @@ pub struct FabricCapabilities {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FabricError {
+    #[error("admission_backlog_full")]
+    Capacity,
     #[error("invalid or oversized command: {0}")]
     Invalid(String),
     #[error("identity/content conflict")]
@@ -134,6 +136,16 @@ pub struct DeadLetter {
 
 #[derive(Debug, Clone)]
 pub enum FabricCommand {
+    InspectRetention {
+        now_ms: i64,
+        grace_ms: i64,
+        external_roots: Vec<crate::harness::BlobId>,
+    },
+    PublishBounded {
+        events: Vec<FabricEvent>,
+        subscription: SubscriptionSpec,
+        max_pending: usize,
+    },
     TransactMany {
         checkpoints: Vec<CheckpointWrite>,
         outbox: Vec<FabricEvent>,
@@ -211,6 +223,7 @@ pub enum FabricCommand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FabricReply {
+    Retention(RetentionInventory),
     Checkpoint(Option<FabricCheckpoint>),
     Event(Option<FabricEvent>),
     Published(Vec<EventId>),
@@ -223,6 +236,19 @@ pub enum FabricReply {
     Receipt(Option<Receipt>),
     Dispatched(usize),
     DeadLetters(Vec<DeadLetter>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionInventory {
+    pub events: usize,
+    pub checkpoints: usize,
+    pub outbox_backlog: usize,
+    pub oldest_outbox_age_ms: i64,
+    pub dead_letters: usize,
+    pub active_leases: usize,
+    pub lease_reclaims: u64,
+    pub protected_artifacts: usize,
+    pub orphan_candidates: Vec<crate::harness::BlobId>,
 }
 
 pub trait OperatorFabric: Send + Sync {

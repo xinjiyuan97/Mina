@@ -1,5 +1,8 @@
 # P4 Server、统一输出与最终验收
 
+后续灰度、版本隔离、故障/资源边界与保留接口见 [P5 运维记录](./p5-rollout-recovery-operations.md)。
+本文的测试数字与“本轮未实现”均是 P4 历史状态，不代表 P5 的实现或门禁结果。
+
 日期：2026-10-23。基线 HEAD `5f9c965`，分支 `feat/event-driven-operator-pipeline`。保留 P0–P3 和既有 P4 成果；没有 commit、push 或创建分支。
 
 ## 1. 显式启用与恢复

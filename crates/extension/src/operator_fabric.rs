@@ -39,14 +39,36 @@ pub(crate) fn storage(error: impl std::fmt::Display) -> FabricError {
     FabricError::Storage(error.to_string())
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FabricState {
+    #[serde(default = "schema_version")]
+    schema_version: u64,
+    #[serde(default)]
+    lease_reclaims: u64,
     #[serde(default)]
     checkpoints: std::collections::BTreeMap<String, FabricCheckpoint>,
     events: Vec<StoredEvent>,
     subscriptions: Vec<StoredSubscription>,
     receipts: Vec<Receipt>,
     dead_letters: Vec<DeadLetter>,
+}
+
+fn schema_version() -> u64 {
+    1
+}
+
+impl Default for FabricState {
+    fn default() -> Self {
+        Self {
+            schema_version: schema_version(),
+            lease_reclaims: 0,
+            checkpoints: Default::default(),
+            events: Vec::new(),
+            subscriptions: Vec::new(),
+            receipts: Vec::new(),
+            dead_letters: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +244,51 @@ impl FabricState {
         Ok(FabricReply::Published(ids))
     }
 
+    fn publish_bounded(
+        &mut self,
+        events: Vec<FabricEvent>,
+        subscription: SubscriptionSpec,
+        max_pending: usize,
+    ) -> Result<FabricReply, FabricError> {
+        if max_pending == 0 || max_pending > 4096 {
+            return Err(invalid("pending limit"));
+        }
+        validate_events(&events, false)?;
+        self.apply(FabricCommand::Subscribe(subscription.clone()))?;
+        let index = self.subscription(&subscription.consumer, &subscription.subscription)?;
+        let matches = |event: &FabricEvent| {
+            event.topic == subscription.topic
+                && subscription
+                    .event_type
+                    .as_ref()
+                    .is_none_or(|kind| kind == &event.envelope.event_type)
+                && subscription
+                    .tenant
+                    .as_ref()
+                    .is_none_or(|tenant| tenant == &event.envelope.tenant_id)
+        };
+        let pending = self
+            .events
+            .iter()
+            .filter(|stored| matches(&stored.event))
+            .count()
+            .saturating_sub(self.subscriptions[index].offset as usize);
+        let added = events
+            .iter()
+            .filter(|event| {
+                matches(event)
+                    && !self
+                        .events
+                        .iter()
+                        .any(|stored| stored.event.envelope.event_id == event.envelope.event_id)
+            })
+            .count();
+        if added > 0 && pending.saturating_add(added) > max_pending {
+            return Err(FabricError::Capacity);
+        }
+        self.publish(events, true)
+    }
+
     fn validate_lease(&self, lease: &DeliveryLease, now_ms: i64) -> Result<usize, FabricError> {
         let index = self.subscription(&lease.consumer, &lease.subscription)?;
         let current = &self.subscriptions[index];
@@ -251,6 +318,79 @@ impl FabricState {
         consumer: Option<&str>,
     ) -> Result<FabricReply, FabricError> {
         match command {
+            FabricCommand::InspectRetention {
+                now_ms,
+                grace_ms,
+                external_roots,
+            } => {
+                if grace_ms <= 0 || external_roots.len() > 4096 {
+                    return Err(invalid("retention bounds"));
+                }
+                let roots = serde_json::to_string(&(
+                    &self.events,
+                    &self.receipts,
+                    &self.dead_letters,
+                    self.checkpoints
+                        .iter()
+                        .filter(|(key, _)| !key.starts_with("pipeline-artifact:"))
+                        .collect::<Vec<_>>(),
+                    &external_roots,
+                ))
+                .map_err(storage)?;
+                let mut report = RetentionInventory {
+                    events: self.events.len(),
+                    checkpoints: self.checkpoints.len(),
+                    outbox_backlog: self.events.iter().filter(|event| !event.visible).count(),
+                    oldest_outbox_age_ms: self
+                        .events
+                        .iter()
+                        .filter(|event| !event.visible)
+                        .map(|event| {
+                            now_ms
+                                .saturating_sub(event.event.envelope.occurred_at_ms)
+                                .max(0)
+                        })
+                        .max()
+                        .unwrap_or(0),
+                    dead_letters: self.dead_letters.len(),
+                    lease_reclaims: self.lease_reclaims,
+                    active_leases: self
+                        .subscriptions
+                        .iter()
+                        .filter(|subscription| {
+                            subscription.lease.as_ref().is_some_and(|lease| {
+                                lease.offset > subscription.offset && lease.expires_at_ms > now_ms
+                            })
+                        })
+                        .count(),
+                    protected_artifacts: 0,
+                    orphan_candidates: vec![],
+                };
+                for (key, checkpoint) in &self.checkpoints {
+                    let Some(id) = key
+                        .strip_prefix("pipeline-artifact:")
+                        .and_then(|id| id.parse::<agent_core::harness::BlobId>().ok())
+                    else {
+                        continue;
+                    };
+                    if roots.contains(&id.to_string()) {
+                        report.protected_artifacts += 1;
+                    } else if checkpoint.value["metadata"]["created_at_ms"]
+                        .as_i64()
+                        .is_some_and(|created| {
+                            now_ms >= created && now_ms.saturating_sub(created) >= grace_ms
+                        })
+                    {
+                        report.orphan_candidates.push(id);
+                    }
+                }
+                Ok(FabricReply::Retention(report))
+            }
+            FabricCommand::PublishBounded {
+                events,
+                subscription,
+                max_pending,
+            } => self.publish_bounded(events, subscription, max_pending),
             FabricCommand::TransactMany {
                 mut checkpoints,
                 outbox,
@@ -546,6 +686,11 @@ impl FabricState {
                         continue;
                     }
                     let current = &mut self.subscriptions[index];
+                    if current.lease.as_ref().is_some_and(|lease| {
+                        lease.offset > current.offset && lease.expires_at_ms <= now_ms
+                    }) {
+                        self.lease_reclaims = self.lease_reclaims.saturating_add(1);
+                    }
                     current.epoch = current
                         .epoch
                         .checked_add(1)

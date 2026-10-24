@@ -3,11 +3,83 @@ use agent_core::{effect_pipeline::*, event_runtime::*, harness::*, operator_fabr
 use serde_json::json;
 use std::{collections::BTreeSet, sync::Arc};
 
+#[cfg(test)]
+mod p5_tests {
+    use super::*;
+
+    #[test]
+    fn p5_legacy_pending_wait_reader_keeps_historical_capacity() {
+        let run_id = RunId::new();
+        let request = EffectWaitRequest {
+            tenant_id: "local".into(),
+            run_id,
+            effect_id: "effect".into(),
+            call_id: "call".into(),
+            route: EffectRoute {
+                topic: "waits".into(),
+                event_type: "wait.register.requested".into(),
+                consumer: "wait".into(),
+            },
+            effects: vec![],
+            waits: (0..33)
+                .map(|index| {
+                    let wait_key = format!("wait-{index}");
+                    WaitSpec {
+                        wait_key: wait_key.clone(),
+                        subscription: CreateSubscription {
+                            subscription_id: SubscriptionId::new(),
+                            owner: SubscriptionOwner::Run { run_id },
+                            scope: SubscriptionScope::Run { run_id },
+                            filter: EventFilter {
+                                topics: vec!["external.completed".into()],
+                                sources: vec![EventSource::Gateway],
+                                correlation_id: Some(run_id.to_string()),
+                                ..Default::default()
+                            },
+                            delivery: DeliveryTarget::WakeRun { run_id, wait_key },
+                            mode: SubscriptionMode::Once,
+                            start_position: StartPosition::Beginning,
+                            expires_at_ms: None,
+                            max_deliveries: Some(1),
+                            created_at_ms: 0,
+                        },
+                    }
+                })
+                .collect(),
+        };
+        assert!(
+            validate(&request).is_ok(),
+            "new limits must not reject an already persisted P4 wait"
+        );
+        assert!(validate_counts(request.waits.len(), request.effects.len()).is_err());
+    }
+
+    #[test]
+    fn p5_wait_and_native_effect_counts_are_bounded() {
+        assert!(super::validate_counts(32, 32).is_ok());
+        assert!(super::validate_counts(0, 0).is_err());
+        assert!(super::validate_counts(33, 0).is_err());
+        assert!(super::validate_counts(1, 33).is_err());
+    }
+}
+
 #[derive(Clone)]
 pub struct EffectWaitBridge {
     fabric: Arc<dyn OperatorFabric>,
     events: Arc<dyn EventStore>,
     jobs: Arc<dyn JobStore>,
+}
+
+fn validate_counts(waits: usize, effects: usize) -> Result<(), FabricError> {
+    if waits == 0 || waits > 32 || effects > 32 {
+        return Err(invalid("wait_resource_limit"));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_new(request: &EffectWaitRequest) -> Result<(), FabricError> {
+    validate_counts(request.waits.len(), request.effects.len())?;
+    validate(request)
 }
 
 pub(crate) fn validate(request: &EffectWaitRequest) -> Result<(), FabricError> {

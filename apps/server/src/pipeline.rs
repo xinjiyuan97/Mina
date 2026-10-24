@@ -1,6 +1,4 @@
 use super::*;
-#[cfg(test)]
-use agent_core::operator::EngineVersion;
 use agent_core::operator_fabric::OperatorFabric;
 use agent_extension::pipeline::SqlitePipelineStore;
 use agent_harness::PlannedRun;
@@ -145,6 +143,12 @@ pub(super) async fn start(
     plan: PlannedRun,
     persisted: bool,
 ) -> Result<StartedRun, RunRuntimeError> {
+    if let Some(snapshot) = state.runtime.get_run(plan.run_id).await?
+        && let Some(manifest) = &snapshot.execution_manifest
+    {
+        agent_core::operator::validate_execution_manifest(manifest)
+            .map_err(|code| RunRuntimeError::Machine(code.into()))?;
+    }
     let request = state
         .admission
         .request(plan.run_id)
@@ -322,13 +326,13 @@ mod tests {
     #[tokio::test]
     async fn p3_opt_in_live_replay_last_event_id_and_default_legacy() {
         let mut state = crate::tests::test_state();
-        assert!(state.pipeline_engine.is_legacy());
+        assert!(state.pipeline_profile.engine().is_legacy());
         let directory = tempfile::tempdir().expect("temp");
         let ledger = Arc::new(
             SqlitePipelineStore::open(directory.path().join("pipeline.db")).expect("ledger"),
         );
         let calls = Arc::new(AtomicUsize::new(0));
-        state.pipeline_engine = EngineVersion::OperatorV1;
+        state.pipeline_profile = crate::tools_pipeline::EngineProfile::Text;
         state.pipeline = Some(Arc::new(
             PipelineRuntime::new(
                 ledger,

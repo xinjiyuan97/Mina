@@ -62,6 +62,10 @@ full = [
 name = "frame_shapes"
 required-features = ["agent-chat"]
 
+[[example]]
+name = "operator_retention"
+required-features = ["sqlite"]
+
 [dependencies]
 agent-core.workspace = true
 async-stream = { workspace = true, optional = true }

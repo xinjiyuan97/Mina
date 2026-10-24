@@ -1,5 +1,9 @@
 # 单次 Run 状态与持久化
 
+本文的旧 Run reader 继续保留。operator_v1 的事务事实、投影与版本隔离见
+[P5 灰度与恢复运维](./design/agent/p5-rollout-recovery-operations.md)；新 admission 的配置变化不改变
+已有 Run 的 engine/profile/projection，terminal SSE 必须先追平持久 watermark 再关闭。
+
 ## 1. 范围
 
 这一层只管理一次独立执行：一个输入、一个 `run_id`、一条有序事件流和一个唯一终态。它不引入 `session_id`，不把上一轮消息传给下一轮，也不实现跨 run 的记忆；这些属于下一阶段的 Session 层。

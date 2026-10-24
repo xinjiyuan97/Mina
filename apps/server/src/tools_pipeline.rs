@@ -47,15 +47,6 @@ pub(super) fn configured_profile() -> Result<EngineProfile, Box<dyn std::error::
         Err(error) => Err(error.into()),
     }
 }
-pub(super) fn effective_profile(state: &AppState) -> EngineProfile {
-    if state.pipeline_engine.is_legacy() {
-        EngineProfile::Legacy
-    } else if state.pipeline_profile == EngineProfile::Tools {
-        EngineProfile::Tools
-    } else {
-        EngineProfile::Text
-    }
-}
 fn persistence(error: impl std::fmt::Display) -> RunRuntimeError {
     RunRuntimeError::Persistence(error.to_string())
 }
@@ -96,6 +87,12 @@ impl ToolsServerPipeline {
         let _guard = self.starts.lock().await;
         let run_id = plan.run_id;
         let previous = self.runs.get_run(run_id).await.map_err(persistence)?;
+        if let Some(manifest) = previous
+            .as_ref()
+            .and_then(|run| run.execution_manifest.as_ref())
+        {
+            agent_core::operator::validate_execution_manifest(manifest).map_err(persistence)?;
+        }
         if let Some(previous) = &previous
             && (previous.input != plan.input
                 || previous

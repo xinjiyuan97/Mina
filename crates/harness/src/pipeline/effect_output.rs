@@ -132,6 +132,13 @@ impl EffectOutputOperator {
                 Err(FabricError::Fenced) => return Err(FabricError::Fenced),
                 result => {
                     result?;
+                    tracing::info!(
+                        engine = "operator_v1",
+                        profile = "operator_v1_tools",
+                        delta_batch_items = batch.last_seq.saturating_sub(batch.first_seq) + 1,
+                        delta_batch_bytes = serde_json::to_vec(&batch).map_err(invalid)?.len(),
+                        "durable delta batch saved"
+                    );
                 }
             }
         }

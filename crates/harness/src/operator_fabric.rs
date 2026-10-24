@@ -111,6 +111,9 @@ impl FabricRuntime {
             return Err(protocol_error());
         };
         for delivery in deliveries {
+            let started_at = std::time::Instant::now();
+            let operator = delivery.event.envelope.operator.name.clone();
+            let engine = delivery.event.envelope.engine_version;
             let lease = delivery.lease.clone();
             if clock() >= lease.expires_at_ms {
                 report.fenced += 1;
@@ -189,8 +192,21 @@ impl FabricRuntime {
                     Ok(_) => return Err(protocol_error()),
                 }
             }
+            tracing::info!(operator, engine = ?engine,
+                operator_latency_ms = started_at.elapsed().as_millis() as u64,
+                "fabric delivery finished");
         }
         report.dispatched += self.dispatch(store).await?;
+        if report != FabricTickReport::default() {
+            tracing::info!(
+                retry_count = report.retried,
+                dlq_count = report.dead_lettered,
+                fenced_count = report.fenced,
+                committed_count = report.committed,
+                dispatched_count = report.dispatched,
+                "fabric tick finished"
+            );
+        }
         Ok(report)
     }
 

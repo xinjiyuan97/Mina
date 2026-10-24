@@ -159,12 +159,28 @@ impl ToolsPipelineRuntime {
     }
     async fn project(&self, tenant: &str, run_id: RunId) -> Result<(), FabricError> {
         if let Some(runs) = &self.runs {
-            super::RunEventProjector::append(
-                runs.as_ref(),
-                self.load(tenant, run_id).await?.public_events,
-            )
-            .await
-            .map_err(super::effect_coordinator::invalid)?;
+            let record = self.load(tenant, run_id).await?;
+            let projected = runs
+                .get_run(run_id)
+                .await
+                .map_err(super::effect_coordinator::invalid)?
+                .map_or(0, |run| run.last_seq);
+            let projection_lag_events = record
+                .public_events
+                .last()
+                .map_or(0, |event| event.seq)
+                .saturating_sub(projected);
+            super::RunEventProjector::append(runs.as_ref(), record.public_events)
+                .await
+                .map_err(super::effect_coordinator::invalid)?;
+            if projection_lag_events > 0 {
+                tracing::info!(
+                    engine = "operator_v1",
+                    profile = TOOLS_PROFILE,
+                    projection_lag_events,
+                    "projection caught up"
+                );
+            }
         }
         Ok(())
     }
@@ -387,6 +403,8 @@ impl ToolsPipelineRuntime {
                 return Err(FabricError::Conflict);
             };
             processed += deliveries.len();
+            let delivery_count = deliveries.len();
+            let started_at = std::time::Instant::now();
             match consumer {
                 "wait" => {
                     for delivery in deliveries {
@@ -480,6 +498,16 @@ impl ToolsPipelineRuntime {
                         }
                     }
                 }
+            }
+            if delivery_count > 0 {
+                tracing::info!(
+                    operator = consumer,
+                    engine = "operator_v1",
+                    profile = TOOLS_PROFILE,
+                    delivery_count,
+                    operator_latency_ms = started_at.elapsed().as_millis() as u64,
+                    "operator batch finished"
+                );
             }
             self.fabric
                 .execute(FabricCommand::DispatchOutbox { limit: 128 })

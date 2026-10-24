@@ -103,7 +103,17 @@ impl AdmissionFacade {
             .collect();
         match self
             .fabric
-            .execute(FabricCommand::PublishBatch(events))
+            .execute(FabricCommand::PublishBounded {
+                events,
+                subscription: SubscriptionSpec {
+                    consumer: CONTEXT_CONSUMER.into(),
+                    subscription: CONTEXT_CONSUMER.into(),
+                    topic: CONTEXT_TOPIC.into(),
+                    event_type: Some(CONTEXT_REQUESTED.into()),
+                    tenant: Some("local".into()),
+                },
+                max_pending: 128,
+            })
             .await
         {
             Ok(FabricReply::Published(_)) => {}
@@ -327,7 +337,24 @@ impl FabricHandler for ContextOperator {
             {
                 return Err("Context request identity mismatch".into());
             }
-            let (kind, payload, outcome) = match self.preparer.prepare(request.clone()).await {
+            let preparation = self
+                .preparer
+                .prepare(request.clone())
+                .await
+                .and_then(|prepared| {
+                    if prepared.pack.artifact_refs.len() > 128
+                        || prepared.pack.memory_refs.len() > 128
+                        || prepared.pack.skill_refs.len() > 128
+                    {
+                        Err(ContextFailed {
+                            code: "context_resource_limit".into(),
+                            message: "too many context references".into(),
+                        })
+                    } else {
+                        Ok(prepared)
+                    }
+                });
+            let (kind, payload, outcome) = match preparation {
                 Ok(prepared) => {
                     let completed = ContextCompleted {
                         request_hash: request.request_hash.clone(),
@@ -496,10 +523,12 @@ impl ContextPreparer for AgentContextPreparer {
     }
 }
 
-/// Temporary P2 bridge. Remove when the P3/P4 operator executor replaces legacy starts.
 pub fn legacy_plan(request: ContextRequest, prepared: PreparedContext) -> PlannedRun {
     let pack = prepared.pack;
     let manifest = json!({
+        "engine_version": request.engine_version,
+        "profile": request.execution_profile.as_deref().unwrap_or(if request.engine_version.is_legacy() { "legacy" } else { "operator_v1_text" }),
+        "projection_version": 1,
         "schema_version": 1, "context_fingerprint": pack.fingerprint, "context_budget": pack.budget,
         "skill_refs": pack.skill_refs, "memory_refs": pack.memory_refs, "artifact_refs": pack.artifact_refs,
         "components": pack.component_descriptors,

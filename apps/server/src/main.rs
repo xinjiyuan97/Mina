@@ -93,6 +93,7 @@ mod p4_approval_tests;
 #[cfg(test)]
 mod p4_tools_tests;
 mod pipeline;
+mod rollout;
 mod tools_pipeline;
 
 const MAX_BLOB_BYTES: usize = 10 * 1_048_576;
@@ -107,8 +108,8 @@ type AppRuntimeAgent = ObservedMachine<ServerAgentLoop>;
 #[derive(Clone)]
 struct AppState {
     pipeline: Option<Arc<agent_harness::pipeline::PipelineRuntime>>,
-    pipeline_engine: agent_core::operator::EngineVersion,
     pipeline_profile: tools_pipeline::EngineProfile,
+    rollout: rollout::Rollout,
     tools_pipeline: Option<Arc<tools_pipeline::ToolsServerPipeline>>,
     admission: Arc<agent_harness::context_operator::AdmissionFacade>,
     runtime: RunRuntime<AppRuntimeAgent>,
@@ -951,8 +952,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             event_adapter.clone(),
             &config,
         )?)),
-        pipeline_engine: profile.engine(),
         pipeline_profile: profile,
+        rollout: rollout::Rollout::configured()?,
         tools_pipeline: Some(tools_pipeline),
         admission,
         runtime,
@@ -1554,13 +1555,18 @@ async fn create_run_owned(state: AppState, request: CreateRunRequest) -> Respons
         Ok(prepared) => prepared,
         Err(error) => return error,
     };
+    let legacy = prepared
+        .plan
+        .execution_manifest
+        .as_ref()
+        .is_none_or(|manifest| manifest["engine_version"] == "legacy_machine");
     let started = match pipeline::start(&state, prepared.plan, false).await {
         Ok(started) => started,
         Err(error) => return map_runtime_error(error),
     };
 
     if request.stream {
-        let live = state.pipeline_engine.is_legacy().then_some(started.events);
+        let live = legacy.then_some(started.events);
         return run_event_response(state.runtime, started.run_id, 0, true, live);
     }
 
@@ -1790,7 +1796,9 @@ async fn submit_session_run_owned(
     {
         Ok(prepared) => prepared,
         Err(response) => {
-            if response.status().is_server_error() {
+            if response.status().is_server_error()
+                && response.status() != StatusCode::SERVICE_UNAVAILABLE
+            {
                 return response;
             }
             if let Ok(snapshot) = state
@@ -2063,6 +2071,10 @@ fn run_event_response(
                         return;
                     }
                 };
+                if snapshot.last_seq > cursor {
+                    replay_required = true;
+                    continue;
+                }
                 if snapshot.is_terminal() {
                     return;
                 }
@@ -3122,8 +3134,8 @@ api_key = "test-key"
         }
         AppState {
             pipeline: None,
-            pipeline_engine: Default::default(),
             pipeline_profile: tools_pipeline::EngineProfile::Legacy,
+            rollout: Default::default(),
             tools_pipeline: None,
             admission,
             runtime: RunRuntime::new(

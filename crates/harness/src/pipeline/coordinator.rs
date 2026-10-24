@@ -26,6 +26,7 @@ impl RunCoordinator {
             return Ok(None);
         }
         let expected = record.generation;
+        let reclaimed = record.lease_owner.is_some();
         if record.lease_owner.is_some() {
             record.ledger.token.lease_epoch += 1;
         }
@@ -39,7 +40,17 @@ impl RunCoordinator {
         {
             Err(PipelineError::Fenced) => Ok(None),
             Err(error) => Err(error),
-            Ok(()) => Ok(Some(record)),
+            Ok(()) => {
+                if reclaimed {
+                    tracing::info!(
+                        engine = "operator_v1",
+                        profile = "operator_v1_text",
+                        lease_reclaim_count = 1,
+                        "pipeline lease reclaimed"
+                    );
+                }
+                Ok(Some(record))
+            }
         }
     }
 

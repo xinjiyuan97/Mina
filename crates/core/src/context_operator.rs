@@ -1,4 +1,4 @@
-//! P2 request/Context contracts. Execution remains pinned to legacy_machine.
+//! Request/Context contracts with a persisted execution profile.
 
 use crate::{
     context::{ContextArtifactRef, ContextBudget, ContextPack},
@@ -111,7 +111,7 @@ pub fn payload_schema(kind: &str) -> serde_json::Value {
         CONTEXT_FAILED => json!({
             "request_hash":{"type":"string", "minLength":1},
             "max_steps":{"type":"integer", "minimum":1},
-            "code":{"enum":["skill_resolution_failed", "context_build_failed"]},
+            "code":{"enum":["skill_resolution_failed", "context_build_failed", "context_resource_limit"]},
             "error_ref":{"type":"string", "format":"uuid"}
         }),
         _ => return json!(false),

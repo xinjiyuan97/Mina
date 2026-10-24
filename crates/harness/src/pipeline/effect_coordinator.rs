@@ -557,7 +557,7 @@ impl ToolsRunCoordinator {
                     effects,
                     route: route.clone(),
                 };
-                super::effect_wait::validate(&request)?;
+                super::effect_wait::validate_new(&request)?;
                 checkpoints.push(CheckpointWrite {
                     key: request.key(),
                     expected: None,

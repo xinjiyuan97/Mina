@@ -61,6 +61,31 @@ mod sqlite {
         PipelineError::Storage(error.to_string())
     }
 
+    fn decode_record(encoded: &str) -> Result<PipelineRecord, PipelineError> {
+        let value: serde_json::Value = serde_json::from_str(encoded).map_err(storage)?;
+        if value
+            .get("schema_version")
+            .is_some_and(|version| version.as_u64() != Some(1))
+            || value["facts"].as_array().is_some_and(|facts| {
+                facts.iter().any(|fact| {
+                    fact["schema_version"] != 1
+                        || fact["projection_version"] != 1
+                        || fact["engine_version"] != "operator_v1"
+                        || fact["operator"]["version"] != 1
+                })
+            })
+        {
+            return Err(storage("unsupported_pipeline_version"));
+        }
+        serde_json::from_value(value).map_err(storage)
+    }
+
+    fn encode_record(record: &PipelineRecord) -> Result<String, PipelineError> {
+        let mut value = serde_json::to_value(record).map_err(storage)?;
+        value["schema_version"] = serde_json::json!(1);
+        serde_json::to_string(&value).map_err(storage)
+    }
+
     impl SqlitePipelineStore {
         pub fn open(path: impl AsRef<Path>) -> Result<Self, PipelineError> {
             let connection = Connection::open(path).map_err(storage)?;
@@ -86,9 +111,7 @@ mod sqlite {
                         )
                         .optional()
                         .map_err(storage)?;
-                    encoded
-                        .map(|encoded| serde_json::from_str(&encoded).map_err(storage))
-                        .transpose()
+                    encoded.map(|encoded| decode_record(&encoded)).transpose()
                 })
                 .await
                 .map_err(storage)?
@@ -107,9 +130,9 @@ mod sqlite {
                     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(storage)?;
                     let actual: Option<(i64, String)> = transaction.query_row("SELECT generation, record_json FROM operator_runs_v1 WHERE run_id = ?1", [record.ledger.run_id.to_string()], |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(storage)?;
                     if actual.as_ref().map(|(value, _)| *value as u64) != expected || record.generation != expected.map_or(0, |generation| generation + 1) { return Err(PipelineError::Fenced); }
-                    let previous: Option<PipelineRecord> = actual.map(|(_, encoded)| serde_json::from_str(&encoded).map_err(storage)).transpose()?;
+                    let previous: Option<PipelineRecord> = actual.map(|(_, encoded)| decode_record(&encoded)).transpose()?;
                     record.validate_append(previous.as_ref())?;
-                    transaction.execute("INSERT INTO operator_runs_v1 (run_id, generation, record_json) VALUES (?1, ?2, ?3) ON CONFLICT(run_id) DO UPDATE SET generation=excluded.generation, record_json=excluded.record_json", params![record.ledger.run_id.to_string(), i64::try_from(record.generation).map_err(storage)?, serde_json::to_string(&record).map_err(storage)?]).map_err(storage)?;
+                    transaction.execute("INSERT INTO operator_runs_v1 (run_id, generation, record_json) VALUES (?1, ?2, ?3) ON CONFLICT(run_id) DO UPDATE SET generation=excluded.generation, record_json=excluded.record_json", params![record.ledger.run_id.to_string(), i64::try_from(record.generation).map_err(storage)?, encode_record(&record)?]).map_err(storage)?;
                     transaction.commit().map_err(storage)
                 }).await.map_err(storage)?
             })

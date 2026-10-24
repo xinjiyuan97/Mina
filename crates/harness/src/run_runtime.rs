@@ -187,7 +187,6 @@ where
         Ok(self.launch(execution))
     }
 
-    /// P2-only idempotent bridge; the existing flow row is the durable start receipt.
     pub async fn start_context_plan(
         &self,
         plan: PlannedRun,
@@ -195,6 +194,13 @@ where
     ) -> Result<StartedRun, RunRuntimeError> {
         let _guard = self.context_starts.lock().await;
         let snapshot = self.store.get_run(plan.run_id).await?;
+        if let Some(manifest) = snapshot
+            .as_ref()
+            .and_then(|run| run.execution_manifest.as_ref())
+        {
+            agent_core::operator::validate_execution_manifest(manifest)
+                .map_err(|code| RunRuntimeError::Machine(code.into()))?;
+        }
         if snapshot
             .as_ref()
             .and_then(|run| run.execution_manifest.as_ref())
@@ -437,6 +443,15 @@ where
             let _ = durable.flows.cancel(run_id, unix_time_ms()).await;
             self.finish_machine_run(run_id);
             return Ok(());
+        }
+        if let Some(manifest) = &snapshot.execution_manifest {
+            agent_core::operator::validate_execution_manifest(manifest)
+                .map_err(|code| RunRuntimeError::Machine(code.into()))?;
+            if manifest["engine_version"] == "operator_v1" {
+                return Err(RunRuntimeError::Machine(
+                    "operator_v1 run cannot enter legacy".into(),
+                ));
+            }
         }
         let lifecycle = if snapshot.last_seq == 0 {
             RunEventKind::RunStarted
@@ -1009,6 +1024,20 @@ where
         let unfinished = self.store.unfinished_runs().await?;
         let mut count = 0;
         for snapshot in unfinished {
+            if snapshot
+                .execution_manifest
+                .as_ref()
+                .is_some_and(|manifest| {
+                    agent_core::operator::validate_execution_manifest(manifest).is_err()
+                })
+            {
+                tracing::error!(
+                    code = "unsupported_run_version",
+                    run_id = %snapshot.run_id,
+                    "run quarantined; checkpoint retained"
+                );
+                continue;
+            }
             if let Some(durable) = &self.durable {
                 let flow = durable.flows.get(snapshot.run_id).await.map_err(|error| {
                     RunStoreError::Backend(format!("read durable flow recovery state: {error}"))

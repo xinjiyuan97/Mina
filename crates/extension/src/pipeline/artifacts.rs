@@ -5,8 +5,12 @@ use serde_json::json;
 use std::sync::Arc;
 
 pub struct FabricBlobStore(pub Arc<dyn OperatorFabric>);
+const MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+const CHUNK_BYTES: usize = 256 * 1024;
 #[derive(Serialize, Deserialize)]
 struct Manifest {
+    #[serde(default)]
+    schema_version: Option<u32>,
     metadata: BlobMetadata,
     chunks: usize,
 }
@@ -17,6 +21,9 @@ fn backend(error: impl std::fmt::Display) -> BlobStoreError {
 impl BlobStore for FabricBlobStore {
     fn put(&self, command: PutBlob) -> BlobStoreFuture<'_, BlobMetadata> {
         Box::pin(async move {
+            if command.data.len() > MAX_ARTIFACT_BYTES {
+                return Err(backend("artifact_resource_limit"));
+            }
             let metadata = BlobMetadata {
                 blob_id: BlobId::new(),
                 media_type: command.media_type,
@@ -25,7 +32,7 @@ impl BlobStore for FabricBlobStore {
                 created_at_ms: command.created_at_ms,
             };
             let mut chunks = 0;
-            for (index, chunk) in command.data.chunks(256 * 1024).enumerate() {
+            for (index, chunk) in command.data.chunks(CHUNK_BYTES).enumerate() {
                 self.0
                     .execute(FabricCommand::Transact {
                         checkpoint: CheckpointWrite {
@@ -46,6 +53,7 @@ impl BlobStore for FabricBlobStore {
                         key: format!("pipeline-artifact:{}", metadata.blob_id),
                         expected: None,
                         value: json!(Manifest {
+                            schema_version: Some(1),
                             metadata: metadata.clone(),
                             chunks
                         }),
@@ -73,7 +81,20 @@ impl BlobStore for FabricBlobStore {
             let Some(saved) = saved else {
                 return Ok(None);
             };
+            if saved
+                .value
+                .get("schema_version")
+                .is_some_and(|version| version.as_u64() != Some(1))
+            {
+                return Err(backend("unsupported_artifact_version"));
+            }
             let manifest: Manifest = serde_json::from_value(saved.value).map_err(backend)?;
+            if manifest.schema_version.is_some()
+                && (manifest.chunks > MAX_ARTIFACT_BYTES / CHUNK_BYTES
+                    || manifest.metadata.size_bytes > MAX_ARTIFACT_BYTES as u64)
+            {
+                return Err(backend("artifact_resource_limit"));
+            }
             let mut data = Vec::new();
             for index in 0..manifest.chunks {
                 let FabricReply::Checkpoint(Some(saved)) = self
@@ -96,6 +117,9 @@ impl BlobStore for FabricBlobStore {
                         )
                         .map_err(backend)?,
                 );
+                if data.len() as u64 > manifest.metadata.size_bytes {
+                    return Err(backend("artifact_resource_limit"));
+                }
             }
             if data.len() as u64 != manifest.metadata.size_bytes {
                 return Err(backend("artifact size mismatch"));

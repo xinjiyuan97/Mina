@@ -93,7 +93,25 @@ impl RunEventProjector {
                     result => result?,
                 }
             }
+            let projected = runs
+                .get_run(run_id)
+                .await
+                .map_err(storage)?
+                .map_or(0, |run| run.last_seq);
+            let projection_lag_events = record
+                .public_events
+                .last()
+                .map_or(0, |event| event.seq)
+                .saturating_sub(projected);
             Self::append(runs, record.public_events).await?;
+            if projection_lag_events > 0 {
+                tracing::info!(
+                    engine = "operator_v1",
+                    profile = "operator_v1_text",
+                    projection_lag_events,
+                    "projection caught up"
+                );
+            }
             return Ok(());
         }
     }

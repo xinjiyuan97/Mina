@@ -30,6 +30,7 @@ impl ModelOperator {
         token: InvocationToken,
         sender: DeltaSender,
     ) -> Result<(), PipelineError> {
+        let started_at = std::time::Instant::now();
         let record = load(self.store.as_ref(), run_id).await?;
         if record.ledger.token != token || record.lease_expires_at_ms <= crate::unix_time_ms() {
             return Err(PipelineError::Fenced);
@@ -161,7 +162,16 @@ impl ModelOperator {
         .await;
         result.error = outcome.unwrap_or_else(|_| Some("upstream_timeout".into()));
         result.coverage_digest = coverage(&result.journal);
-        self.save(run_id, &token, result).await
+        let saved = self.save(run_id, &token, result).await;
+        tracing::info!(
+            operator = "model",
+            engine = "operator_v1",
+            profile = "operator_v1_text",
+            operator_latency_ms = started_at.elapsed().as_millis() as u64,
+            success = saved.is_ok(),
+            "model operator finished"
+        );
+        saved
     }
 
     pub async fn interrupted(

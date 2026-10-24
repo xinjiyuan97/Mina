@@ -137,6 +137,13 @@ impl ModelOutputAggregator {
                 Ok(())
             })
             .await?;
+            tracing::info!(
+                engine = "operator_v1",
+                profile = "operator_v1_text",
+                delta_batch_items = batch.last_seq.saturating_sub(batch.first_seq) + 1,
+                delta_batch_bytes = serde_json::to_vec(&batch).map_err(super::storage)?.len(),
+                "durable delta batch saved"
+            );
             if let Some(runs) = &self.runs {
                 super::RunEventProjector::project(self.store.as_ref(), runs.as_ref(), run_id)
                     .await?;

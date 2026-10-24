@@ -2,6 +2,224 @@ use agent_core::{event_runtime::EventId, operator_fabric::*};
 use agent_extension::operator_fabric::MemoryFabric;
 use serde_json::json;
 
+#[tokio::test]
+#[cfg(feature = "pipeline")]
+async fn p5_artifact_reader_preserves_legacy_and_rejects_future_before_decode() {
+    use agent_core::harness::{BlobStore, PutBlob};
+    let store = std::sync::Arc::new(MemoryFabric::default());
+    let blobs = agent_extension::pipeline::FabricBlobStore(store.clone());
+    let metadata = blobs
+        .put(PutBlob {
+            media_type: "text/plain".into(),
+            name: None,
+            data: b"legacy".to_vec(),
+            created_at_ms: 0,
+        })
+        .await
+        .expect("artifact");
+    let key = format!("pipeline-artifact:{}", metadata.blob_id);
+    let FabricReply::Checkpoint(Some(mut saved)) = store
+        .execute(FabricCommand::ReadCheckpoint(key.clone()))
+        .await
+        .expect("read")
+    else {
+        panic!("manifest")
+    };
+    saved
+        .value
+        .as_object_mut()
+        .expect("object")
+        .remove("schema_version");
+    store
+        .execute(FabricCommand::Transact {
+            checkpoint: CheckpointWrite {
+                key: key.clone(),
+                expected: Some(saved.version),
+                value: saved.value,
+            },
+            outbox: vec![],
+            delivery: None,
+        })
+        .await
+        .expect("historical manifest");
+    assert_eq!(
+        blobs
+            .get(metadata.blob_id)
+            .await
+            .expect("read legacy")
+            .expect("blob")
+            .data,
+        b"legacy"
+    );
+    store
+        .execute(FabricCommand::Transact {
+            checkpoint: CheckpointWrite {
+                key,
+                expected: Some(saved.version + 1),
+                value: json!({"schema_version":999,"metadata":"future format"}),
+            },
+            outbox: vec![],
+            delivery: None,
+        })
+        .await
+        .expect("future manifest");
+    let error = blobs
+        .get(metadata.blob_id)
+        .await
+        .expect_err("isolate future artifact");
+    assert!(
+        error.to_string().contains("unsupported_artifact_version"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+#[cfg(all(feature = "sqlite", feature = "pipeline"))]
+async fn p5_text_ledger_unknown_versions_fail_closed_before_decode() {
+    use agent_core::{
+        harness::RunId,
+        pipeline::{PipelineError, PipelineStore},
+    };
+    let directory = tempfile::tempdir().expect("temp");
+    let path = directory.path().join("text.db");
+    let store = agent_extension::pipeline::SqlitePipelineStore::open(&path).expect("open");
+    let connection = rusqlite::Connection::open(&path).expect("connection");
+    let run_id = RunId::new();
+    let encoded = json!({"schema_version":999,"reducer":"future format"}).to_string();
+    connection
+        .execute(
+            "INSERT INTO operator_runs_v1(run_id,generation,record_json) VALUES (?1,0,?2)",
+            [run_id.to_string(), encoded.clone()],
+        )
+        .expect("future record");
+    assert_eq!(
+        store.load(run_id).await,
+        Err(PipelineError::Storage(
+            "unsupported_pipeline_version".into()
+        ))
+    );
+    let saved: String = connection
+        .query_row("SELECT record_json FROM operator_runs_v1", [], |row| {
+            row.get(0)
+        })
+        .expect("saved");
+    assert_eq!(saved, encoded);
+}
+
+#[tokio::test]
+#[cfg(feature = "pipeline")]
+async fn p5_artifact_size_is_rejected_before_any_chunk_is_saved() {
+    use agent_core::harness::{BlobStore, PutBlob};
+    let store = std::sync::Arc::new(MemoryFabric::default());
+    let blobs = agent_extension::pipeline::FabricBlobStore(store.clone());
+    assert!(
+        blobs
+            .put(PutBlob {
+                media_type: "application/octet-stream".into(),
+                name: None,
+                data: vec![0; 16 * 1024 * 1024 + 1],
+                created_at_ms: 0
+            })
+            .await
+            .is_err()
+    );
+    let FabricReply::Retention(report) = store
+        .execute(FabricCommand::InspectRetention {
+            now_ms: 1,
+            grace_ms: 1,
+            external_roots: vec![],
+        })
+        .await
+        .expect("inspect")
+    else {
+        panic!("report")
+    };
+    assert_eq!(report.checkpoints, 0);
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn p5_unknown_ledger_version_is_quarantined_without_rewrite() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("events.db");
+    let store = agent_extension::store::SqliteEventStore::open(&path, "p5")
+        .await
+        .expect("open");
+    store
+        .execute(FabricCommand::Publish(event(1)))
+        .await
+        .expect("publish");
+    drop(store);
+    let connection = rusqlite::Connection::open(&path).expect("connection");
+    let original: String = connection
+        .query_row(
+            "SELECT state_json FROM workflow_operator_fabric_v1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("state");
+    let mut future: serde_json::Value = serde_json::from_str(&original).expect("json");
+    future["schema_version"] = json!(999);
+    future["events"] = json!("future format must not be decoded");
+    let encoded = future.to_string();
+    connection
+        .execute(
+            "UPDATE workflow_operator_fabric_v1 SET state_json = ?1",
+            [&encoded],
+        )
+        .expect("future fixture");
+    let store = agent_extension::store::SqliteEventStore::open(&path, "p5")
+        .await
+        .expect("reopen");
+    assert_eq!(
+        store.execute(FabricCommand::Publish(event(2))).await,
+        Err(FabricError::Invalid("unsupported_fabric_version".into()))
+    );
+    let unchanged: String = connection
+        .query_row(
+            "SELECT state_json FROM workflow_operator_fabric_v1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("state");
+    assert_eq!(unchanged, encoded);
+    let mut historical: serde_json::Value = serde_json::from_str(&original).expect("JSON");
+    historical
+        .as_object_mut()
+        .expect("object")
+        .remove("schema_version");
+    historical
+        .as_object_mut()
+        .expect("object")
+        .remove("lease_reclaims");
+    let mut unsupported = historical.clone();
+    unsupported["events"][0]["event"]["envelope"]["projection_version"] = json!(999);
+    connection
+        .execute(
+            "UPDATE workflow_operator_fabric_v1 SET state_json = ?1",
+            [unsupported.to_string()],
+        )
+        .expect("future projection");
+    assert_eq!(
+        store.execute(FabricCommand::Publish(event(2))).await,
+        Err(FabricError::Invalid(
+            "unsupported_fabric_event_version".into()
+        ))
+    );
+    connection
+        .execute(
+            "UPDATE workflow_operator_fabric_v1 SET state_json = ?1",
+            [historical.to_string()],
+        )
+        .expect("rollback fixture");
+    assert!(
+        store
+            .execute(FabricCommand::Publish(event(2)))
+            .await
+            .is_ok()
+    );
+}
+
 fn event(sequence: u64) -> FabricEvent {
     FabricEvent {
         topic: "facts".into(),
@@ -16,6 +234,263 @@ fn event(sequence: u64) -> FabricEvent {
         })).expect("envelope"),
         payload_schema: json!({"type":"object","required":["value"],"properties":{"value":{"type":"integer"}},"additionalProperties":false}),
     }
+}
+
+#[tokio::test]
+async fn p5_atomic_backlog_limit_allows_retry_and_drain() {
+    let store = MemoryFabric::default();
+    let publish = |sequence| FabricCommand::PublishBounded {
+        events: vec![event(sequence)],
+        subscription: subscription("sub"),
+        max_pending: 1,
+    };
+    store.execute(publish(1)).await.expect("first");
+    store
+        .execute(publish(1))
+        .await
+        .expect("idempotent at capacity");
+    assert_eq!(store.execute(publish(2)).await, Err(FabricError::Capacity));
+    assert_eq!(replay(&store).await.len(), 1);
+    let delivery = claim(&store, 0).await.remove(0);
+    store
+        .execute(commit(delivery.lease, 1, vec![]))
+        .await
+        .expect("drain");
+    store.execute(publish(2)).await.expect("capacity released");
+}
+
+#[tokio::test]
+async fn p5_inventory_counts_expired_lease_reclaims() {
+    let store = MemoryFabric::default();
+    subscribe(&store).await;
+    store
+        .execute(FabricCommand::Publish(event(1)))
+        .await
+        .expect("publish");
+    claim(&store, 0).await;
+    claim(&store, 10).await;
+    let FabricReply::Retention(report) = store
+        .execute(FabricCommand::InspectRetention {
+            now_ms: 11,
+            grace_ms: 1,
+            external_roots: vec![],
+        })
+        .await
+        .expect("report")
+    else {
+        panic!("report")
+    };
+    assert_eq!(report.lease_reclaims, 1);
+    assert_eq!(report.active_leases, 1);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn p5_sqlite_busy_does_not_ack_or_publish_unsaved_facts() {
+    let directory = tempfile::tempdir().expect("temp");
+    let path = directory.path().join("busy.db");
+    let store = agent_extension::store::SqliteEventStore::open(&path, "p5")
+        .await
+        .expect("store");
+    subscribe(&store).await;
+    store
+        .execute(FabricCommand::Publish(event(1)))
+        .await
+        .expect("publish");
+    let delivery = claim(&store, 0).await.remove(0);
+    let connection = rusqlite::Connection::open(&path).expect("connection");
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("hold writer");
+    assert!(matches!(
+        store
+            .execute(commit(delivery.lease, 1, vec![event(2)]))
+            .await,
+        Err(FabricError::Storage(_))
+    ));
+    connection.execute_batch("ROLLBACK").expect("release");
+    assert_eq!(offset(&store).await, 0);
+    assert_eq!(replay(&store).await.len(), 1);
+    let delivery = claim(&store, 10).await.remove(0);
+    store
+        .execute(commit(delivery.lease, 11, vec![event(2)]))
+        .await
+        .expect("retry after reclaim");
+    assert_eq!(offset(&store).await, 1);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn p5_seeded_kill_points_reopen_without_duplicate_facts() {
+    let seed = 0x5eed_u64;
+    let mut random = seed;
+    let mut covered = [false; 4];
+    for iteration in 0..32 {
+        random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let point = (random >> 32) as usize % 4;
+        covered[point] = true;
+        let directory = tempfile::tempdir().expect("temp");
+        let path = directory.path().join("kill.db");
+        let store = agent_extension::store::SqliteEventStore::open(&path, "p5")
+            .await
+            .expect("open");
+        subscribe(&store).await;
+        store
+            .execute(FabricCommand::Publish(event(1)))
+            .await
+            .expect("publish");
+        if point > 0 {
+            let delivery = claim(&store, 0).await.remove(0);
+            if point > 1 {
+                store
+                    .execute(commit(delivery.lease, 1, vec![event(2)]))
+                    .await
+                    .expect("commit");
+                if point > 2 {
+                    store
+                        .execute(FabricCommand::DispatchOutbox { limit: 1 })
+                        .await
+                        .expect("dispatch");
+                }
+            }
+        }
+        drop(store);
+        let store = agent_extension::store::SqliteEventStore::open(&path, "p5")
+            .await
+            .expect("reopen");
+        if point < 2 {
+            let delivery = claim(&store, 10).await.remove(0);
+            store
+                .execute(commit(delivery.lease, 11, vec![event(2)]))
+                .await
+                .expect("recover");
+        }
+        store
+            .execute(FabricCommand::DispatchOutbox { limit: 1 })
+            .await
+            .expect("dispatch");
+        store
+            .execute(FabricCommand::DispatchOutbox { limit: 1 })
+            .await
+            .expect("idempotent dispatch");
+        assert_eq!(
+            offset(&store).await,
+            1,
+            "seed={seed} iteration={iteration} point={point}"
+        );
+        assert_eq!(
+            replay(&store).await.len(),
+            2,
+            "seed={seed} iteration={iteration} point={point}"
+        );
+    }
+    assert_eq!(covered, [true; 4]);
+}
+
+#[tokio::test]
+async fn p5_retention_inventory_protects_active_outbox_and_checkpoint_references() {
+    let store = MemoryFabric::default();
+    let orphan = agent_core::harness::BlobId::new();
+    let active = agent_core::harness::BlobId::new();
+    let pending = agent_core::harness::BlobId::new();
+    let dead = agent_core::harness::BlobId::new();
+    for blob in [orphan, active, pending, dead] {
+        store
+            .execute(FabricCommand::Transact {
+                checkpoint: CheckpointWrite {
+                    key: format!("pipeline-artifact:{blob}"),
+                    expected: None,
+                    value: json!({"metadata":{"blob_id":blob,"created_at_ms":0},"chunks":1}),
+                },
+                outbox: vec![],
+                delivery: None,
+            })
+            .await
+            .expect("manifest");
+    }
+    store
+        .execute(FabricCommand::Transact {
+            checkpoint: CheckpointWrite {
+                key: "active-run".into(),
+                expected: None,
+                value: json!({"ref":active}),
+            },
+            outbox: vec![],
+            delivery: None,
+        })
+        .await
+        .expect("active checkpoint");
+    subscribe(&store).await;
+    let mut source = event(1);
+    source.envelope.payload = json!({"ref":dead});
+    source.payload_schema = json!(true);
+    store
+        .execute(FabricCommand::Publish(source))
+        .await
+        .expect("source");
+    let delivery = claim(&store, 0).await.remove(0);
+    store
+        .execute(FabricCommand::Retry {
+            lease: delivery.lease,
+            now_ms: 1,
+            backoff_ms: 1,
+            max_attempts: 1,
+            error: "injected".into(),
+        })
+        .await
+        .expect("DLQ");
+    let mut outbox = event(2);
+    outbox.envelope.operator_seq.0 = 0;
+    outbox.envelope.payload = json!({"ref":pending});
+    outbox.payload_schema = json!(true);
+    store
+        .execute(FabricCommand::Transact {
+            checkpoint: CheckpointWrite {
+                key: "outbox-owner".into(),
+                expected: None,
+                value: json!({}),
+            },
+            outbox: vec![outbox],
+            delivery: None,
+        })
+        .await
+        .expect("pending outbox");
+    let inspect = |now_ms| FabricCommand::InspectRetention {
+        now_ms,
+        grace_ms: 100,
+        external_roots: vec![],
+    };
+    let FabricReply::Retention(report) = store.execute(inspect(99)).await.expect("inspect") else {
+        panic!("report")
+    };
+    assert!(report.orphan_candidates.is_empty());
+    let FabricReply::Retention(report) = store.execute(inspect(100)).await.expect("inspect") else {
+        panic!("report")
+    };
+    assert_eq!(report.orphan_candidates, vec![orphan]);
+    assert_eq!(report.protected_artifacts, 3);
+    assert_eq!(report.outbox_backlog, 1);
+    assert_eq!(report.dead_letters, 1);
+    let FabricReply::Retention(report) = store
+        .execute(FabricCommand::InspectRetention {
+            now_ms: 100,
+            grace_ms: 100,
+            external_roots: vec![orphan],
+        })
+        .await
+        .expect("external roots")
+    else {
+        panic!("report")
+    };
+    assert!(report.orphan_candidates.is_empty());
+    assert!(matches!(
+        store
+            .execute(FabricCommand::ReadCheckpoint(format!(
+                "pipeline-artifact:{orphan}"
+            )))
+            .await,
+        Ok(FabricReply::Checkpoint(Some(_)))
+    ));
 }
 
 fn subscription(name: &str) -> SubscriptionSpec {

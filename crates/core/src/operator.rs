@@ -1,4 +1,4 @@
-//! Versioned target contracts only; no scheduler, transport or execution wiring.
+//! Versioned contracts; no scheduler, transport or execution wiring.
 //!
 //! Sequence domains require explicit boundary conversion, never implicit reuse.
 //! ```compile_fail,E0308
@@ -20,6 +20,34 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub fn validate_execution_manifest(manifest: &Value) -> Result<(), &'static str> {
+    let unsupported = "unsupported_run_version";
+    if !manifest.is_object()
+        || manifest
+            .get("schema_version")
+            .is_some_and(|version| version.as_u64() != Some(1))
+        || manifest
+            .get("projection_version")
+            .is_some_and(|version| version.as_u64() != Some(1))
+    {
+        return Err(unsupported);
+    }
+    match manifest.get("engine_version") {
+        None => Ok(()),
+        Some(engine) if engine == "legacy_machine" => Ok(()),
+        Some(engine)
+            if engine == "operator_v1"
+                && manifest["projection_version"] == 1
+                && manifest.get("profile").is_none_or(|profile| {
+                    profile == "operator_v1_text" || profile == "operator_v1_tools"
+                }) =>
+        {
+            Ok(())
+        }
+        _ => Err(unsupported),
+    }
+}
 
 use crate::{
     event_runtime::EventId,
