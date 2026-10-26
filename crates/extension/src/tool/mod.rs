@@ -4,6 +4,10 @@
 //! validation, risk approval, cancellation, and public events.
 
 mod catalog;
+#[cfg(feature = "openai")]
+mod image;
+#[cfg(feature = "openai")]
+pub use image::{GenerateImageTool, ImageGenerationConfig};
 #[cfg(feature = "docx-tools")]
 mod docx;
 mod filesystem;

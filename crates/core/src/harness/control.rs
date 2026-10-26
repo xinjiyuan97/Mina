@@ -13,6 +13,12 @@ impl RunCancellation {
         Self::default()
     }
 
+    pub fn child(&self) -> Self {
+        Self {
+            token: self.token.child_token(),
+        }
+    }
+
     pub fn cancel(&self) {
         self.token.cancel();
     }

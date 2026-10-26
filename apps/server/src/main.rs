@@ -19,15 +19,14 @@ use agent_core::event_runtime::{
     SubscriptionId, SubscriptionMode, SubscriptionOwner, SubscriptionScope,
 };
 use agent_core::harness::{
-    AGENT_LOOP_CHECKPOINT_SCHEMA_VERSION, AGENT_LOOP_REDUCER_PROTOCOL_VERSION, Agent, AgentLoop,
-    AgentMetadata, ApprovalDecision, ApprovalError, ApprovalFuture, ApprovalId, ApprovalPort,
-    ApprovalRequest, ApprovalResolution, ArchiveSession, BeginSessionRun, BlobId, BlobStore,
-    ContentPart, CreateSession, EffectRequest, FinalizeSessionRun, FinishReason, FlowEffect,
-    FlowEffectRouter, FlowError, FlowStore, JobExecutionError, JobExecutionFuture, JobRecord,
-    JobRouter, JobStore, MAX_SESSION_PAGE_SIZE, ModelAttachment, PutBlob, RunEvent, RunFailure,
-    RunId, RunResponse, RunSnapshot, RunStatus, RunStore, RunStoreError, SessionId, SessionStatus,
-    SessionStore, SessionStoreError, ToolDefinition, ToolPort, ToolRegistry, ToolRiskLevel,
-    WakeFlowRun,
+    Agent, AgentLoop, AgentMetadata, ApprovalDecision, ApprovalError, ApprovalFuture, ApprovalId,
+    ApprovalPort, ApprovalRequest, ApprovalResolution, ArchiveSession, BeginSessionRun, BlobId,
+    BlobStore, ContentPart, CreateSession, EffectRequest, FinalizeSessionRun, FinishReason,
+    FlowEffect, FlowEffectRouter, FlowError, FlowStore, JobExecutionError, JobExecutionFuture,
+    JobRecord, JobRouter, JobStore, MAX_SESSION_PAGE_SIZE, ModelAttachment, PutBlob, RunEvent,
+    RunFailure, RunId, RunResponse, RunSnapshot, RunStatus, RunStore, RunStoreError, SessionId,
+    SessionStatus, SessionStore, SessionStoreError, ToolDefinition, ToolPort, ToolRegistry,
+    ToolRiskLevel, WakeFlowRun,
 };
 use agent_core::memory::{
     CreateMemoryWriteProposal, HostMemoryWritePolicy, MemoryApprovalId, MemoryApprovalStatus,
@@ -45,8 +44,8 @@ use agent_core::skill::{
 use agent_extension::adf::{InMemoryAdfArtifactStore, RunAdfToolSession};
 use agent_extension::context::ModelSummaryGenerator;
 use agent_extension::observability::{
-    AsyncObservationConfig, AsyncObservationHook, HookObservationExporter, ObservedMachine,
-    ObservedModel, ObservedTools, TracingObservationHook,
+    AsyncObservationConfig, AsyncObservationHook, HookObservationExporter, ObservedModel,
+    ObservedTools, TracingObservationHook,
 };
 use agent_extension::provider::{ConfiguredModelProvider, Modality};
 use agent_extension::sandbox::HostProcessSandbox;
@@ -60,8 +59,8 @@ use agent_extension::tool::{
 use agent_extension::workspace::{NativeWorkspaceFs, WorkspaceFs};
 use agent_harness::{
     ContextStrategy, EventRuntime, EventRuntimeConfig, FlowEffectRuntime, FlowEffectRuntimeConfig,
-    Harness, HarnessConfig, HarnessError, JobRuntime, JobRuntimeConfig, OrchestrationConfig,
-    QuickJsConfig, RunRuntime, RunRuntimeError, StartedRun,
+    HarnessConfig, HarnessError, JobRuntime, JobRuntimeConfig, OrchestrationConfig, QuickJsConfig,
+    RunRepository, RunRuntimeError, StartedRun,
     adf::JavaScriptAdfExecutor,
     script::{QuickJsRuntime, QuickJsRuntimeConfig},
 };
@@ -85,15 +84,14 @@ use tokio::{
 };
 use tracing_subscriber::EnvFilter;
 
+use agent_core::agent::context_operator::PreparedRun;
 use agent_harness as run_runtime;
-use agent_harness::context_operator::PreparedRun;
 mod admission;
 #[cfg(test)]
 mod p4_approval_tests;
 #[cfg(test)]
 mod p4_tools_tests;
 mod pipeline;
-mod rollout;
 mod tools_pipeline;
 
 const MAX_BLOB_BYTES: usize = 10 * 1_048_576;
@@ -103,16 +101,14 @@ type ServerAgentLoop = AgentLoop<
     ObservedModel<ConfiguredModelProvider>,
     ObservedTools<RunAdfToolSession<ToolRegistry>>,
 >;
-type AppRuntimeAgent = ObservedMachine<ServerAgentLoop>;
 
 #[derive(Clone)]
 struct AppState {
-    pipeline: Option<Arc<agent_harness::pipeline::PipelineRuntime>>,
+    pipeline: Option<Arc<tools_pipeline::ServerAgentRuntime>>,
     pipeline_profile: tools_pipeline::EngineProfile,
-    rollout: rollout::Rollout,
-    tools_pipeline: Option<Arc<tools_pipeline::ToolsServerPipeline>>,
-    admission: Arc<agent_harness::context_operator::AdmissionFacade>,
-    runtime: RunRuntime<AppRuntimeAgent>,
+    tools_pipeline: Option<Arc<tools_pipeline::ServerAgentRuntime>>,
+    admission: Arc<agent_core::agent::context_operator::AdmissionFacade>,
+    runtime: RunRepository,
     config: Arc<HarnessConfig>,
     approvals: InMemoryApprovalBroker,
     events: Arc<EventRuntime>,
@@ -469,13 +465,6 @@ impl InMemoryApprovalBroker {
             .map_err(|_| ResolveApprovalError::NotPending)?;
         Ok(ResolveApprovalOutcome::Accepted)
     }
-
-    fn remove_run(&self, run_id: RunId) {
-        self.records
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|_, record| record.request.run_id != run_id);
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -796,13 +785,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         agent = agent_metadata.name,
         engine = engine.kind,
-        reducer_protocol_version = engine.protocol_version,
+        graph_protocol_version = engine.protocol_version,
         checkpoint_schema_version = engine.checkpoint_schema_version,
         "configured agent runtime"
     );
 
-    let harness = Harness::new(ObservedMachine::new(agent, Arc::clone(&observation_hook)))
-        .with_run_timeout(Duration::from_secs(config.agent().run_timeout_seconds));
     let store_path = env::var_os("MINA_RUN_STORE_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("data/runs.sqlite3"));
@@ -856,21 +843,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_store: Arc<dyn EventStore> = event_adapter.clone();
     let flow_store: Arc<dyn FlowStore> = event_adapter.clone();
     let job_store: Arc<dyn JobStore> = event_adapter.clone();
-    let admission = Arc::new(agent_harness::context_operator::AdmissionFacade::new(
+    let admission = Arc::new(agent_core::agent::context_operator::AdmissionFacade::new(
         event_adapter.clone(),
         Arc::clone(&blobs),
-        Arc::new(agent_harness::context_operator::AgentContextPreparer {
+        Arc::new(agent_core::agent::context_operator::AgentContextPreparer {
             context,
             skills: Arc::clone(&skills),
         }),
     ));
     admission.start_worker();
-    let legacy_router: Arc<dyn DeliveryRouter> = Arc::new(ServerDeliveryRouter {
+    let auxiliary_router: Arc<dyn DeliveryRouter> = Arc::new(ServerDeliveryRouter {
         memories: Arc::clone(&memory_store),
         proposals: Arc::clone(&memory_proposals),
         flows: Some(Arc::clone(&flow_store)),
     });
-    let wait_bridge = Arc::new(agent_harness::pipeline::EffectWaitBridge::new(
+    let wait_bridge = Arc::new(agent_core::agent::GraphWaitBridge::new(
         event_adapter.clone(),
         event_adapter.clone(),
         event_adapter.clone(),
@@ -878,7 +865,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let delivery_router: Arc<dyn DeliveryRouter> =
         Arc::new(tools_pipeline::EngineDeliveryRouter::new(
             sqlite_store.clone(),
-            legacy_router,
+            auxiliary_router,
             wait_bridge.clone(),
         ));
     let events = Arc::new(EventRuntime::new(
@@ -903,30 +890,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for proposal in memory_proposals.pending_proposals(1_000).await? {
         ensure_memory_approval(&events, &proposal).await?;
     }
-    let approval_cleanup = approvals.clone();
-    let runtime = RunRuntime::new_durable(harness, store, flow_store, move |run_id| {
-        approval_cleanup.remove_run(run_id);
-    });
-    let pending_context = admission
-        .scan_requests()
-        .await?
-        .into_iter()
-        .map(|entry| {
-            if entry.request.is_err() {
-                tracing::error!(run_id = %entry.run_id, code = "run_recovery_failed",
-                    "corrupt admission retained for recovery; continuing startup");
-            }
-            entry.run_id
-        })
-        .collect();
-    let recovered = runtime.recover_interrupted_except(&pending_context).await?;
-    if recovered > 0 {
-        tracing::warn!(
-            recovered,
-            "closed runs interrupted by the previous server process"
-        );
-    }
-    runtime.start_flow_worker();
+    let runtime = RunRepository::new(agent_metadata, store);
     let pending_session_finalizations = sessions.pending_finalizations().await?;
     let reconciled_sessions = pending_session_finalizations.len();
     for (session_id, run) in pending_session_finalizations {
@@ -947,17 +911,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     start_session_finalization_worker(Arc::clone(&sessions));
 
     let profile = tools_pipeline::configured_profile()?;
-    let tools_pipeline = Arc::new(tools_pipeline::ToolsServerPipeline::new(
-        Arc::new(
-            agent_harness::pipeline::ToolsPipelineRuntime::new(
-                event_adapter.clone(),
-                operator_model,
-                operator_tools,
-            )
-            .with_blobs(blobs.clone())
-            .with_projection(sqlite_store.clone())
-            .with_wait_ports(event_adapter.clone(), event_adapter.clone()),
-        ),
+    let tools_pipeline = Arc::new(tools_pipeline::ServerAgentRuntime::new(
+        agent_core::agent::AgentResources::new(event_adapter.clone())
+            .model("primary", "server-v1", operator_model)
+            .toolset("workspace", "server-v1", operator_tools)
+            .wait_service("durable", "server-v1", wait_bridge),
         sqlite_store.clone(),
     ));
     let state = AppState {
@@ -969,7 +927,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &config,
         )?)),
         pipeline_profile: profile,
-        rollout: rollout::Rollout::configured()?,
         tools_pipeline: Some(tools_pipeline),
         admission,
         runtime,
@@ -1519,9 +1476,9 @@ async fn inspect_agent(State(state): State<AppState>) -> Response {
 
 const fn agent_engine_info() -> AgentEngineInfo {
     AgentEngineInfo {
-        kind: "reducer",
-        protocol_version: AGENT_LOOP_REDUCER_PROTOCOL_VERSION,
-        checkpoint_schema_version: AGENT_LOOP_CHECKPOINT_SCHEMA_VERSION,
+        kind: "static_graph",
+        protocol_version: 1,
+        checkpoint_schema_version: 1,
     }
 }
 
@@ -1572,19 +1529,15 @@ async fn create_run_owned(state: AppState, request: CreateRunRequest) -> Respons
         Ok(prepared) => prepared,
         Err(error) => return error,
     };
-    let legacy = prepared
-        .plan
-        .execution_manifest
-        .as_ref()
-        .is_none_or(|manifest| manifest["engine_version"] == "legacy_machine");
     let started = match pipeline::start(&state, prepared.plan, false).await {
         Ok(started) => started,
         Err(error) => return map_runtime_error(error),
     };
 
     if request.stream {
-        let live = legacy.then_some(started.events);
-        return run_event_response(state.runtime, started.run_id, 0, true, live);
+        // Preview deltas may precede a durable checkpoint. Keep the engine's
+        // live receiver so a provider awaiting client interaction cannot stall.
+        return run_event_response(state.runtime, started.run_id, 0, true, Some(started.events));
     }
 
     match wait_for_terminal(&state.runtime, started).await {
@@ -1817,7 +1770,7 @@ async fn submit_session_run_owned(
             }
             if let Ok(snapshot) = state
                 .runtime
-                .fail_persisted(
+                .reject_unadmitted(
                     run_id,
                     "context_build_failed",
                     "context orchestration failed",
@@ -1843,7 +1796,7 @@ async fn submit_session_run_owned(
         Err(error) => {
             if let Ok(snapshot) = state
                 .runtime
-                .fail_persisted(run_id, "run_start_failed", "run executor could not start")
+                .reject_unadmitted(run_id, "run_start_failed", "run executor could not start")
                 .await
             {
                 let _ = state
@@ -2024,7 +1977,7 @@ async fn get_run_events(
             run_id,
             after_seq,
             query.follow.unwrap_or(true),
-            state.runtime.subscribe(run_id),
+            None,
         ),
         Ok(None) => run_not_found(),
         Err(error) => map_store_error(error),
@@ -2032,7 +1985,7 @@ async fn get_run_events(
 }
 
 fn run_event_response(
-    runtime: RunRuntime<AppRuntimeAgent>,
+    runtime: RunRepository,
     run_id: RunId,
     after_seq: u64,
     follow: bool,
@@ -2100,7 +2053,7 @@ fn run_event_response(
             }
 
             if live_events.is_none() {
-                live_events = runtime.subscribe(run_id);
+                live_events = None;
             }
             let Some(receiver) = live_events.as_mut() else {
                 // A durable machine deliberately releases its executor while it is
@@ -2176,7 +2129,7 @@ fn stream_error_event(message: impl Into<String>) -> Event {
 }
 
 async fn wait_for_terminal(
-    runtime: &RunRuntime<AppRuntimeAgent>,
+    runtime: &RunRepository,
     mut started: StartedRun,
 ) -> Result<RunResponse, HarnessError> {
     loop {
@@ -2502,63 +2455,12 @@ async fn resolve_persisted_approval(
             "the run terminated before this approval was resolved",
             false,
         ),
-        None => {
-            let now_ms = run_runtime::unix_time_ms();
-            let event_id = EventId::stable("tool-approval-resolved", &approval_id.to_string());
-            let decision = match requested.decision {
-                ApprovalDecision::AllowOnce => "allow-once",
-                ApprovalDecision::Deny => "deny",
-            };
-            match state
-                .events
-                .publish(PublishEvent {
-                    event_id,
-                    topic: "tool.approval.resolved".into(),
-                    event_type: "tool.approval.resolved".into(),
-                    schema_version: 1,
-                    source: EventSource::Gateway,
-                    subject: Some(format!("run/{run_id}")),
-                    correlation_id: Some(approval_id.to_string()),
-                    causation_id: None,
-                    occurred_at_ms: now_ms,
-                    recorded_at_ms: now_ms,
-                    payload: serde_json::json!({
-                        "decision": decision,
-                        "reason": requested.reason.clone(),
-                    }),
-                })
-                .await
-            {
-                Ok(result) => (
-                    StatusCode::ACCEPTED,
-                    Json(ResolveApprovalResponse {
-                        run_id,
-                        approval_id,
-                        resolution: requested,
-                        replayed: result.replayed,
-                    }),
-                )
-                    .into_response(),
-                Err(EventError::Conflict(message)) => api_error(
-                    StatusCode::CONFLICT,
-                    "approval_already_resolved",
-                    message,
-                    false,
-                ),
-                Err(EventError::Invalid(message)) => api_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_approval_event",
-                    message,
-                    false,
-                ),
-                Err(error) => api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "event_runtime_error",
-                    error.to_string(),
-                    true,
-                ),
-            }
-        }
+        None => api_error(
+            StatusCode::CONFLICT,
+            "legacy_execution_removed",
+            "this historical run cannot resume; create a new operator run",
+            false,
+        ),
     }
 }
 
@@ -2568,32 +2470,6 @@ async fn cancel_run(State(state): State<AppState>, Path(run_id): Path<String>) -
     };
     if let Some(response) = tools_pipeline::cancel(&state, run_id).await {
         return response;
-    }
-
-    match state.runtime.cancel_durable(run_id).await {
-        Ok(true) => {
-            return (
-                StatusCode::ACCEPTED,
-                Json(CancelRunResponse {
-                    run_id,
-                    status: "cancellation_requested",
-                }),
-            )
-                .into_response();
-        }
-        Ok(false) => {}
-        Err(error) => return map_runtime_error(error),
-    }
-
-    if state.runtime.cancel(run_id) {
-        return (
-            StatusCode::ACCEPTED,
-            Json(CancelRunResponse {
-                run_id,
-                status: "cancellation_requested",
-            }),
-        )
-            .into_response();
     }
 
     match state.runtime.get_run(run_id).await {
@@ -3027,9 +2903,7 @@ mod tests {
         ClaimDeliveries, ClaimTimers, CompleteDelivery, EventComponentDescriptor, PublishResult,
         RetryDelivery, ScheduleOnce, Subscription, Timer, TimerId,
     };
-    use agent_core::harness::{
-        AgentEvent, MachineOutput, MachineResumeRequest, MachineStartRequest, StepOutcome,
-    };
+    use agent_core::harness::AgentEvent;
     use agent_core::tool::ToolRiskLevel;
     use agent_extension::store::{InMemoryMemoryStore, InMemoryRunStore};
     use futures_util::stream as futures_stream;
@@ -3178,7 +3052,7 @@ api_key = "test-key"
             Arc::clone(&hook),
             Arc::clone(&blobs),
         )
-        .expect("native Agent loop should compose for tests");
+        .expect("operator Agent loop should compose for tests");
         let compressor: Arc<dyn ContextCompressor> =
             Arc::new(SlidingWindowCompressor::new(Arc::clone(&estimator)));
         let artifacts: Arc<dyn ContextArtifactStore> =
@@ -3193,7 +3067,6 @@ api_key = "test-key"
             "target/nonexistent-test-skills",
             "test-skills",
         ));
-        let approval_cleanup = approvals.clone();
         let events = Arc::new(EventRuntime::new(
             Arc::new(UnavailableEventStore),
             Arc::new(ServerDeliveryRouter {
@@ -3204,10 +3077,10 @@ api_key = "test-key"
             EventRuntimeConfig::default(),
         ));
         let skills = Arc::new(SkillOrchestrator::new(skill_store));
-        let admission = Arc::new(agent_harness::context_operator::AdmissionFacade::new(
+        let admission = Arc::new(agent_core::agent::context_operator::AdmissionFacade::new(
             Arc::new(agent_extension::operator_fabric::MemoryFabric::default()),
             Arc::clone(&blobs),
-            Arc::new(agent_harness::context_operator::AgentContextPreparer {
+            Arc::new(agent_core::agent::context_operator::AgentContextPreparer {
                 context,
                 skills: Arc::clone(&skills),
             }),
@@ -3215,17 +3088,18 @@ api_key = "test-key"
         if tokio::runtime::Handle::try_current().is_ok() {
             admission.start_worker();
         }
+        let tools_pipeline = Arc::new(tools_pipeline::ServerAgentRuntime::new(
+            agent_core::agent::AgentResources::new(admission.fabric())
+                .model("primary", "server-v1", agent.model_port())
+                .toolset("workspace", "server-v1", agent.tool_port()),
+            store.clone(),
+        ));
         AppState {
             pipeline: None,
-            pipeline_profile: tools_pipeline::EngineProfile::Legacy,
-            rollout: Default::default(),
-            tools_pipeline: None,
+            pipeline_profile: tools_pipeline::EngineProfile::Tools,
+            tools_pipeline: Some(tools_pipeline),
             admission,
-            runtime: RunRuntime::new(
-                Harness::new(ObservedMachine::new(agent, hook)),
-                store,
-                move |run_id| approval_cleanup.remove_run(run_id),
-            ),
+            runtime: RunRepository::new(agent.metadata(), store),
             config: Arc::clone(&config),
             approvals,
             events,
@@ -3555,7 +3429,7 @@ api_key = "test-key"
     }
 
     #[tokio::test]
-    async fn web_backend_drives_responses_through_the_core_reducer() {
+    async fn web_backend_drives_responses_through_the_static_graph() {
         use std::convert::Infallible;
 
         use axum::{
@@ -3639,59 +3513,37 @@ api_key = "test-key"
         )
         .expect("agent should compose");
         let run_id = RunId::new();
-        let start = MachineStartRequest {
-            run_id,
-            input: "hello".into(),
-            attachments: Vec::new(),
-            prior_messages: Vec::new(),
-            allowed_tools: Some(Vec::new()),
-            allow_run_adf: false,
-            max_steps: Some(2),
-            context_fingerprint: Some("test-context".into()),
-            activated_at_ms: 1,
-            cancellation: agent_core::harness::RunCancellation::new(),
-        };
-        let checkpoint = agent_core::harness::AgentMachine::initial_checkpoint(&agent, &start)
-            .expect("reducer checkpoint should be created");
-        assert_eq!(checkpoint.agent_kind, "agent-loop");
-        assert_eq!(
-            checkpoint.schema_version,
-            AGENT_LOOP_CHECKPOINT_SCHEMA_VERSION
-        );
-        assert_eq!(
-            checkpoint.payload["protocol_version"],
-            AGENT_LOOP_REDUCER_PROTOCOL_VERSION
-        );
-
-        let outputs: Vec<_> = agent_core::harness::AgentMachine::resume(
+        let outputs: Vec<_> = agent_core::harness::Agent::run(
             &agent,
-            MachineResumeRequest {
+            agent_core::harness::RunRequest {
                 run_id,
-                activation_id: agent_core::harness::ActivationId::new(),
-                checkpoint,
-                inbox: Vec::new(),
-                activated_at_ms: 1,
-                cancellation: start.cancellation,
+                input: "hello".into(),
+                attachments: vec![],
+                prior_messages: vec![],
+                allowed_tools: Some(vec![]),
+                allow_run_adf: false,
+                max_steps: Some(2),
+                cancellation: agent_core::harness::RunCancellation::new(),
             },
         )
         .collect()
         .await;
-        let deltas = outputs
+        let output: String = outputs
             .iter()
-            .filter_map(|output| match output {
-                MachineOutput::Event(AgentEvent::OutputDelta {
+            .filter_map(|event| match event {
+                AgentEvent::OutputDelta {
                     channel: agent_core::harness::OutputChannel::AssistantText,
                     delta,
-                }) => Some(delta.as_str()),
+                } => Some(delta.as_str()),
                 _ => None,
             })
-            .collect::<Vec<_>>();
-        assert_eq!(deltas, vec!["hel", "lo"]);
+            .collect();
+        assert_eq!(output, "hello");
         assert!(matches!(
             outputs.last(),
-            Some(MachineOutput::Yield(StepOutcome::Complete {
+            Some(AgentEvent::Completed {
                 finish_reason: FinishReason::Stop
-            }))
+            })
         ));
         provider_server.abort();
     }

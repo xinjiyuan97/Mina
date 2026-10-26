@@ -3,11 +3,10 @@ use agent_extension::operator_fabric::MemoryFabric;
 use serde_json::json;
 
 #[tokio::test]
-#[cfg(feature = "pipeline")]
 async fn p5_artifact_reader_preserves_legacy_and_rejects_future_before_decode() {
     use agent_core::harness::{BlobStore, PutBlob};
     let store = std::sync::Arc::new(MemoryFabric::default());
-    let blobs = agent_extension::pipeline::FabricBlobStore(store.clone());
+    let blobs = agent_core::agent::artifacts::FabricBlobStore(store.clone());
     let metadata = blobs
         .put(PutBlob {
             media_type: "text/plain".into(),
@@ -74,44 +73,10 @@ async fn p5_artifact_reader_preserves_legacy_and_rejects_future_before_decode() 
 }
 
 #[tokio::test]
-#[cfg(all(feature = "sqlite", feature = "pipeline"))]
-async fn p5_text_ledger_unknown_versions_fail_closed_before_decode() {
-    use agent_core::{
-        harness::RunId,
-        pipeline::{PipelineError, PipelineStore},
-    };
-    let directory = tempfile::tempdir().expect("temp");
-    let path = directory.path().join("text.db");
-    let store = agent_extension::pipeline::SqlitePipelineStore::open(&path).expect("open");
-    let connection = rusqlite::Connection::open(&path).expect("connection");
-    let run_id = RunId::new();
-    let encoded = json!({"schema_version":999,"reducer":"future format"}).to_string();
-    connection
-        .execute(
-            "INSERT INTO operator_runs_v1(run_id,generation,record_json) VALUES (?1,0,?2)",
-            [run_id.to_string(), encoded.clone()],
-        )
-        .expect("future record");
-    assert_eq!(
-        store.load(run_id).await,
-        Err(PipelineError::Storage(
-            "unsupported_pipeline_version".into()
-        ))
-    );
-    let saved: String = connection
-        .query_row("SELECT record_json FROM operator_runs_v1", [], |row| {
-            row.get(0)
-        })
-        .expect("saved");
-    assert_eq!(saved, encoded);
-}
-
-#[tokio::test]
-#[cfg(feature = "pipeline")]
 async fn p5_artifact_size_is_rejected_before_any_chunk_is_saved() {
     use agent_core::harness::{BlobStore, PutBlob};
     let store = std::sync::Arc::new(MemoryFabric::default());
-    let blobs = agent_extension::pipeline::FabricBlobStore(store.clone());
+    let blobs = agent_core::agent::artifacts::FabricBlobStore(store.clone());
     assert!(
         blobs
             .put(PutBlob {
@@ -183,7 +148,11 @@ async fn p5_unknown_ledger_version_is_quarantined_without_rewrite() {
         )
         .expect("state");
     assert_eq!(unchanged, encoded);
-    let mut historical: serde_json::Value = serde_json::from_str(&original).expect("JSON");
+    let mut legacy = agent_extension::operator_fabric::FabricState::default();
+    legacy
+        .apply(FabricCommand::Publish(event(1)))
+        .expect("legacy event");
+    let mut historical = serde_json::to_value(legacy).expect("JSON");
     historical
         .as_object_mut()
         .expect("object")
@@ -1221,7 +1190,7 @@ async fn sqlite_sql_write_before_commit_failure_rolls_back_everything() {
     let injector = rusqlite::Connection::open(&path).expect("independent connection");
     injector.execute_batch("CREATE TABLE fault_parent (id INTEGER PRIMARY KEY);
         CREATE TABLE fault_child (parent INTEGER REFERENCES fault_parent(id) DEFERRABLE INITIALLY DEFERRED);
-        CREATE TRIGGER fault_before_commit AFTER UPDATE ON workflow_operator_fabric_v1
+        CREATE TRIGGER fault_before_commit AFTER UPDATE ON workflow_fabric_records
         BEGIN INSERT INTO fault_child(parent) VALUES(1); END;").expect("inject real deferred commit failure");
     assert!(matches!(
         store
@@ -1324,5 +1293,237 @@ async fn sqlite_dlq_survives_reopen() {
     assert_eq!(offset(&store).await, 1);
     assert!(
         matches!(store.execute(FabricCommand::DeadLetters { after: 0, limit: 1 }).await.expect("durable dlq"), FabricReply::DeadLetters(items) if items.len() == 1 && items[0].error == "permanent")
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_migrates_legacy_logs_and_only_writes_changed_records() {
+    use agent_extension::store::SqliteEventStore;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("incremental.db");
+    let store = SqliteEventStore::open(&path, "incremental").await.unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let mut legacy = agent_extension::operator_fabric::FabricState::default();
+    legacy
+        .apply(FabricCommand::TransactLog {
+            log: "history".into(),
+            expected: 0,
+            items: vec![json!("first"), json!("second")],
+            checkpoints: vec![CheckpointWrite {
+                key: "untouched".into(),
+                expected: None,
+                value: json!("large old state"),
+            }],
+            outbox: vec![],
+            delivery: None,
+        })
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO workflow_operator_fabric_v1 VALUES(1,?1)",
+            [serde_json::to_string(&legacy).unwrap()],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .execute(FabricCommand::ReadLog {
+                log: "history".into(),
+                after: 1,
+                limit: 1
+            })
+            .await
+            .unwrap(),
+        FabricReply::Log(Some(LogPage {
+            through: 2,
+            items: vec![json!("second")]
+        }))
+    );
+    // Any rewrite of an existing event or unrelated checkpoint would fail the test.
+    connection.execute_batch("CREATE TRIGGER no_history_rewrite BEFORE UPDATE ON workflow_fabric_records WHEN OLD.section='logs' OR (OLD.section='checkpoints' AND OLD.identity='untouched') BEGIN SELECT RAISE(ABORT,'rewrote immutable history'); END;").unwrap();
+    let append = |expected| FabricCommand::TransactLog {
+        log: "history".into(),
+        expected,
+        items: vec![json!("third")],
+        checkpoints: vec![CheckpointWrite {
+            key: "new".into(),
+            expected: None,
+            value: json!("new state"),
+        }],
+        outbox: vec![],
+        delivery: None,
+    };
+    assert_eq!(store.execute(append(1)).await, Err(FabricError::Fenced));
+    assert_eq!(
+        store
+            .execute(FabricCommand::ReadCheckpoint("new".into()))
+            .await
+            .unwrap(),
+        FabricReply::Checkpoint(None)
+    );
+    connection.execute_batch("CREATE TRIGGER fail_append BEFORE INSERT ON workflow_fabric_records WHEN NEW.section='logs' BEGIN SELECT RAISE(ABORT,'injected append failure'); END;").unwrap();
+    assert!(matches!(
+        store.execute(append(2)).await,
+        Err(FabricError::Storage(_))
+    ));
+    assert_eq!(
+        store
+            .execute(FabricCommand::ReadCheckpoint("new".into()))
+            .await
+            .unwrap(),
+        FabricReply::Checkpoint(None)
+    );
+    assert_eq!(
+        store
+            .execute(FabricCommand::ReadLog {
+                log: "history".into(),
+                after: 2,
+                limit: 1
+            })
+            .await
+            .unwrap(),
+        FabricReply::Log(Some(LogPage {
+            through: 2,
+            items: vec![]
+        }))
+    );
+    connection
+        .execute_batch("DROP TRIGGER fail_append;")
+        .unwrap();
+    store.execute(append(2)).await.unwrap();
+    drop(store);
+    let store = SqliteEventStore::open(&path, "incremental").await.unwrap();
+    assert_eq!(
+        store
+            .execute(FabricCommand::ReadLog {
+                log: "history".into(),
+                after: 2,
+                limit: 1
+            })
+            .await
+            .unwrap(),
+        FabricReply::Log(Some(LogPage {
+            through: 3,
+            items: vec![json!("third")]
+        }))
+    );
+    let FabricReply::Checkpoint(Some(saved)) = store
+        .execute(FabricCommand::ReadCheckpoint("untouched".into()))
+        .await
+        .unwrap()
+    else {
+        panic!("legacy checkpoint");
+    };
+    assert_eq!(saved.value, json!("large old state"));
+    // Unrelated malformed payload must not be decoded by checkpoint reads or log paging.
+    connection.execute("UPDATE workflow_fabric_records SET value_json='invalid' WHERE section='checkpoints' AND identity='new'", []).unwrap();
+    assert!(
+        store
+            .execute(FabricCommand::ReadCheckpoint("untouched".into()))
+            .await
+            .is_ok()
+    );
+    assert!(
+        store
+            .execute(FabricCommand::ReadLog {
+                log: "history".into(),
+                after: 0,
+                limit: 1
+            })
+            .await
+            .is_ok()
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_scheduling_does_not_decode_unrelated_coordination_records() {
+    use agent_extension::store::SqliteEventStore;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("scoped.db");
+    let store = SqliteEventStore::open(&path, "scoped").await.unwrap();
+    // Establish the relational schema before inserting valid JSON with unrelated unsupported payloads.
+    store
+        .execute(FabricCommand::ReadCheckpoint("initialize".into()))
+        .await
+        .unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    for (section, value) in [
+        (
+            "events",
+            json!({"visible":true,"event":{"topic":"unrelated","envelope":{"tenant_id":"other","run_id":"other","event_id":"other","schema_version":999}}}),
+        ),
+        (
+            "subscriptions",
+            json!({"spec":{"consumer":"unrelated","subscription":"unrelated"},"due_at_ms":0,"epoch":"unsupported"}),
+        ),
+        (
+            "receipts",
+            json!({"key":{"consumer":"unrelated","event_id":"other"},"result":"unsupported"}),
+        ),
+        ("dead_letters", json!({"future_format":"unsupported"})),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO workflow_fabric_records VALUES(?1,'',0,?2)",
+                rusqlite::params![section, value.to_string()],
+            )
+            .unwrap();
+    }
+    subscribe(&store).await;
+    store
+        .execute(FabricCommand::Publish(event(1)))
+        .await
+        .unwrap();
+    let FabricReply::Claimed(mut claims) = store
+        .execute(FabricCommand::ClaimForConsumer {
+            consumer: "consumer".into(),
+            worker: "scoped".into(),
+            now_ms: 0,
+            lease_ms: 100,
+            limit: 1,
+            max_attempts: 3,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("claims");
+    };
+    assert_eq!(claims.len(), 1);
+    let delivery = claims.remove(0);
+    store
+        .execute(commit(delivery.lease, 1, vec![event(2)]))
+        .await
+        .unwrap();
+    store
+        .execute(FabricCommand::DispatchOutbox { limit: 1 })
+        .await
+        .unwrap();
+    assert_eq!(offset(&store).await, 1);
+    assert_eq!(replay(&store).await.len(), 2);
+    assert_eq!(
+        store
+            .execute(FabricCommand::ReadEvent(event(2).envelope.event_id))
+            .await
+            .unwrap(),
+        FabricReply::Event(Some(event(2)))
+    );
+    store
+        .execute(FabricCommand::Transact {
+            checkpoint: CheckpointWrite {
+                key: "isolated".into(),
+                expected: None,
+                value: json!({"ok":true}),
+            },
+            outbox: vec![],
+            delivery: None,
+        })
+        .await
+        .unwrap();
+    // Verify the consumer lookup really uses the index, rather than decoding every subscription.
+    let plan: String = connection.query_row("EXPLAIN QUERY PLAN SELECT value_json FROM workflow_fabric_records WHERE section='subscriptions' AND json_extract(value_json,'$.spec.consumer')='consumer' AND json_extract(value_json,'$.spec.subscription')='sub'", [], |r| r.get(3)).unwrap();
+    assert!(
+        plan.contains("workflow_fabric_subscription_lookup"),
+        "{plan}"
     );
 }

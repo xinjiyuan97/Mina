@@ -1,8 +1,8 @@
+use agent_core::agent::context_operator::*;
 use agent_core::{
     context::*, context_operator::*, harness::RunId, operator_fabric::*, skill::SkillLock,
 };
 use agent_extension::store::{FilesystemBlobStore, SqliteEventStore};
-use agent_harness::context_operator::*;
 use std::{
     sync::{
         Arc,
@@ -174,7 +174,7 @@ async fn p6_pending_context_reopen_preserves_order_and_conflicts() {
         .await
         .expect("outcome");
     assert_eq!(
-        legacy_plan(saved, prepared).attachments,
+        prepared_plan(saved, prepared).attachments,
         request.attachments
     );
 }
@@ -387,7 +387,7 @@ async fn p2_timeout_does_not_remove_durable_request() {
 
 #[tokio::test]
 async fn p2_receipt_outbox_reopen_and_duplicate_delivery_commit_once() {
-    use agent_harness::operator_fabric::FabricHandler;
+    use agent_core::agent::operator_fabric::FabricHandler;
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("events.sqlite");
     let blobs = Arc::new(FilesystemBlobStore::new(directory.path().join("blobs")));
@@ -609,7 +609,7 @@ async fn p2_context_matches_legacy_input_fingerprint_skill_lock_and_memory() {
     assert_eq!(prepared.pack, legacy);
     assert_eq!(prepared.skill_lock, skill_lock);
     assert_eq!(prepared.request_digest, request_digest);
-    let plan = legacy_plan(request, prepared);
+    let plan = prepared_plan(request, prepared);
     assert_eq!(plan.prior_messages, legacy.messages);
     assert_eq!(plan.allowed_tools, Some(legacy.effective_tools));
     assert_eq!(plan.context_fingerprint, Some(legacy.fingerprint));
@@ -727,7 +727,7 @@ async fn p6_claimed_uncommitted_context_reopens_and_reclaims_expired_lease() {
 }
 
 async fn claimed_context_reopen(request: ContextRequest) {
-    use agent_harness::operator_fabric::FabricHandler;
+    use agent_core::agent::operator_fabric::FabricHandler;
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("events.sqlite");
     let blobs = Arc::new(FilesystemBlobStore::new(directory.path().join("blobs")));

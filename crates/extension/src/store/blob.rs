@@ -1,4 +1,8 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+mod retention;
+pub use retention::BlobCollectionReport;
 
 use agent_core::harness::{
     BlobId, BlobMetadata, BlobObject, BlobStore, BlobStoreError, BlobStoreFuture, PutBlob,
@@ -11,12 +15,16 @@ use agent_core::harness::{
 #[derive(Debug, Clone)]
 pub struct FilesystemBlobStore {
     root: PathBuf,
+    maintenance: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl FilesystemBlobStore {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            maintenance: Arc::new(tokio::sync::RwLock::new(())),
+        }
     }
 
     #[must_use]
@@ -36,6 +44,7 @@ impl FilesystemBlobStore {
 impl BlobStore for FilesystemBlobStore {
     fn put(&self, command: PutBlob) -> BlobStoreFuture<'_, BlobMetadata> {
         Box::pin(async move {
+            let _guard = self.maintenance.read().await;
             let blob_id = BlobId::new();
             let metadata = BlobMetadata {
                 blob_id,
@@ -79,6 +88,7 @@ impl BlobStore for FilesystemBlobStore {
 
     fn get(&self, blob_id: BlobId) -> BlobStoreFuture<'_, Option<BlobObject>> {
         Box::pin(async move {
+            let _guard = self.maintenance.read().await;
             let metadata = match tokio::fs::read(self.metadata_path(blob_id)).await {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

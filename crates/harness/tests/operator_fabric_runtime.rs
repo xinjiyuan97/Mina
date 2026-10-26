@@ -1,6 +1,6 @@
+use agent_core::agent::operator_fabric::*;
 use agent_core::{event_runtime::EventId, operator_fabric::*};
 use agent_extension::operator_fabric::MemoryFabric;
-use agent_harness::operator_fabric::*;
 use serde_json::json;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 

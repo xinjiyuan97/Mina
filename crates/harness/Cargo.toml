@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Host runtime, durable orchestration and portable script execution for agents"
+description = "Multi-agent event orchestration and host adapters"
 
 [features]
 default = []
@@ -13,8 +13,11 @@ quickjs = ["dep:rquickjs"]
 full = ["quickjs"]
 
 [dependencies]
+tokio-util.workspace = true
+uuid.workspace = true
+rusqlite.workspace = true
 agent-core.workspace = true
-agent-extension = { workspace = true, features = ["pipeline"] }
+agent-extension.workspace = true
 async-stream.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
@@ -40,10 +43,6 @@ required-features = ["quickjs"]
 
 [[test]]
 name = "javascript_agent_loop"
-required-features = ["quickjs"]
-
-[[test]]
-name = "async_job_agent_loop"
 required-features = ["quickjs"]
 
 [[test]]

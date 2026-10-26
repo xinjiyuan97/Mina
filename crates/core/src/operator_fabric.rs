@@ -136,6 +136,47 @@ pub struct DeadLetter {
 
 #[derive(Debug, Clone)]
 pub enum FabricCommand {
+    /// Maintenance operation: retire terminal, quiescent run resources after retention.
+    RetireRun {
+        tenant: String,
+        run_id: crate::harness::RunId,
+        now_ms: i64,
+        retention_ms: i64,
+        dry_run: bool,
+    },
+    /// Mark/sweep embedded FabricBlobStore artifacts. The host must supply external roots
+    /// and quiesce all uploads/root changes until collection finishes.
+    CollectArtifacts {
+        now_ms: i64,
+        grace_ms: i64,
+        external_roots: Vec<crate::harness::BlobId>,
+        dry_run: bool,
+    },
+    /// Root inventory for external BlobStore maintenance under the host's maintenance barrier.
+    ArtifactRoots,
+
+    /// Append immutable values and commit checkpoints/outbox in one transaction.
+    TransactLog {
+        log: String,
+        expected: u64,
+        items: Vec<Value>,
+        checkpoints: Vec<CheckpointWrite>,
+        outbox: Vec<FabricEvent>,
+        delivery: Option<(DeliveryLease, i64)>,
+    },
+    GuardedTransactLog {
+        lease: DeliveryLease,
+        now_ms: i64,
+        log: String,
+        expected: u64,
+        items: Vec<Value>,
+        checkpoints: Vec<CheckpointWrite>,
+    },
+    ReadLog {
+        log: String,
+        after: u64,
+        limit: usize,
+    },
     InspectRetention {
         now_ms: i64,
         grace_ms: i64,
@@ -155,6 +196,14 @@ pub enum FabricCommand {
         lease: DeliveryLease,
         now_ms: i64,
         checkpoint: CheckpointWrite,
+        outbox: Vec<FabricEvent>,
+    },
+    /// Atomically write multiple records while retaining an active delivery.
+    /// Unlike TransactMany with `delivery`, this does not acknowledge the lease.
+    GuardedTransactMany {
+        lease: DeliveryLease,
+        now_ms: i64,
+        checkpoints: Vec<CheckpointWrite>,
         outbox: Vec<FabricEvent>,
     },
     ReadCheckpoint(String),
@@ -223,6 +272,10 @@ pub enum FabricCommand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FabricReply {
+    Collected(CollectionReport),
+    ArtifactRoots(Vec<crate::harness::BlobId>),
+    /// None means no log exists (for compatibility with inline legacy history).
+    Log(Option<LogPage>),
     Retention(RetentionInventory),
     Checkpoint(Option<FabricCheckpoint>),
     Event(Option<FabricEvent>),
@@ -232,7 +285,9 @@ pub enum FabricReply {
     Offset(u64),
     Claimed(Vec<ClaimedDelivery>),
     Committed(Receipt),
-    Retried { dead_lettered: bool },
+    Retried {
+        dead_lettered: bool,
+    },
     Receipt(Option<Receipt>),
     Dispatched(usize),
     DeadLetters(Vec<DeadLetter>),
@@ -251,7 +306,30 @@ pub struct RetentionInventory {
     pub orphan_candidates: Vec<crate::harness::BlobId>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionReport {
+    pub checkpoints: usize,
+    pub logs: usize,
+    pub subscriptions: usize,
+    pub receipts: usize,
+    pub dead_letters: usize,
+    pub event_payloads: usize,
+    pub artifacts: usize,
+    pub artifact_bytes: u64,
+    /// Legacy orphan uploads first observed by this pass (not deleted yet).
+    #[serde(default)]
+    pub quarantined_artifacts: usize,
+    pub dry_run: bool,
+}
+
 pub trait OperatorFabric: Send + Sync {
     fn capabilities(&self) -> FabricCapabilities;
     fn execute(&self, command: FabricCommand) -> FabricFuture<'_>;
+}
+
+/// The high watermark and a bounded page after the requested offset.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogPage {
+    pub through: u64,
+    pub items: Vec<Value>,
 }

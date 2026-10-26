@@ -113,7 +113,7 @@ impl ApprovalResolution {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub approval_id: ApprovalId,
     pub run_id: RunId,

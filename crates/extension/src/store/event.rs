@@ -2056,6 +2056,27 @@ fn migrate(connection: &Connection) -> Result<(), EventError> {
     connection
         .execute_batch(
             "BEGIN IMMEDIATE;
+         CREATE TABLE IF NOT EXISTS workflow_fabric_records (
+             section TEXT NOT NULL,
+             identity TEXT NOT NULL,
+             position INTEGER NOT NULL,
+             value_json TEXT NOT NULL,
+             PRIMARY KEY(section, identity, position)
+         );
+         CREATE INDEX IF NOT EXISTS workflow_fabric_subscription_lookup
+             ON workflow_fabric_records(json_extract(value_json,'$.spec.consumer'),json_extract(value_json,'$.spec.subscription')) WHERE section='subscriptions';
+         CREATE INDEX IF NOT EXISTS workflow_fabric_subscription_due
+             ON workflow_fabric_records(json_extract(value_json,'$.due_at_ms'),position) WHERE section='subscriptions';
+         CREATE INDEX IF NOT EXISTS workflow_fabric_event_topic
+             ON workflow_fabric_records(json_extract(value_json,'$.event.topic'),position) WHERE section='events';
+         CREATE INDEX IF NOT EXISTS workflow_fabric_event_barrier
+             ON workflow_fabric_records(json_extract(value_json,'$.visible'),position) WHERE section='events';
+         CREATE INDEX IF NOT EXISTS workflow_fabric_receipt_lookup
+             ON workflow_fabric_records(json_extract(value_json,'$.key.consumer'),json_extract(value_json,'$.key.event_id')) WHERE section='receipts';
+         CREATE INDEX IF NOT EXISTS workflow_fabric_event_partition
+             ON workflow_fabric_records(json_extract(value_json,'$.event.envelope.tenant_id'),json_extract(value_json,'$.event.envelope.run_id'),position) WHERE section='events';
+         CREATE INDEX IF NOT EXISTS workflow_fabric_event_id
+             ON workflow_fabric_records(json_extract(value_json,'$.event.envelope.event_id')) WHERE section='events';
          CREATE TABLE IF NOT EXISTS workflow_operator_fabric_v1 (
              singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
              state_json TEXT NOT NULL

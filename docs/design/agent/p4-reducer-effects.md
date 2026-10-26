@@ -1,5 +1,7 @@
 # P4 Harness reducer effects
 
+> 历史设计说明：本文涉及的固定流水线已移除。当前实现、持久化事件与恢复 API 以[静态图指南](static-agent-graph.md)和[单 Agent API](operator-only-api.md)为准。
+
 日期：2026-10-23。仍以原始迁移设计为权威；本文记录实际实现，不改变验收范围。
 
 ## 已接通的链

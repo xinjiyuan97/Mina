@@ -1,5 +1,7 @@
 # Mina 架构与边界划分
 
+> 当前分支的运行时分层已更新：单 Agent 引擎集中在 Core，多 Agent 编排在 Harness，Legacy 执行器已移除。新 API 与迁移边界见 [Operator-only API](design/agent/operator-only-api.md)。下文保留原设计背景。
+
 > 状态：初始架构建议。本文定义模块职责、依赖方向和推荐的 Rust workspace 结构；消息细节见 [Gateway–Agent 协议](./02-gateway-agent-protocol.md)，上游连接细节见 [Gateway–上游协议](./03-gateway-upstream-protocol.md)。
 
 当前仓库没有一次性创建下述所有 crate，而是先按同样的依赖方向落地最小纵向切片。已实现结构见 [单次任务运行时](./04-single-task-runtime.md)。

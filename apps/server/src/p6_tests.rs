@@ -201,24 +201,15 @@ async fn p6_operator_image_attachment_only_and_order_reach_model() {
 
 #[tokio::test]
 async fn p6_text_profile_preserves_attachments() {
-    let directory = tempfile::tempdir().expect("temp");
     let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
     let mut state = tests::test_state();
     state.pipeline_profile = crate::tools_pipeline::EngineProfile::Text;
-    state.pipeline = Some(Arc::new(
-        agent_harness::pipeline::PipelineRuntime::new(
-            Arc::new(
-                agent_extension::pipeline::SqlitePipelineStore::open(
-                    directory.path().join("pipeline.db"),
-                )
-                .expect("ledger"),
-            ),
-            state.runtime.run_store(),
-            state.blobs.clone(),
-            Arc::new(Capture(sender)),
-        )
-        .with_fabric(state.admission.fabric()),
-    ));
+    state.pipeline = Some(Arc::new(crate::tools_pipeline::ServerAgentRuntime::new(
+        agent_core::agent::AgentResources::new(state.admission.fabric())
+            .model("primary", "server-v1", Arc::new(Capture(sender)))
+            .toolset("workspace", "server-v1", Arc::new(ToolRegistry::new())),
+        state.runtime.run_store(),
+    )));
     let attachments = vec![attachment(&state, "image/png", "image.png").await];
     let prepared = prepare_run_plan(
         &state,

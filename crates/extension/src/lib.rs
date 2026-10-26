@@ -13,8 +13,6 @@ pub mod context;
 pub mod adf;
 
 pub mod operator_fabric;
-#[cfg(feature = "pipeline")]
-pub mod pipeline;
 pub mod provider;
 
 #[cfg(feature = "workspace")]

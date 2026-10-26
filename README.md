@@ -1,183 +1,118 @@
 # Mina
 
-Mina 是一个用于持续迭代 Agent Harness 的 Rust + Next.js monorepo。当前采用模块化单体：`agent-core` 保存稳定契约与 Agent 决策逻辑，`agent-extension` 保存外部实现，`agent-harness` 组合 Core 与 Extension 并负责宿主运行、耐久编排和可选 QuickJS。
+Mina 是一个 Rust Agent 框架，使用静态事件订阅图组织单 Agent 的执行。模型、上下文、工具策略、工具执行与等待各自作为节点，通过发布和订阅事件协作。图可以从 YAML/JSON 加载，也可以通过 Rust API 构建，两种入口共用校验和执行引擎。
 
-## 目录
+单 Agent 引擎位于 `agent-core`，模型、工具和存储适配位于 `agent-extension`，多 Agent 的独立总线与编排位于 `agent-harness::multi`。Server、CLI 和 HTTP demo 已接入静态图；旧原生执行路径和固定流水线已移除。
 
-```text
-mina/
-├── apps/
-│   ├── web/                  # Next.js 前端
-│   ├── server/               # Rust/Axum 后端
-│   └── agent-cli/            # 可直接运行的 Agent CLI
-├── crates/
-│   ├── core/                 # agent-core：AgentLoop、稳定契约、Context/Memory/Skill
-│   ├── harness/              # agent-harness：Run runtime、Event/Job/Flow、QuickJS/ADF
-│   └── extension/            # agent-extension：Provider/Tool/Sandbox/Store/Tracing/ADF adapters
-│   └── multi/                # agent-multi：Sub-Pub 与多 Agent Pattern
-├── contracts/tool/v1/       # C ABI 头文件与 JSON Schema
-└── docs/                     # 架构与协议设计
+## 文档入口
+
+| 需要做什么 | 文档 |
+| --- | --- |
+| 编写 YAML/JSON 图，或用 Rust 构建图 | [静态 Agent 图编写指南](docs/design/agent/static-agent-graph.md) |
+| 实现并注册自定义节点 | [自定义 Graph 节点](docs/design/agent/custom-graph-nodes.md) |
+| 查节点能力、配置字段、输入输出事件 | [Graph 节点参考](docs/design/agent/graph-nodes.md) |
+| 选择底层总线或高层 Agent API | [API 与分层](docs/design/agent/operator-only-api.md) |
+| 接入宿主资源与配置构建器 | [配置图接入说明](docs/design/agent/configured-operator-graph.md) |
+| 运行 HTTP 对话和图片生成示例 | [agent-chat Demo](docs/14-agent-chat-demo.md) |
+
+可直接参考 [纯文本图](config/agents/text.yaml) 和 [工具调用图](config/agents/tools.yaml)。图文件声明节点和订阅关系；Provider 客户端、工具实现、数据库连接与密钥由宿主注入。
+
+## 图如何运行
+
+```mermaid
+flowchart LR
+    Input[输入] --> Context[Context]
+    Context --> Model[Model]
+    Model -->|stop.completed| Done[完成]
+    Model -->|stop.tool_calls| Gate[Gate]
+    Gate -->|dispatch| Policy[ToolPolicy]
+    Policy -->|authorized| Tools[Tools]
+    Policy -->|拒绝或失败结果| Gate
+    Tools -->|result| Gate
+    Tools -->|wait.requested| Wait[Wait：可选]
+    Wait -->|唤醒结果| Gate
+    Gate -->|completed| Context
 ```
 
-## 本地运行
+图在一次 Run 中保持不变，但可以包含循环、分支和多个节点实例。模型直接发布 `stop.*` 事件；Gate 负责通用批次分发和结果汇总。静态图支持审批、外部等待、受限并行工具调用、checkpoint 和恢复。`max_steps` 限制模型轮次，耗尽后失败，不额外调用模型总结。
 
-要求：Node.js 22+、pnpm 10+、Rust 1.92+。
+Core 提供两层接入方式：
+
+- 底层：`OperatorBus` 提供算子与事件订阅、事件发送和投递推进；`GraphEngine` 执行图与提交状态。
+- 高层：`GraphAgent` 提供对话流；`GraphHost` 提供公开事件日志与投影；`AgentEngine` 提供后台运行、审批、取消、分页事件读取和恢复。
+
+持久化能力由注入的存储决定。MemoryFabric 只在进程内保存状态；跨进程恢复需要持久化 Fabric 和匹配的资源 revision。恢复不会盲目重放中断的模型调用或非幂等外部副作用。
+
+## 快速运行 HTTP demo
+
+要求 Rust 1.92+。在仓库根目录执行：
+
+```bash
+cp config/agent-chat-demo.example.toml config/agent-chat-demo.toml
+# 编辑配置中的对话模型、生图模型及各自服务地址
+export OPENAI_API_KEY='your-api-key'
+cargo run -p mina-server --example agent_chat_demo -- config/agent-chat-demo.toml
+```
+
+默认监听 `127.0.0.1:8081`。示例配置读取 [demo.yaml](config/agents/demo.yaml)，由 YAML 定义节点、订阅和策略，通过 `[workspace]` 注册目录、读写、搜索及终端工具，并通过 `[image_generation]` 注册生图工具。仅测试文件和终端时可删除生图配置，无需图片服务。若只需要纯文本对话，删除 workspace、生图及其 provider 配置，并将 `graph` 改为 `config/agents/text.yaml`。已有本地配置不会自动启用生图。
+
+workspace 默认示例目录为 `data/agent-chat-demo-workspace`。启用后 demo 直接执行工具，没有人工审批；终端运行宿主进程，不提供系统级隔离。
+
+```bash
+curl -N http://127.0.0.1:8081/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"protocol":"agent-chat/1","conversationId":"demo","turnId":"turn-1","runId":"run-1","input":[{"type":"message","inputId":"input-1","parts":[{"type":"text","text":"你好"}]}]}'
+```
+
+Demo 使用内存图状态，没有鉴权或跨进程恢复，适合本地集成。生图结果保存为 PNG，通过 `/images/{id}` 读取；前端代理也需要转发该路径。详见 [Demo 使用说明](docs/14-agent-chat-demo.md)。
+
+## 运行完整工作台
+
+另需 Node.js 22+、pnpm 10+：
 
 ```bash
 pnpm install
-pnpm dev
+cp config/mina.example.toml config/mina.toml
+# 编辑 config/mina.toml 的模型和 Provider 配置
+MINA_CONFIG=config/mina.toml pnpm dev
 ```
-
-默认地址：
 
 - Web：<http://localhost:3000>
 - Server：<http://127.0.0.1:8787>
 - 健康检查：<http://127.0.0.1:8787/healthz>
 
-也可以分别执行 `pnpm dev:web` 和 `pnpm dev:server`。Web 开发服务器会把 `/api/*` 和 `/healthz` 转发给 Rust 后端，因此浏览器端不需要单独配置 CORS。
+Web 会将 `/api/*` 和 `/healthz` 代理到 Server。也可以分别运行 `pnpm dev:web` 和 `pnpm dev:server`。完整工作台与上述独立 demo 使用不同的 HTTP 接口和配置文件；demo 的生图配置不会自动注册到正式 Server。
 
-## 常用命令
+Server 默认使用 `data/runs.sqlite3`，可通过 `MINA_RUN_STORE_PATH` 修改。`MINA_ENGINE_PROFILE` 支持 `operator_v1_tools`（默认）和 `operator_v1_text`，两者使用同一静态图运行时。旧运行数据不自动转换为新图。
+
+## 目录与边界
+
+| 目录 | 职责 |
+| --- | --- |
+| `crates/core` | 单 Agent 图引擎、总线、节点、API 与端口契约 |
+| `crates/extension` | Provider、工具、SQLite、Blob、Workspace 和沙箱适配 |
+| `crates/harness` | 宿主流程、事件和任务集成，以及 `multi` 多 Agent 编排 |
+| `crates/multi` | 多 Agent API 的兼容导出 |
+| `apps/server` | 正式 HTTP Server 与独立 `agent_chat_demo` 示例 |
+| `apps/agent-cli` | 命令行 Agent |
+| `apps/web` | Next.js 工作台 |
+| `packages/browser-agent` | [浏览器 WASM SDK](packages/browser-agent/README.md) |
+| `apps/wasm-agent` | 浏览器 SDK 的 React demo |
+| `config/agents` | 可加载的静态图示例 |
+| `contracts/tool/v1` | [外部工具 ABI 与 JSON Schema](contracts/tool/v1/README.md) |
+
+单 Agent 的内部总线与多 Agent 的任务总线彼此独立，不共享内部 checkpoint。Core 不依赖 Harness、Extension、HTTP 客户端或数据库实现。
+
+## 验证
 
 ```bash
-pnpm check       # TypeScript、ESLint 和 Rust 检查
-pnpm test        # Rust workspace 测试
-pnpm build       # 构建 Web 和 Rust workspace
+pnpm check                                      # 前端、Rust 编译与分层检查
+cargo test --workspace --all-targets             # Rust 工作区回归
+cargo test -p mina-server --example agent_chat_demo
+cargo fmt --all -- --check
+bash scripts/check-rust-boundaries.sh
 ```
 
-如需修改后端地址，在 `apps/web` 下复制 `.env.local.example` 为 `.env.local`。后端监听地址可通过 `MINA_SERVER_ADDR` 设置。
+图测试覆盖文件/代码构建、事件协议、token 用量、审批、等待、恢复和回收。图片生成使用本地 mock 检查调用与 HTTP 文件读取，真实服务需要单独配置并验证。
 
-Run、Session、上下文 artifact、Memory、Flow checkpoint/inbox/outbox、Event/Subscription/Timer 和 Job 默认持久化到 `data/runs.sqlite3`。可通过 `MINA_RUN_STORE_PATH` 指定其他 SQLite 文件。页面断开不会结束后台 run；重新连接可使用 `GET /api/v1/runs/{run_id}/events?after_seq=<seq>` 续传，状态可通过 `GET /api/v1/runs/{run_id}` 查询。Server 重启后，已经提交 checkpoint 的 `WaitingEvent` run 会恢复；崩溃时仍在模型或同步 Tool 内执行、没有安全 checkpoint 的 activation 才会得到明确的 `run_interrupted` 终态。
-
-## 模型配置
-
-Harness 使用强类型 TOML 配置。复制示例并通过环境变量告诉后端配置位置：
-
-```bash
-cp config/mina.example.toml config/mina.toml
-# 编辑 config/mina.toml，把 api_key 替换为真实值
-MINA_CONFIG=config/mina.toml pnpm dev
-```
-
-`api_key` 直接保存在本地 TOML 配置中。`config/mina.toml` 已被 Git 忽略，配置对象的调试输出也会隐藏密钥。仍可选用 `{ env = "ENV_NAME" }` 引用环境变量。配置加载会校验默认模型、URL、模态、上下文窗口等字段，并自动把 `base_url` 规范化为以 `/` 结尾。
-
-服务端只提供原生 reducer 驱动的 `agent-loop`：
-
-```toml
-[agent]
-kind = "agent-loop" # 模型可以在一个 run 内调用工具并继续执行
-system_prompt = "You are Mina, a helpful agent."
-max_steps = 8
-run_timeout_seconds = 900
-model_timeout_seconds = 600
-tool_timeout_seconds = 30
-tool_call_strategy = "parallel-safe" # sequential | parallel-safe
-
-[approval]
-review_level = 50 # Low=10, Medium=50, High=90；0=全部审核，100=关闭审核
-
-[script.quickjs]
-enabled = true
-timeout_ms = 2000
-memory_bytes = 33554432
-max_concurrent_executions = 2
-
-[adf]
-enabled = true
-max_active_per_run = 8
-
-[jobs]
-enabled = true
-allowed_kinds = ["builtin.delay"]
-```
-
-Tool 风险由 Tool 作者声明，Host 使用 `[approval].review_level` 统一过滤：仅当 `tool_level >= review_level` 时进入用户审批。默认值 `50` 保持 Medium/High 需要审批；设为 `90` 时只审批 High，设为 `0` 时所有 Tool 都审批，设为 `100` 时关闭 Tool 人工审批。配置只接受 `0..=100`。外部 Tool manifest 仍使用 `low/medium/high`，因此不会破坏现有 JSON Schema 或 C ABI。
-
-启用后，Server 和 CLI 都会注册 `javascript_eval`，并提供 `adf_define`、`adf_list`、`adf_remove`。当前 ADF 只允许 Run-scoped、同步、无 Host capability 的 JavaScript；定义完成后，内容寻址的动态 Tool 从下一个 model step 开始可见。脚本源码和输入在公共 SSE、SQLite RunEvent 和普通观测中只记录大小与 digest。
-
-Harness 还提供 `JavaScriptAgentMachine`：脚本用 `start(context,input)` / `resume(context,checkpoint,events)` 返回受校验的 OutputDelta、Event wait、Timer、Job 或 PublishEvent。每次 activation 都创建全新 QuickJS Context，只把 JSON checkpoint 与 content-addressed artifact ref 写入 Store，不保存 Promise、闭包、全局变量或 VM 栈。
-
-上层编排同样由 TOML 选择具体实现和策略。默认组合是 filesystem SkillStore、SQLite FTS MemoryRetriever、Host MemoryWritePolicy、Hybrid Compressor 和启发式 TokenEstimator。替换这些实现不需要修改 AgentLoop。模型返回完整且自洽的 usage 时以模型数据为准；缺失或不可比较的字段才由 estimator 根据实际请求和流式回复内容补齐，Run 的 `usage.source` 会标记为 `provider_reported`、`mixed` 或 `estimator_fallback`。
-
-```toml
-[orchestration]
-skill_directory = "skills"
-memory_enabled = true
-memory_scope = "global"
-compressor = "hybrid"
-context_policy_version = 1
-```
-
-`skill_directory` 中每个一级子目录代表一个 Skill package，至少包含 `skill.toml` 和 `SKILL.md`。仓库内置的 [`rust-project-guide`](./skills/rust-project-guide) 示例声明为 `routable`，输入包含 Rust、Cargo、crate、workspace、编译、测试或依赖时会自动加载。调试工作台的 Skills 页签会显示 Store、版本、digest、激活方式和路由 hints；最终选中的 Skill refs 同时写入 Run execution manifest。
-
-`agent.max_steps` 是 Host 上限；`POST /api/v1/runs` 和 `POST /api/v1/sessions/{session_id}/runs` 可为单次 Run 传入更小的 `max_steps`。预算耗尽时，未执行的 tool call 会以结构化 `agent_step_limit_exceeded` 工具错误返回模型，并额外执行一次禁用工具的最终总结，而不是直接终止 Run。
-
-`kind` 目前只接受 `agent-loop`；旧的 `echo` 与 `single-turn` 服务端兼容入口已经移除。需要不调用真实模型的前端测试时，应使用实现 Responses 或 Messages 协议的 mock provider。
-
-## 当前调用链
-
-应用层使用三个内部入口：`agent-core` 提供契约与 Agent 决策逻辑，`agent-extension` 按 Feature 提供 Provider、Tools、Workspace FS、Sandbox、Store 和可观测性实现，`agent-harness` 在二者之上提供 Harness、耐久运行时和可选脚本引擎。依赖方向固定为 `extension -> core`、`harness -> core + extension`，禁止 `extension -> harness`。
-
-```text
-Next.js -> Session submit -> SkillOrchestrator -> ContextEngine
-                                      │                ├-> SessionStore
-                                      └-> SkillStore    ├-> MemoryRetriever
-                                                       └-> ContextCompressor
-                                                -> agent-harness::Harness
-                                              -> AgentLoopReducer
-                                                   -> Native Effect Runner
-                                                        ├-> RunToolSession(revision)
-                                                        │    ├-> ToolRegistry -> Extension Tools
-                                                        │    └-> Run ADF overlay -> QuickJS
-                                                        └-> ModelPort -> Extension Provider
-                                             <-> AgentLoopReducerState checkpoint
-                                                   <-> Harness Event/Timer/Job Runtime -> Extension SQLite
-```
-
-服务端直接组合 `AgentLoop` 的原生 `AgentMachine` 实现。所有决策由 `AgentLoopReducer` 产生，Native Effect Runner 只负责模型、工具、计时与取消等异步效果。前端停止按钮会调用 `POST /api/v1/runs/{run_id}/cancel`，取消信号贯穿 run、审批、模型和工具执行。
-
-`agent-extension::tool` 当前提供 `get_current_time`、`read`、`list_directory`、`search`、`write`、`edit`、`apply_patch`、`shell_command`、`exec_command`、`write_stdin`、`pptx_check`、`xlsx_check`、`docx_check`、`javascript_eval` 和 `async_job`；ADF overlay 另外提供 `adf_define/list/remove` 及动态生成的工具。`read/list/search/pptx_check/xlsx_check/docx_check/javascript_eval` 默认 Low，`write/edit/apply_patch/async_job` 默认 Medium，terminal process tools 始终 High。文件工具限制在 workspace 内并拒绝密钥配置、`.env`、私钥和 `.git` 路径；三个 Office checker 对未打包 OOXML 目录或最终 `.pptx/.xlsx/.docx` 文件执行有界结构校验，包括 XML、Content Types、关系及格式专属引用，但不替代 Office 应用的 Schema、公式语义或视觉渲染检查；`search` 通过可替换的 `SearchBackend` 工作，默认 adapter 是不联网的 workspace text search。
-
-Tool 还声明 `idempotency/concurrency/completion/retry`。只有 ReadOnly/Idempotent Tool 可有限自动重试；只有 `parallel_safe + immediate` 且无需审批的调用可并发，写回模型时仍保持调用顺序；MaySuspend Tool 通过 checkpoint + wait/effect 释放 worker，事件到达后跨重启恢复。
-
-AgentLoop 每个 model step 固定使用一份 `ToolSetSnapshot(revision, digest)`，工具调用也携带同一 revision；ADF 修改只影响下一 step。当前 `InMemoryAdfArtifactStore` 适用于单次 Run，Run 结束会清理动态 overlay，尚不承诺跨 Server 重启恢复 ADF。durable artifact/checkpoint 属于下一阶段。
-
-`shell_command/exec_command/write_stdin` 通过 `agent-core::sandbox::ProcessSandbox` 契约执行，当前 `agent-extension::sandbox` 提供 `HostProcessSandbox`：固定 cwd、清空继承环境、管理会话并限制输出，但它会如实报告 `isolation=none`，不是内核级安全边界。生产环境应替换为 bubblewrap/nsjail、OCI/gVisor 或 microVM adapter；详细选型见 [进程沙箱与工具后端](./docs/10-process-sandbox-and-tool-backends.md)。
-
-Tool failure 统一包含稳定 `code`、`category`、安全 `message`、`retryable` 和可选 `retry_after_ms`；失败会进入 RunEvent/RunSnapshot 并作为结构化 tool result 返回模型，不会因为普通工具失败直接终止整个 Agent。`agent-core::observability` 定义脱敏事件和 Hook，`agent-extension::observability` 提供 Model/Tool/AgentMachine 装饰器、有界异步 batch/retry/flush queue、tracing adapter 及通用 exporter port。Host 可以接 OpenTelemetry/Langfuse，而 Harness 不依赖具体监控厂商，监控故障也不会阻塞 Agent。
-
-外部工具通过 [`contracts/tool/v1`](./contracts/tool/v1/README.md) 接入。公共边界采用版本化 C ABI，manifest、调用和结果使用 JSON Schema；Rust 内部 trait、Tokio future 和 allocator 不跨语言暴露。
-
-前端聊天界面使用 npm 发布的 `@xinjiyuan97/chat-core` 和 `@xinjiyuan97/chat-ui`。工作台通过 `GET /api/v1/sessions?status=active` 从 SQLite 恢复会话列表和历史消息，支持新建、切换并记住最近使用的 Session；自定义 transport 通过 `POST /api/v1/sessions/{session_id}/runs` 提交消息，再订阅 Run SSE。工具审批映射为组件库的 `permission-request` / `permission-resolved`。
-
-详细设计见：
-
-- [架构与边界划分](./docs/01-architecture-boundaries.md)
-- [Gateway–Agent 交互协议](./docs/02-gateway-agent-protocol.md)
-- [Gateway–上游协议](./docs/03-gateway-upstream-protocol.md)
-- [单次任务运行时](./docs/04-single-task-runtime.md)
-- [Agent Loop 与工具协议](./docs/05-agent-loop-tools.md)
-- [独立事件运行时与订阅系统](./docs/06-event-runtime-subscriptions.md)
-- [工具包与跨语言静态链接契约](./docs/07-tool-packages-and-ffi.md)
-- [单次 Run 状态与持久化](./docs/08-single-run-state-storage.md)
-- [下一阶段：Session、上下文编排与可恢复流程框架](./docs/09-next-flow-framework.md)
-- [进程沙箱与工具后端](./docs/10-process-sandbox-and-tool-backends.md)
-- [单 Agent 生产化边界](./docs/11-single-agent-production-hardening.md)
-- [Core/Harness/Extension 三包边界](./docs/12-core-extension-consolidation.md)
-- [QuickJS 便携脚本运行时设计与执行计划](./docs/13-quickjs-portable-script-runtime.md)
-- [Agent Defined Functions（ADF）设计与执行计划](./docs/14-agent-defined-functions.md)
-- [跨环境 Workspace FS 契约与实现](./docs/15-workspace-filesystem.md)
-
-The browser runtime is available as the headless [`@mina/browser-agent` SDK](packages/browser-agent/README.md); `apps/wasm-agent` is its React demo. The host system prompt is embedded in WASM.
-
-### 多 Agent 调用链
-
-```text
-agent-core -> agent-harness -> agent-multi
-                              ├─ EventBus / Sub-Pub
-                              ├─ Supervisor / Discussion
-                              └─ SQLite Durable Bus
-```
-
-`agent-multi` 的内存总线用于本地与测试；SQLite 提供 replay、offset、ack
-和幂等发布。多 Agent 任务使用稳定的 message/correlation ID，并按至少一次
-投递语义实现幂等处理。
+更多专题：[架构边界](docs/01-architecture-boundaries.md)、[进程沙箱](docs/10-process-sandbox-and-tool-backends.md)、[Workspace 文件系统](docs/15-workspace-filesystem.md)。历史设计文档中的旧流水线描述不作为当前 API 使用指南。

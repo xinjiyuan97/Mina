@@ -12,30 +12,20 @@ async fn corrupt_recovery(kind: &str) {
     let _ = worker.await;
     let connection =
         rusqlite::Connection::open(directory.path().join("events.db")).expect("database");
-    let encoded: String = connection
+    let (position, encoded): (i64, String) = connection
         .query_row(
-            "SELECT state_json FROM workflow_operator_fabric_v1 WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .expect("fabric state");
-    let mut fabric: Value = serde_json::from_str(&encoded).expect("state json");
-    let event = fabric["events"]
-        .as_array_mut()
-        .expect("events")
-        .iter_mut()
-        .find(|item| {
-            item["event"]["envelope"]["run_id"] == json!(bad)
-                && item["event"]["envelope"]["event_type"] == "run.requested"
-        })
-        .expect("bad request event");
+            "SELECT position,value_json FROM workflow_fabric_records WHERE section='events' AND json_extract(value_json,'$.event.envelope.run_id')=?1 AND json_extract(value_json,'$.event.envelope.event_type')='run.requested'",
+            [bad.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).expect("bad request record");
+    let mut event: Value = serde_json::from_str(&encoded).expect("event JSON");
     let payload = &mut event["event"]["envelope"]["payload"];
     if kind == "payload" {
         *payload = json!({"invalid":"P6_PRIVATE_CORRUPT_SENTINEL"});
         connection
             .execute(
-                "UPDATE workflow_operator_fabric_v1 SET state_json = ?1 WHERE singleton = 1",
-                [serde_json::to_string(&fabric).expect("serialize")],
+                "UPDATE workflow_fabric_records SET value_json = ?1 WHERE section='events' AND position=?2",
+                rusqlite::params![serde_json::to_string(&event).expect("serialize"), position],
             )
             .expect("inject invalid durable payload");
     } else {
@@ -63,18 +53,21 @@ async fn corrupt_recovery(kind: &str) {
         .expect("model request");
     assert_eq!(request.run_id, good);
     assert!(received.try_recv().is_err(), "corrupt run must not execute");
-    assert!(
+    assert_eq!(
         state
             .pipeline
             .as_ref()
-            .expect("pipeline")
-            .store
-            .load(bad)
+            .unwrap()
+            .engine
+            .host(bad)
             .await
-            .expect("load")
-            .expect("record")
-            .lease_owner
-            .is_none()
+            .unwrap()
+            .engine
+            .get_run("local", bad)
+            .await
+            .unwrap()
+            .deliveries,
+        0
     );
 }
 

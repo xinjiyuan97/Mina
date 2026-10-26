@@ -5,10 +5,7 @@ use agent_core::{
     harness::*,
     skill::SkillLock,
 };
-use agent_harness::{
-    context_operator::{AdmissionFacade, ContextPreparer, PrepareFuture},
-    pipeline::{EffectWaitBridge, ToolsPipelineRuntime},
-};
+use agent_harness::context_operator::{AdmissionFacade, ContextPreparer, PrepareFuture};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,7 +14,7 @@ use tokio::sync::Notify;
 #[test]
 fn tools_profile_is_explicit_and_default_and_text_are_unchanged() {
     use crate::tools_pipeline::{EngineProfile, parse_profile};
-    assert_eq!(parse_profile(None).expect("default"), EngineProfile::Legacy);
+    assert_eq!(parse_profile(None).expect("default"), EngineProfile::Tools);
     assert_eq!(
         parse_profile(Some("operator_v1_text")).expect("text"),
         EngineProfile::Text
@@ -27,10 +24,11 @@ fn tools_profile_is_explicit_and_default_and_text_are_unchanged() {
         EngineProfile::Tools
     );
     assert!(parse_profile(Some("operator_v1")).is_err());
+    assert!(parse_profile(Some("legacy")).is_err());
 }
 
 #[tokio::test]
-async fn p5_canary_applies_only_to_new_admissions_after_rollback() {
+async fn profile_changes_apply_only_to_new_admissions() {
     let directory = tempfile::tempdir().expect("temp");
     let model = Arc::new(Model {
         calls: AtomicUsize::new(0),
@@ -42,8 +40,6 @@ async fn p5_canary_applies_only_to_new_admissions_after_rollback() {
     });
     let (mut state, worker) = fixture(directory.path(), model, tools).await;
     let original = RunId::new();
-    state.rollout =
-        crate::rollout::Rollout::parse(Some("0"), Some(&original.to_string())).expect("rollout");
     let input = |run_id| PrepareRunRequest {
         attachment_names: None,
         run_id,
@@ -57,12 +53,11 @@ async fn p5_canary_applies_only_to_new_admissions_after_rollback() {
     let prepared = prepare_run_plan(&state, input(original))
         .await
         .expect("admit operator");
-    state.rollout = crate::rollout::Rollout::parse(Some("0"), None).expect("rollback");
-    state.pipeline_profile = crate::tools_pipeline::EngineProfile::Legacy;
+    state.pipeline_profile = crate::tools_pipeline::EngineProfile::Text;
     let new_run = RunId::new();
     prepare_run_plan(&state, input(new_run))
         .await
-        .expect("new admission stays legacy");
+        .expect("new admission uses text operators");
     assert!(
         state
             .admission
@@ -70,8 +65,9 @@ async fn p5_canary_applies_only_to_new_admissions_after_rollback() {
             .await
             .expect("request")
             .expect("saved")
-            .engine_version
-            .is_legacy()
+            .execution_profile
+            .as_deref()
+            == Some("operator_v1_text")
     );
     let pinned = state
         .admission
@@ -412,11 +408,7 @@ async fn fixture(
         state.blobs.clone(),
     )
     .expect("construct legacy, never execute");
-    state.runtime = RunRuntime::new(
-        Harness::new(ObservedMachine::new(legacy, hook)),
-        runs.clone(),
-        |_| {},
-    );
+    state.runtime = RunRepository::new(legacy.metadata(), runs.clone());
     state.admission = Arc::new(AdmissionFacade::new(
         native.clone(),
         state.blobs.clone(),
@@ -427,17 +419,23 @@ async fn fixture(
     Arc::get_mut(&mut state.orchestration)
         .expect("unique orchestration")
         .tools = tools.definitions();
-    let runtime = Arc::new(
-        ToolsPipelineRuntime::new(native.clone(), model, tools)
-            .with_blobs(state.blobs.clone())
-            .with_wait_ports(native.clone(), native.clone())
-            .with_projection(runs.clone()),
-    );
-    state.tools_pipeline = Some(Arc::new(crate::tools_pipeline::ToolsServerPipeline::new(
-        runtime,
+    let resources = agent_core::agent::AgentResources::new(native.clone())
+        .model("primary", "server-v1", model)
+        .toolset("workspace", "server-v1", tools)
+        .wait_service(
+            "durable",
+            "server-v1",
+            Arc::new(agent_core::agent::GraphWaitBridge::new(
+                native.clone(),
+                native.clone(),
+                native.clone(),
+            )),
+        );
+    state.tools_pipeline = Some(Arc::new(crate::tools_pipeline::ServerAgentRuntime::new(
+        resources,
         runs.clone(),
     )));
-    let bridge = Arc::new(EffectWaitBridge::new(
+    let bridge = Arc::new(agent_core::agent::GraphWaitBridge::new(
         native.clone(),
         native.clone(),
         native.clone(),
@@ -617,11 +615,7 @@ async fn until_event(response: reqwest::Response, kind: &str) -> Value {
 }
 
 #[tokio::test]
-async fn tools_server_reopens_pending_approval_or_wait_and_cancel_only_publishes_fact() {
-    use agent_core::{
-        effect_pipeline::{RunCancelRequest, run_key},
-        operator_fabric::{FabricCommand, FabricReply},
-    };
+async fn tools_server_reopens_pending_approval_or_wait_and_persists_cancel() {
     for suspend in [false, true] {
         let directory = tempfile::tempdir().expect("temp");
         let model = Arc::new(Model {
@@ -670,7 +664,7 @@ async fn tools_server_reopens_pending_approval_or_wait_and_cancel_only_publishes
 
         let (mut state, context_worker) =
             fixture(directory.path(), model.clone(), tools.clone()).await;
-        state.pipeline_profile = crate::tools_pipeline::EngineProfile::Legacy;
+        state.pipeline_profile = crate::tools_pipeline::EngineProfile::Text;
         admission::recover_once(&state)
             .await
             .expect("recover persisted tools profile");
@@ -682,8 +676,7 @@ async fn tools_server_reopens_pending_approval_or_wait_and_cancel_only_publishes
             .await;
         assert_eq!(model.calls.load(Ordering::SeqCst), 1);
         assert_eq!(tools.calls.load(Ordering::SeqCst), usize::from(suspend));
-        let runtime = &state.tools_pipeline.as_ref().expect("tools").runtime;
-        let before = runtime.load("local", run_id).await.expect("durable run");
+        let engine = &state.tools_pipeline.as_ref().expect("tools").engine;
         let (address, server) = serve(state.clone()).await;
         assert_eq!(
             client
@@ -694,48 +687,16 @@ async fn tools_server_reopens_pending_approval_or_wait_and_cancel_only_publishes
                 .status(),
             StatusCode::ACCEPTED
         );
+        let host = engine.host(run_id).await.expect("host");
         assert_eq!(
-            runtime
-                .load("local", run_id)
+            host.engine
+                .get_run("local", run_id)
                 .await
-                .expect("not directly reduced")
-                .reducer,
-            before.reducer
+                .expect("graph")
+                .status,
+            agent_core::agent::GraphStatus::Cancelled
         );
-        let FabricReply::Checkpoint(Some(saved)) = state
-            .admission
-            .fabric()
-            .execute(FabricCommand::ReadCheckpoint(format!(
-                "{}:cancel",
-                run_key("local", run_id)
-            )))
-            .await
-            .expect("cancel intent")
-        else {
-            panic!("missing intent");
-        };
-        let intent: RunCancelRequest =
-            serde_json::from_value(saved.value).expect("cancel contract");
-        assert_eq!(intent.actor, "gateway:http");
-        for _ in 0..30 {
-            if runtime
-                .tick("local", run_id, agent_harness::unix_time_ms)
-                .await
-                .expect("reduce cancel")
-                == 0
-            {
-                break;
-            }
-        }
-        assert!(matches!(
-            runtime
-                .load("local", run_id)
-                .await
-                .expect("terminal")
-                .reducer
-                .outcome(),
-            AgentLoopOutcome::Cancelled
-        ));
+        engine.recover(run_id).await.expect("project cancellation");
         if !suspend {
             let approval = waiting["approval_id"].as_str().expect("approval");
             assert_eq!(
@@ -885,7 +846,7 @@ async fn tools_http_sse_approval_and_wait_live_equal_sqlite_replay_and_last_even
         let _ = context_worker.await;
         drop(state);
         let (mut reopened, context_worker) = fixture(directory.path(), model.clone(), tools).await;
-        reopened.pipeline_profile = crate::tools_pipeline::EngineProfile::Legacy;
+        reopened.pipeline_profile = crate::tools_pipeline::EngineProfile::Text;
         admission::recover_once(&reopened)
             .await
             .expect("recover pinned profile, never legacy");

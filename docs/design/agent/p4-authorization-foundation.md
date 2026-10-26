@@ -1,5 +1,7 @@
 # P4 工具与审批基础
 
+> 历史设计说明：本文涉及的固定流水线已移除。当前实现、持久化事件与恢复 API 以[静态图指南](static-agent-graph.md)和[单 Agent API](operator-only-api.md)为准。
+
 日期：2026-10-23。
 
 本文件记录授权基础与早期 RED→GREEN 证据；Job/Timer/External wait 见 `p4-durable-waits.md`，Server tools profile 和最终验收见 `p4-server-streaming.md`。

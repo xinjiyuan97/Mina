@@ -340,3 +340,333 @@ async fn sqlite_transaction_and_undispatched_outbox_survive_reopen() {
         FabricReply::Dispatched(1)
     );
 }
+
+async fn guarded_many_contract(store: &dyn OperatorFabric) {
+    let run = RunId::new();
+    let mut source = event(run, "guarded-source");
+    source.envelope.operator_seq = OperatorSequence(1);
+    store.execute(FabricCommand::Publish(source)).await.unwrap();
+    store
+        .execute(FabricCommand::Subscribe(SubscriptionSpec {
+            consumer: "writer".into(),
+            subscription: "writer".into(),
+            topic: "p4-test".into(),
+            event_type: None,
+            tenant: Some("local".into()),
+        }))
+        .await
+        .unwrap();
+    let FabricReply::Claimed(deliveries) = store
+        .execute(FabricCommand::Claim {
+            worker: "worker".into(),
+            now_ms: 1,
+            lease_ms: 100,
+            limit: 1,
+            max_attempts: 3,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("claim")
+    };
+    let lease = deliveries[0].lease.clone();
+    let write = |key: &str, expected| CheckpointWrite {
+        key: key.into(),
+        expected,
+        value: json!({"value": 1}),
+    };
+    let command = |now_ms, expected, outbox| FabricCommand::GuardedTransactMany {
+        lease: lease.clone(),
+        now_ms,
+        checkpoints: vec![write("batch", None), write("head", expected)],
+        outbox,
+    };
+    // A conflict on the last write must roll back the earlier batch and outbox.
+    assert_eq!(
+        store
+            .execute(command(2, Some(7), vec![event(run, "batch-event")]))
+            .await,
+        Err(FabricError::Fenced)
+    );
+    assert_eq!(
+        store
+            .execute(FabricCommand::ReadCheckpoint("batch".into()))
+            .await
+            .unwrap(),
+        FabricReply::Checkpoint(None)
+    );
+    assert_eq!(
+        store
+            .execute(FabricCommand::DispatchOutbox { limit: 10 })
+            .await
+            .unwrap(),
+        FabricReply::Dispatched(0)
+    );
+    // Expired leases and cross-run outbox writes cannot commit either record.
+    assert_eq!(
+        store.execute(command(101, None, vec![])).await,
+        Err(FabricError::Fenced)
+    );
+    assert!(
+        store
+            .execute(command(2, None, vec![event(RunId::new(), "foreign")]))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .execute(FabricCommand::ReadCheckpoint("batch".into()))
+            .await
+            .unwrap(),
+        FabricReply::Checkpoint(None)
+    );
+    store
+        .execute(command(2, None, vec![event(run, "batch-event")]))
+        .await
+        .unwrap();
+    for key in ["head", "batch"] {
+        assert!(matches!(
+            store
+                .execute(FabricCommand::ReadCheckpoint(key.into()))
+                .await
+                .unwrap(),
+            FabricReply::Checkpoint(Some(FabricCheckpoint { version: 0, .. }))
+        ));
+    }
+    assert_eq!(
+        store
+            .execute(FabricCommand::Offset {
+                consumer: "writer".into(),
+                subscription: "writer".into(),
+            })
+            .await
+            .unwrap(),
+        FabricReply::Offset(0)
+    );
+    // The same delivery stays active for subsequent flushes.
+    store
+        .execute(FabricCommand::GuardedTransactMany {
+            lease: lease.clone(),
+            now_ms: 3,
+            checkpoints: vec![write("next-batch", None), write("head", Some(0))],
+            outbox: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .execute(FabricCommand::DispatchOutbox { limit: 10 })
+            .await
+            .unwrap(),
+        FabricReply::Dispatched(1)
+    );
+    let stream_checkpoint = |now_ms, revision| FabricCommand::GuardedTransactLog {
+        lease: lease.clone(),
+        now_ms,
+        log: "stream-preview".into(),
+        expected: 0,
+        items: vec![json!("visible")],
+        checkpoints: vec![write("stream-state", revision)],
+    };
+    assert_eq!(
+        store.execute(stream_checkpoint(101, None)).await,
+        Err(FabricError::Fenced)
+    );
+    assert_eq!(
+        store.execute(stream_checkpoint(4, Some(99))).await,
+        Err(FabricError::Fenced)
+    );
+    assert_eq!(
+        store
+            .execute(FabricCommand::ReadLog {
+                log: "stream-preview".into(),
+                after: 0,
+                limit: 1
+            })
+            .await
+            .unwrap(),
+        FabricReply::Log(None)
+    );
+    store.execute(stream_checkpoint(4, None)).await.unwrap();
+    assert_eq!(
+        store
+            .execute(FabricCommand::ReadLog {
+                log: "stream-preview".into(),
+                after: 0,
+                limit: 1
+            })
+            .await
+            .unwrap(),
+        FabricReply::Log(Some(LogPage {
+            through: 1,
+            items: vec![json!("visible")]
+        }))
+    );
+    assert_eq!(
+        store
+            .execute(FabricCommand::Offset {
+                consumer: "writer".into(),
+                subscription: "writer".into()
+            })
+            .await
+            .unwrap(),
+        FabricReply::Offset(0)
+    );
+}
+
+#[tokio::test]
+async fn memory_guarded_many_is_atomic_and_does_not_acknowledge() {
+    guarded_many_contract(&MemoryFabric::default()).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_guarded_many_is_atomic_and_survives_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("guarded.db");
+    {
+        let store = agent_extension::store::SqliteEventStore::open(&path, "guarded")
+            .await
+            .unwrap();
+        guarded_many_contract(&store).await;
+    }
+    let store = agent_extension::store::SqliteEventStore::open(&path, "guarded")
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .execute(FabricCommand::ReadCheckpoint("head".into()))
+            .await
+            .unwrap(),
+        FabricReply::Checkpoint(Some(FabricCheckpoint { version: 1, .. }))
+    ));
+    assert_eq!(
+        store
+            .execute(FabricCommand::Offset {
+                consumer: "writer".into(),
+                subscription: "writer".into(),
+            })
+            .await
+            .unwrap(),
+        FabricReply::Offset(0)
+    );
+}
+
+async fn log_transaction_contract(store: &dyn OperatorFabric) {
+    let command = |expected, revision, items| FabricCommand::TransactLog {
+        log: "public-log".into(),
+        expected,
+        items,
+        checkpoints: vec![CheckpointWrite {
+            key: "run-state".into(),
+            expected: revision,
+            value: json!(expected),
+        }],
+        outbox: vec![],
+        delivery: None,
+    };
+    store
+        .execute(command(0, None, vec![json!("one"), json!("two")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .execute(command(2, Some(99), vec![json!("lost")]))
+            .await,
+        Err(FabricError::Fenced)
+    );
+    assert_eq!(
+        store
+            .execute(command(0, Some(0), vec![json!("duplicate")]))
+            .await,
+        Err(FabricError::Fenced)
+    );
+    assert_eq!(
+        store
+            .execute(FabricCommand::ReadLog {
+                log: "public-log".into(),
+                after: 1,
+                limit: 1
+            })
+            .await
+            .unwrap(),
+        FabricReply::Log(Some(LogPage {
+            through: 2,
+            items: vec![json!("two")]
+        }))
+    );
+    store
+        .execute(command(2, Some(0), vec![json!("three")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .execute(FabricCommand::ReadLog {
+                log: "public-log".into(),
+                after: 2,
+                limit: 128
+            })
+            .await
+            .unwrap(),
+        FabricReply::Log(Some(LogPage {
+            through: 3,
+            items: vec![json!("three")]
+        }))
+    );
+    assert_eq!(
+        store
+            .execute(FabricCommand::ReadLog {
+                log: "missing".into(),
+                after: 0,
+                limit: 1
+            })
+            .await
+            .unwrap(),
+        FabricReply::Log(None)
+    );
+    assert!(
+        store
+            .execute(FabricCommand::ReadLog {
+                log: "public-log".into(),
+                after: 0,
+                limit: 0
+            })
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn memory_log_append_and_checkpoint_commit_atomically() {
+    log_transaction_contract(&MemoryFabric::default()).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_log_append_and_checkpoint_survive_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("log.db");
+    {
+        let store = agent_extension::store::SqliteEventStore::open(&path, "log")
+            .await
+            .unwrap();
+        log_transaction_contract(&store).await;
+    }
+    let store = agent_extension::store::SqliteEventStore::open(&path, "log")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .execute(FabricCommand::ReadLog {
+                log: "public-log".into(),
+                after: 0,
+                limit: 128
+            })
+            .await
+            .unwrap(),
+        FabricReply::Log(Some(LogPage {
+            through: 3,
+            items: vec![json!("one"), json!("two"), json!("three")]
+        }))
+    );
+}

@@ -1,9 +1,9 @@
+use agent_core::agent::operator_compat::*;
 use agent_core::{
     event_runtime::{EventEnvelope, PublishEvent},
     harness::{AgentLoopEffect, RunEvent},
     operator::{LogSequence, PublicRunSequence},
 };
-use agent_harness::operator_compat::*;
 use serde_json::json;
 
 #[test]

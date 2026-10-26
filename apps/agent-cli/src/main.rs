@@ -8,9 +8,7 @@ use std::{
 
 use agent_core::{
     adf::RunScopedJavaScriptPolicy,
-    harness::{
-        AgentLoop, ApprovalError, ApprovalFuture, ApprovalPort, ApprovalRequest, ApprovalResolution,
-    },
+    harness::{ApprovalError, ApprovalFuture, ApprovalPort, ApprovalRequest, ApprovalResolution},
     observability::ObservationHook,
     sandbox::ProcessSandbox,
     script::{ScriptLimits, ScriptRuntime},
@@ -146,21 +144,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let tools = ObservedTools::new(tools, Arc::clone(&hook));
 
-    let agent = AgentLoop::new(
-        provider,
-        tools,
+    let mut graph_config = agent_core::agent::graph::GraphAgentConfig::new(
         model.model.clone(),
         config.agent().system_prompt.clone(),
-        model.max_output_tokens,
-        config.agent().max_steps,
-    )
-    .with_approval_policy(config.approval().policy())
-    .with_timeouts(
-        Duration::from_secs(config.agent().model_timeout_seconds),
-        Duration::from_secs(config.agent().tool_timeout_seconds),
-    )
-    .with_tool_call_strategy(config.agent().tool_call_strategy)
-    .with_approval_port(TerminalApprovals);
+    );
+    graph_config.max_steps = config.agent().max_steps;
+    graph_config.max_output_tokens = model.max_output_tokens;
+    graph_config.model_timeout_ms = config.agent().model_timeout_seconds.saturating_mul(1000);
+    graph_config.tool_timeout_ms = config.agent().tool_timeout_seconds.saturating_mul(1000);
+    graph_config.run_timeout_ms = config.agent().run_timeout_seconds.saturating_mul(1000);
+    graph_config.review_level = config.approval().policy().review_level();
+    graph_config.allow_run_adf = config.adf().enabled;
+    graph_config.parallel_tools =
+        config.agent().tool_call_strategy == agent_core::harness::ToolCallStrategy::ParallelSafe;
+    let resources = agent_core::agent::AgentResources::new(Arc::new(
+        agent_core::agent::memory_fabric::MemoryFabric::default(),
+    ))
+    .model("primary", "cli-v1", Arc::new(provider))
+    .toolset("workspace", "cli-v1", Arc::new(tools));
+    let agent = agent_core::agent::GraphAgent::new(
+        graph_config.definition()?,
+        agent_core::agent::OperatorRegistry::builtins(),
+        resources,
+    )?
+    .with_approval_port(Arc::new(TerminalApprovals));
 
     let response = Harness::new(ObservedMachine::new(agent, hook))
         .with_run_timeout(Duration::from_secs(config.agent().run_timeout_seconds))

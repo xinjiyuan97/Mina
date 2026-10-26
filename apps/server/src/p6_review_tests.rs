@@ -2,10 +2,7 @@ use super::*;
 
 #[path = "p6_second_review_tests.rs"]
 mod second_review;
-use agent_harness::{
-    context_operator::legacy_plan,
-    pipeline::{PipelineRuntime, PipelineStart},
-};
+use agent_harness::context_operator::prepared_plan;
 
 fn config(model: &str, max_output: u32) -> HarnessConfig {
     HarnessConfig::from_toml_str(&format!(
@@ -49,18 +46,12 @@ async fn text_state(
     .await;
     state.config = Arc::new(config("original-model", 77));
     state.pipeline_profile = crate::tools_pipeline::EngineProfile::Text;
-    state.pipeline = Some(Arc::new(
-        PipelineRuntime::new(
-            Arc::new(
-                agent_extension::pipeline::SqlitePipelineStore::open(path.join("text.db"))
-                    .expect("ledger"),
-            ),
-            state.runtime.run_store(),
-            state.blobs.clone(),
-            Arc::new(Capture(sender)),
-        )
-        .with_fabric(state.admission.fabric()),
-    ));
+    state.pipeline = Some(Arc::new(crate::tools_pipeline::ServerAgentRuntime::new(
+        agent_core::agent::AgentResources::new(state.admission.fabric())
+            .model("primary", "server-v1", Arc::new(Capture(sender)))
+            .toolset("workspace", "server-v1", Arc::new(ToolRegistry::new())),
+        state.runtime.run_store(),
+    )));
     (state, worker)
 }
 
@@ -74,24 +65,23 @@ async fn pending(
     let prepared = prepare_run_plan(state, prepare_request(run_id, input, attachments))
         .await
         .expect("context");
-    let plan = prepared.plan;
-    let mut start = PipelineStart::text(run_id, &plan.input, &state.config.default_model().model);
-    start.context_sequence = 3;
-    start.start.attachments = plan.attachments;
-    start.start.prior_messages = plan.prior_messages;
-    start.start.context_fingerprint = plan.context_fingerprint;
-    start.start.config.max_steps = plan.max_steps.unwrap_or(1);
-    start.start.config.max_output_tokens = state.config.default_model().max_output_tokens;
+    let mut plan = prepared.plan;
     if inconsistent {
-        start.start.input = "inconsistent persisted input".into();
+        plan.input = "inconsistent persisted input".into();
     }
+    let mut config = agent_core::agent::GraphAgentConfig::new(
+        &state.config.default_model().model,
+        &state.config.agent().system_prompt,
+    );
+    config.max_output_tokens = state.config.default_model().max_output_tokens;
     state
         .pipeline
         .as_ref()
         .expect("pipeline")
-        .admit(start)
+        .engine
+        .admit(&config, plan, None)
         .await
-        .expect("pending ledger");
+        .expect("pending graph");
 }
 
 async fn config_drift(model: &str, max_output: u32) {
@@ -133,7 +123,7 @@ async fn config_drift(model: &str, max_output: u32) {
             .wait(run_id, Duration::from_secs(1))
             .await
             .expect("prepared");
-        let mut plan = legacy_plan(original, prepared);
+        let mut plan = prepared_plan(original, prepared);
         match field {
             0 => plan.input.push_str("changed"),
             1 => plan.attachments.reverse(),
@@ -182,16 +172,22 @@ async fn p6_review_bad_run_does_not_starve_recovery_scan() {
         .expect("healthy run must still recover")
         .expect("request");
     assert_eq!(request.run_id, good);
-    let record = state
-        .pipeline
-        .as_ref()
-        .expect("pipeline")
-        .store
-        .load(bad)
-        .await
-        .expect("load")
-        .expect("record");
-    assert!(record.lease_owner.is_none());
+    assert_eq!(
+        state
+            .pipeline
+            .as_ref()
+            .unwrap()
+            .engine
+            .host(bad)
+            .await
+            .unwrap()
+            .engine
+            .get_run("local", bad)
+            .await
+            .unwrap()
+            .deliveries,
+        0
+    );
     worker.abort();
     let _ = worker.await;
 }

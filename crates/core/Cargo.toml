@@ -5,15 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Provider-neutral agent contracts and decision runtime"
+description = "Single-agent operator engine, lifecycle APIs and portable contracts"
 
 [dependencies]
+base64.workspace = true
+tracing.workspace = true
 async-stream.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 jsonschema.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
+serde_yaml = "0.9.34"
 sha2.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
@@ -31,6 +34,8 @@ tokio-util = { version = "0.7.17", features = ["rt"] }
 uuid = { version = "1.25.0", features = ["serde", "v4", "v5", "js"] }
 
 [dev-dependencies]
+agent-extension = { workspace = true, features = ["adf", "builtin-tools", "sqlite", "filesystem"] }
+tempfile.workspace = true
 jsonschema = { workspace = true, features = ["draft202012"] }
 
 [lints]

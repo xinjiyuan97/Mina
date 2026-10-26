@@ -1,5 +1,7 @@
 # P4 Durable Wait
 
+> 历史设计说明：本文涉及的固定流水线已移除。当前实现、持久化事件与恢复 API 以[静态图指南](static-agent-graph.md)和[单 Agent API](operator-only-api.md)为准。
+
 日期：2026-10-23。本文记录 Harness/SQLite 实现。后续 Server 集成及完整门禁见 `p4-server-streaming.md`，不缩减原 P4 验收要求。
 
 ## 本轮文件

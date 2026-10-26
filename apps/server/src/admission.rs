@@ -1,8 +1,8 @@
 //! HTTP mapping for the P2 admission barrier; no Context/Skills business execution.
 
 use super::*;
+use agent_core::agent::context_operator::{AdmissionError, prepared_plan};
 use agent_core::context_operator::{ContextOutcome, ContextPolicy, ContextRequest};
-use agent_harness::context_operator::{AdmissionError, legacy_plan};
 
 pub(super) async fn owned(
     work: impl std::future::Future<Output = Response> + Send + 'static,
@@ -163,11 +163,7 @@ pub(super) async fn prepare(
         ));
     }
     let orchestration = &state.orchestration;
-    let identity = request
-        .session_id
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| request.run_id.to_string());
-    let profile = state.rollout.select(state.pipeline_profile, &identity);
+    let profile = state.pipeline_profile;
     let config = &orchestration.config;
     let request = ContextRequest {
         engine_version: profile.engine(),
@@ -340,6 +336,10 @@ async fn recover_request(
     state: &AppState,
     request: ContextRequest,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if request.engine_version.is_legacy() {
+        tracing::warn!(run_id = %request.run_id, "legacy run retained for inspection; execution removed");
+        return Ok(());
+    }
     if state
         .runtime
         .get_run(request.run_id)
@@ -357,26 +357,26 @@ async fn recover_request(
         );
         return Ok(());
     }
-    if !request.engine_version.is_legacy() {
-        if state
-            .runtime
-            .get_run(request.run_id)
-            .await?
-            .is_some_and(|run| run.is_terminal())
+    if let Some(run) = state.runtime.get_run(request.run_id).await?
+        && run.is_terminal()
+    {
+        if run
+            .execution_manifest
+            .as_ref()
+            .is_some_and(|m| m["runtime"] == "static_graph_v1")
         {
-            return Ok(());
+            let runtime = if request.execution_profile.as_deref() == Some("operator_v1_text") {
+                &state.pipeline
+            } else {
+                &state.tools_pipeline
+            };
+            if let Some(runtime) = runtime {
+                // RunStore terminal projection can precede wait cleanup at process exit.
+                let host = runtime.engine.host(request.run_id).await?;
+                host.recover(request.run_id).await?;
+            }
         }
-        if let Some(pipeline) = &state.pipeline
-            && request.execution_profile.as_deref()
-                != Some(agent_core::effect_pipeline::TOOLS_PROFILE)
-            && pipeline
-                .store
-                .load(request.run_id)
-                .await?
-                .is_some_and(|record| record.lease_expires_at_ms > agent_harness::unix_time_ms())
-        {
-            return Ok(());
-        }
+        return Ok(());
     }
     match state.admission.outcome(request.run_id).await? {
         Some(ContextOutcome::Failed(failure)) if !request.engine_version.is_legacy() => {
@@ -391,29 +391,7 @@ async fn recover_request(
             tracing::info!(engine = ?request.engine_version,
                     profile = request.execution_profile.as_deref().unwrap_or("legacy"),
                     recovery_attempt_count = 1, "recovering persisted admission");
-            crate::pipeline::start(state, legacy_plan(request, prepared), persisted).await?;
-        }
-        Some(ContextOutcome::Failed(_)) if request.session_id.is_some() => {
-            let snapshot = state.runtime.get_run(request.run_id).await?;
-            if snapshot.as_ref().is_some_and(|run| !run.is_terminal()) {
-                let snapshot = state
-                    .runtime
-                    .fail_persisted(
-                        request.run_id,
-                        "context_build_failed",
-                        "context orchestration failed",
-                    )
-                    .await?;
-                state
-                    .orchestration
-                    .sessions
-                    .finalize_run(FinalizeSessionRun {
-                        session_id: request.session_id.expect("session request"),
-                        run: snapshot,
-                        finalized_at_ms: run_runtime::unix_time_ms(),
-                    })
-                    .await?;
-            }
+            crate::pipeline::start(state, prepared_plan(request, prepared), persisted).await?;
         }
         _ => {}
     }
@@ -445,12 +423,12 @@ pub(super) fn test_blobs() -> Arc<dyn BlobStore> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::agent::context_operator::{AdmissionFacade, ContextPreparer, PrepareFuture};
     use agent_core::{
         context::{ContextBudgetReport, ContextPack},
         context_operator::PreparedContext,
         skill::SkillLock,
     };
-    use agent_harness::context_operator::{AdmissionFacade, ContextPreparer, PrepareFuture};
     use tokio::sync::{Notify, mpsc};
 
     struct BlockedPreparer {
@@ -488,7 +466,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p2_http_disconnect_after_publish_still_starts_legacy() {
+    async fn http_disconnect_after_publish_still_starts_operators() {
         let mut state = crate::tests::test_state();
         let directory = tempfile::tempdir().expect("directory");
         let fabric = Arc::new(
@@ -560,12 +538,12 @@ mod tests {
             }
         })
         .await
-        .expect("legacy starts without HTTP waiter");
+        .expect("operator starts without HTTP waiter");
         worker.abort();
     }
 
     #[tokio::test]
-    async fn p2_preparation_errors_precede_sse_headers_with_legacy_status() {
+    async fn preparation_errors_are_durable_before_sse_headers() {
         for (skills, tokens, status, code) in [
             (
                 serde_json::json!([{"skill_id":"absent", "version":"1"}]),
@@ -617,7 +595,7 @@ mod tests {
                     .get_run(requests[0].run_id)
                     .await
                     .expect("snapshot")
-                    .is_none()
+                    .is_some_and(|run| run.is_terminal())
             );
         }
     }
@@ -732,12 +710,22 @@ mod tests {
             blobs.clone(),
         )
         .expect("agent");
-        state.runtime = RunRuntime::new_durable(
-            Harness::new(ObservedMachine::new(agent, hook)),
+        state.tools_pipeline = Some(Arc::new(crate::tools_pipeline::ServerAgentRuntime::new(
+            agent_core::agent::AgentResources::new(fabric.clone())
+                .model("primary", "server-v1", agent.model_port())
+                .toolset("workspace", "server-v1", agent.tool_port())
+                .wait_service(
+                    "durable",
+                    "server-v1",
+                    Arc::new(agent_core::agent::GraphWaitBridge::new(
+                        fabric.clone(),
+                        fabric.clone(),
+                        fabric.clone(),
+                    )),
+                ),
             runs.clone(),
-            fabric.clone(),
-            |_| {},
-        );
+        )));
+        state.runtime = RunRepository::new(agent.metadata(), runs.clone());
         Arc::get_mut(&mut state.orchestration)
             .expect("owned orchestration")
             .sessions = runs;
@@ -746,7 +734,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p2_stateless_and_session_reopen_finish_context_then_start_legacy_once() {
+    async fn stateless_and_session_reopen_start_operators_once() {
         for session in [false, true] {
             let directory = tempfile::tempdir().expect("directory");
             let path = directory.path().join("state.sqlite");
@@ -801,8 +789,8 @@ mod tests {
                     .admission
                     .publish(ContextRequest {
                         attachment_names: None,
-                        engine_version: Default::default(),
-                        execution_profile: None,
+                        engine_version: agent_core::operator::EngineVersion::OperatorV1,
+                        execution_profile: Some(crate::tools_pipeline::TOOLS_PROFILE.into()),
                         run_id,
                         session_id,
                         through_message_ordinal: session.then_some(1),
@@ -810,7 +798,7 @@ mod tests {
                         input: "hello".into(),
                         attachments: vec![],
                         explicit_skills: vec![],
-                        max_steps: 10,
+                        max_steps: 8,
                         policy: ContextPolicy {
                             default_skills: vec![],
                             max_skills: 8,
@@ -851,22 +839,6 @@ mod tests {
                         .expect("reopen fabric"),
                 );
                 let state = durable_state(runs, fabric.clone(), blobs.clone(), preparer.clone());
-                let pending = state
-                    .admission
-                    .requests()
-                    .await
-                    .expect("requests")
-                    .into_iter()
-                    .map(|request| request.run_id)
-                    .collect();
-                assert_eq!(
-                    state
-                        .runtime
-                        .recover_interrupted_except(&pending)
-                        .await
-                        .expect("startup recovery"),
-                    0
-                );
                 recover_once(&state).await.expect("no context yet");
                 assert!(
                     FlowStore::get(fabric.as_ref(), run_id)
@@ -877,15 +849,23 @@ mod tests {
                 release.notify_one();
                 state.admission.tick().await.expect("prepare after reopen");
                 assert_eq!(observed.recv().await.expect("prepared"), run_id);
-                recover_once(&state).await.expect("legacy bridge");
+                recover_once(&state).await.expect("operator bridge");
                 recover_once(&state).await.expect("duplicate recovery");
                 assert_eq!(
-                    FlowStore::get(fabric.as_ref(), run_id)
+                    state
+                        .tools_pipeline
+                        .as_ref()
+                        .expect("engine")
+                        .engine
+                        .host(run_id)
                         .await
-                        .expect("flow")
-                        .expect("started flow")
-                        .revision,
-                    0
+                        .expect("operator host")
+                        .engine
+                        .get_run("local", run_id)
+                        .await
+                        .expect("graph")
+                        .run_id,
+                    run_id
                 );
             }
             let runs = Arc::new(
@@ -899,14 +879,22 @@ mod tests {
                     .expect("second reopen fabric"),
             );
             let state = durable_state(runs, fabric.clone(), blobs.clone(), preparer.clone());
-            recover_once(&state).await.expect("reuse legacy start");
+            recover_once(&state).await.expect("reuse operator start");
             assert_eq!(
-                FlowStore::get(fabric.as_ref(), run_id)
+                state
+                    .tools_pipeline
+                    .as_ref()
+                    .expect("engine")
+                    .engine
+                    .host(run_id)
                     .await
-                    .expect("flow")
-                    .expect("started flow")
-                    .revision,
-                0
+                    .expect("operator host")
+                    .engine
+                    .get_run("local", run_id)
+                    .await
+                    .expect("graph")
+                    .run_id,
+                run_id
             );
             assert!(observed.try_recv().is_err());
         }

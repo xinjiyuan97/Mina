@@ -2,30 +2,6 @@ use agent_core::{harness::ApprovalId, tool_authorization::approval_payload_schem
 use serde_json::json;
 
 #[test]
-fn pause_resume_control_is_revision_fenced_and_terminal_is_absorbing() {
-    use agent_core::effect_pipeline::{RunControl, RunControlAction, RunControlPhase};
-    let mut control = RunControl::default();
-    assert!(control.apply(0, RunControlAction::Pause));
-    assert_eq!(control.phase, RunControlPhase::Paused);
-    assert!(!control.apply(0, RunControlAction::Resume));
-    let restored: RunControl =
-        serde_json::from_value(serde_json::to_value(&control).expect("fixture operation"))
-            .expect("fixture operation");
-    assert_eq!(control, restored);
-    assert!(control.apply(1, RunControlAction::Resume));
-    assert_eq!(control.phase, RunControlPhase::Running);
-    assert!(control.apply(2, RunControlAction::Pause));
-    assert!(control.apply(3, RunControlAction::Cancel));
-    assert_eq!(control.phase, RunControlPhase::Terminal);
-    assert!(!control.apply(4, RunControlAction::Resume));
-    assert!(!control.apply(4, RunControlAction::Pause));
-    assert!(!control.apply(4, RunControlAction::Complete));
-    let mut completed = RunControl::default();
-    assert!(completed.apply(0, RunControlAction::Complete));
-    assert!(!completed.apply(1, RunControlAction::Cancel));
-}
-
-#[test]
 fn approval_facts_require_bindings_and_resolved_requires_a_real_decision() {
     let digest = format!("sha256:{}", "0".repeat(64));
     for kind in [
