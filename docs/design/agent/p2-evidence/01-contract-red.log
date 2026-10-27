@@ -1,0 +1,30 @@
+   Compiling agent-extension v0.1.0 (/data/work/Mina/crates/extension)
+   Compiling agent-harness v0.1.0 (/data/work/Mina/crates/harness)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.95s
+     Running tests/context_operator.rs (target/debug/deps/context_operator-6dbadeaa43c940b5)
+
+running 2 tests
+test p2_durable_request_survives_waiter_cancel_and_sqlite_reopen ... FAILED
+test p2_timeout_does_not_remove_durable_request ... FAILED
+
+failures:
+
+---- p2_durable_request_survives_waiter_cancel_and_sqlite_reopen stdout ----
+
+thread 'p2_durable_request_survives_waiter_cancel_and_sqlite_reopen' (531) panicked at crates/harness/tests/context_operator.rs:35:47:
+durable publish: Storage("P2 RED: not implemented")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- p2_timeout_does_not_remove_durable_request stdout ----
+
+thread 'p2_timeout_does_not_remove_durable_request' (532) panicked at crates/harness/tests/context_operator.rs:66:43:
+publish: Storage("P2 RED: not implemented")
+
+
+failures:
+    p2_durable_request_survives_waiter_cancel_and_sqlite_reopen
+    p2_timeout_does_not_remove_durable_request
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p agent-harness --test context_operator`

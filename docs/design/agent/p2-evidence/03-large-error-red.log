@@ -1,0 +1,24 @@
+   Compiling agent-harness v0.1.0 (/data/work/Mina/crates/harness)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.10s
+     Running tests/context_operator.rs (target/debug/deps/context_operator-6dbadeaa43c940b5)
+
+running 1 test
+test p2_failure_is_a_committed_fact_not_a_retry ... FAILED
+
+failures:
+
+---- p2_failure_is_a_committed_fact_not_a_retry stdout ----
+
+thread 'p2_failure_is_a_committed_fact_not_a_retry' (181) panicked at crates/harness/tests/context_operator.rs:421:9:
+assertion `left == right` failed
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    p2_failure_is_a_committed_fact_not_a_retry
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p agent-harness --test context_operator`

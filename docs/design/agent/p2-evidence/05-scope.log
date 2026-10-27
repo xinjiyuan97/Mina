@@ -1,0 +1,9 @@
+P2 scope verification
+Gateway Context/Skills business calls:
+PASS: none
+Context operator Model/Tool/operator_v1 execution:
+PASS: none
+Frozen fixtures, native machine/provider/tool and multi bus changes:
+PASS: unchanged
+Whitespace:
+PASS

@@ -1,0 +1,10 @@
+[
+  {"status": 400, "body": {"code": "invalid_run_id", "message": "run_id must be a valid UUID", "retryable": false}},
+  {"status": 404, "body": {"code": "run_not_found", "message": "the run does not exist", "retryable": false}},
+  {"status": 400, "body": {"code": "invalid_session_id", "message": "session_id must be a valid UUID", "retryable": false}},
+  {"status": 400, "body": {"code": "invalid_idempotency_key", "message": "idempotency_key must contain 1 to 256 bytes", "retryable": false}},
+  {"status": 400, "body": {"code": "invalid_input", "message": "input or attachments must not be empty", "retryable": false}},
+  {"status": 200, "body": {"run_id": "00000000-0000-0000-0000-000000000001", "approval_id": "00000000-0000-0000-0000-000000000001", "resolution": {"decision": "deny"}, "replayed": false}},
+  {"status": 200, "body": {"run_id": "00000000-0000-0000-0000-000000000001", "approval_id": "00000000-0000-0000-0000-000000000001", "resolution": {"decision": "deny"}, "replayed": true}},
+  {"status": 409, "body": {"code": "approval_already_resolved", "message": "the approval was already resolved with a different decision", "retryable": false}}
+]

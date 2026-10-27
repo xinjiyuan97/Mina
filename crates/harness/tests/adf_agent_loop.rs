@@ -1,3 +1,4 @@
+use agent_core::agent::AgentLoop;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -5,9 +6,9 @@ use std::sync::{
 
 use agent_core::{
     adf::RunScopedJavaScriptPolicy,
-    harness::{
-        AgentLoop, FinishReason, ModelEvent, ModelEventStream, ModelPort, ModelRequest,
-        RunEventKind, RunId, ToolRegistry,
+    contracts::{
+        FinishReason, ModelEvent, ModelEventStream, ModelPort, ModelRequest, RunEventKind, RunId,
+        ToolRegistry,
     },
     script::{ScriptLimits, ScriptRuntime},
 };

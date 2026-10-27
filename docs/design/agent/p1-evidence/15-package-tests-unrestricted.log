@@ -1,0 +1,356 @@
+   Compiling agent-extension v0.1.0 (/data/work/Mina/crates/extension)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.06s
+     Running unittests src/lib.rs (target/debug/deps/agent_core-b6166f0d65bcff2c)
+
+running 72 tests
+test adf::policy::tests::validates_schema_and_source_limits ... ok
+test context::strategies::tests::estimator_counts_non_ascii_and_marks_estimates ... ok
+test event_runtime::tests::publication_rejects_wildcard_topics ... ok
+test event_runtime::tests::declarative_filter_matches_topic_and_payload ... ok
+test context::strategies::tests::noop_fails_when_a_partition_exceeds_its_budget ... ok
+test harness::agent_loop::machine::tests::does_not_retry_tool_with_unknown_idempotency ... ok
+test context::strategies::tests::sliding_window_never_drops_required_context ... ok
+test adf::lock::tests::locks_source_and_manifest_digests_independently_of_generated_identity ... ok
+test harness::agent_loop::machine::tests::retries_retryable_read_only_tool_within_its_bound ... ok
+test harness::agent_loop::reducer::tests::drives_model_tool_model_without_host_specific_io ... ok
+test harness::agent_loop::reducer::tests::exposes_provider_tools_without_entering_local_tool_execution ... ok
+test harness::agent_loop::reducer::tests::exposes_reasoning_lifecycle_without_reasoning_text ... ok
+test harness::agent_loop::reducer::tests::completed_checkpoint_retains_final_answer_and_reasoning_for_next_turn ... ok
+test harness::agent_loop::reducer::tests::checkpoint_round_trip_preserves_skill_lock ... ok
+test harness::agent_loop::reducer::tests::json_dispatch_contract_round_trips ... ok
+test harness::agent_loop::reducer::tests::model_errors_are_portable_inputs ... ok
+test harness::agent_loop::reducer::tests::rejects_stale_effect_results ... ok
+test adf::policy::tests::foundational_policy_allows_only_pure_run_scoped_javascript ... ok
+test harness::agent_loop::reducer::tests::parses_empty_tool_arguments_as_an_empty_object_and_rejects_malformed_json ... ok
+test harness::agent_loop::machine::tests::tool_suspension_resumes_from_inbox_and_defers_remaining_calls ... ok
+test harness::agent_loop::machine::tests::approval_suspends_serializes_resumes_and_completes ... ok
+test harness::agent_loop::tests::numeric_review_level_can_filter_high_risk_tools ... ok
+test harness::agent_loop::tests::executes_a_risky_tool_only_after_approval ... ok
+test harness::agent_loop::tests::legacy_agent_run_returns_suspension_as_a_structured_tool_error ... ok
+test harness::agent_loop::tests::executes_a_tool_and_continues_until_the_model_finishes ... ok
+test harness::approval::tests::numeric_review_threshold_filters_tool_risk ... ok
+test harness::event::tests::cancellation_produces_a_unique_cancelled_terminal_event ... ok
+test harness::agent_loop::tests::returns_step_limit_as_tool_error_then_runs_a_tool_free_final_summary ... ok
+test harness::event::tests::sequences_events_and_preserves_one_terminal_event ... ok
+test harness::event::tests::synthesizes_a_failure_when_agent_omits_a_terminal_event ... ok
+test harness::machine::tests::checkpoint_requires_a_version_and_has_a_size_limit ... ok
+test harness::run_state::tests::allows_recovery_to_fail_an_unstarted_persisted_run ... ok
+test harness::agent_loop::tests::returns_a_rejected_risky_tool_to_the_model_without_executing_it ... ok
+test harness::run_state::tests::projects_a_complete_run ... ok
+test harness::run_state::tests::projects_the_current_tool_set_revision ... ok
+test harness::run_state::tests::rejects_sequence_gaps ... ok
+test harness::run_state::tests::projects_tool_and_approval_lifecycle ... ok
+test harness::run_state::tests::separates_model_rounds_in_flattened_output ... ok
+test harness::session::tests::projects_redacted_reasoning_without_text ... ok
+test harness::session::tests::projects_ordered_reasoning_tools_approvals_and_text ... ok
+test harness::single_turn::tests::executes_one_task_through_the_model_port ... ok
+test harness::single_turn::tests::keeps_reasoning_separate_from_assistant_text ... ok
+test harness::tests::harness_executes_an_agent ... ok
+test harness::tests::harness_rejects_empty_input ... ok
+test harness::tests::harness_streams_sequenced_events ... ok
+test harness::tests::harness_validates_per_run_step_limits ... ok
+test harness::title::tests::completes_without_touching_conversation_history ... ok
+test harness::title::tests::manual_title_lock_discards_a_late_result ... ok
+test harness::title::tests::short_source_is_deferred ... ok
+test harness::title::tests::title_effect_is_tool_free_and_idempotent ... ok
+test harness::tool::tests::preserves_declared_tool_risk ... ok
+test harness::tool::tests::preserves_retry_guidance_for_external_tools ... ok
+test harness::tool::tests::registers_and_dispatches_a_validated_tool ... ok
+test harness::tool::tests::rejects_automatic_retries_without_idempotency ... ok
+test harness::tool::tests::rejects_duplicate_names ... ok
+test harness::tool::tests::rejects_invalid_arguments_before_dispatch ... ok
+test harness::tool::tests::rejects_parallel_tools_that_can_suspend ... ok
+test harness::tool::tests::reports_an_unknown_tool ... ok
+test script::contract::tests::request_limits_cannot_raise_the_host_ceiling ... ok
+test script::contract::tests::resolved_artifacts_expose_the_locked_digest ... ok
+test skill::runtime::tests::skill_compilation_and_lock_serialization_are_deterministic ... ok
+test tool::contract::tests::rejects_duplicate_tools_and_unknown_versions ... ok
+test harness::agent_loop::tests::fails_when_a_model_round_exceeds_its_deadline ... ok
+test tool::contract::tests::uses_stable_tagged_result_envelopes ... ok
+test tool::contract::tests::validates_and_round_trips_a_plugin_manifest ... ok
+test harness::event::tests::run_deadline_produces_a_unique_timeout_failure ... ok
+test harness::agent_loop::tests::returns_tool_timeouts_to_the_model_and_continues ... ok
+test harness::single_turn::tests::fails_when_the_model_exceeds_its_deadline ... ok
+test tool::contract::tests::rust_envelopes_match_the_published_json_schemas ... ok
+test harness::agent_loop::machine::tests::overlaps_parallel_safe_tools_but_preserves_model_result_order ... ok
+test harness::agent_loop::machine::tests::keeps_exclusive_tools_out_of_parallel_batches ... ok
+test harness::agent_loop::tests::legacy_agent_overlaps_parallel_safe_tools_and_preserves_result_order ... ok
+
+test result: ok. 72 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/operator_contract.rs (target/debug/deps/operator_contract-e60faa10b6e3a2d9)
+
+running 4 tests
+test sequence_domains_are_distinct ... ok
+test rejects_unknown_versions_and_invalid_identity ... ok
+test rejects_schema_and_delivery_mismatch ... ok
+test stable_wire_roundtrip_and_exact_utf8_limit ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/debug/deps/agent_extension-306151c422530062)
+
+running 81 tests
+test adf::store::tests::stores_lists_and_deactivates_a_locked_artifact ... ok
+test adf::store::tests::idempotency_replays_identical_content_and_rejects_conflicts ... ok
+test artifact::docx::tests::reports_body_bookmark_and_relationship_reference_errors ... ok
+test artifact::xlsx::tests::reports_sheet_and_shared_string_errors ... ok
+test context::tests::summarizes_context_through_the_model_port ... ok
+test observability::tests::machine_middleware_records_approval_and_activation_outcome ... ok
+test observability::tests::model_middleware_records_time_to_first_token ... ok
+test observability::tests::model_middleware_records_one_generation_without_content ... ok
+test output::tests::allocates_a_new_text_block_after_a_tool ... ok
+test output::tests::cancelled_and_failed_are_different_wire_events ... ok
+test artifact::docx::tests::validates_unpacked_and_zipped_documents ... ok
+test output::tests::frame_rules_are_monotonic_heartbeat_free_and_idempotent ... ok
+test output::tests::client_reducer_replay_preserves_text_and_tool_order ... ok
+test output::tests::maps_all_terminal_reasons_and_keeps_cancelled_distinct ... ok
+test output::tests::maps_text_and_reasoning_with_stable_blocks ... ok
+test output::tests::maps_tool_argument_execution_output_and_permission_resolution ... ok
+test output::tests::server_hello_matches_spec_fixture_byte_for_byte ... ok
+test output::tests::unimplemented_resume_must_not_be_declared ... ok
+test output::tests::unknown_diagnostic_path_is_non_panicking ... ok
+test output::tests::maps_tools_permission_usage_and_errors ... ok
+test provider::openai::tests::maps_authentication_errors_without_exposing_response_bodies ... ok
+test provider::anthropic::tests::maps_tool_history_to_messages_blocks ... ok
+test provider::openai::tests::maps_blob_references_to_multimodal_content_parts ... ok
+test provider::openai::tests::normalizes_streaming_tool_call_fragments ... ok
+test provider::openai::tests::maps_normalized_request_to_streaming_chat_json ... ok
+test provider::openai::tests::prefers_complete_provider_usage_and_estimates_missing_fields ... ok
+test provider::responses::tests::maps_provider_neutral_messages_to_responses_input_items ... ok
+test artifact::xlsx::tests::validates_unpacked_and_zipped_workbooks ... ok
+test observability::tests::async_hook_batches_retries_and_flushes_on_shutdown ... ok
+test provider::openai::tests::streams_an_openai_compatible_chat_completion ... ok
+test provider::anthropic::tests::normalizes_messages_sse ... ok
+test provider::responses::tests::normalizes_responses_sse ... ok
+test artifact::pptx::tests::validates_unpacked_and_zipped_presentations ... ok
+test artifact::pptx::tests::reports_format_and_package_errors ... ok
+test sandbox::tests::host_adapter_reports_no_isolation_and_executes_directly ... ok
+test store::blob::tests::round_trips_blob_bytes_and_metadata ... ok
+test store::memory::tests::in_memory_adapter_obeys_store_contract ... ok
+test store::event::tests::persists_matches_claims_and_deduplicates_events ... ok
+test store::event::tests::flow_activation_lease_renewal_is_owned_and_fenced ... ok
+test store::memory::tests::sqlite_adapter_obeys_store_contract_and_retrieves_with_fts ... ok
+test store::event::tests::expired_delivery_lease_is_reclaimed_after_reopen ... ok
+test store::event::tests::flow_effect_outbox_reclaims_retries_and_completes_after_reopen ... ok
+test store::job::tests::job_execution_and_notification_leases_survive_reopen ... ok
+test store::event::tests::beginning_subscription_replays_history_and_timer_is_restart_safe ... ok
+test store::event::tests::suspended_flow_wakes_and_resumes_after_store_reopen ... ok
+test store::run::tests::identical_event_append_is_idempotent ... ok
+test store::skill::tests::filesystem_store_lists_and_loads_digest_locked_packages ... ok
+test store::skill::tests::filesystem_store_rejects_symlinked_resources ... ok
+test store::run::tests::event_batch_commits_one_complete_projection ... ok
+test store::run::tests::invalid_event_batch_rolls_back_every_event ... ok
+test store::workspace_skill::tests::ignores_staging_and_pending_install_directories ... ok
+test tool::catalog::tests::office_checkers_can_be_enabled_together ... ok
+test tool::catalog::tests::pptx_checker_requires_explicit_host_opt_in ... ok
+test tool::catalog::tests::safe_catalog_excludes_command_execution ... ok
+test tool::docx::tests::definition_is_read_only_and_parallel_safe ... ok
+test tool::catalog::tests::terminal_execution_requires_explicit_host_opt_in ... ok
+test tool::docx::tests::invalid_package_is_a_successful_report_and_traversal_is_rejected ... ok
+test store::workspace_skill::tests::lists_routes_and_reads_digest_locked_package_resources ... ok
+test tool::filesystem::tests::rejects_host_protected_secret_paths ... ok
+test tool::filesystem::tests::edit_rejects_ambiguous_matches ... ok
+test tool::filesystem::tests::reads_utf8_files_inside_the_workspace ... ok
+test tool::filesystem::tests::rejects_parent_directory_traversal ... ok
+test tool::job::tests::produces_one_atomic_job_wait_and_effect ... ok
+test tool::job::tests::rejects_job_kinds_outside_the_host_allowlist ... ok
+test tool::pptx::tests::definition_is_read_only_and_bounded ... ok
+test tool::filesystem::tests::rejects_symlinks_that_escape_the_workspace ... ok
+test tool::pptx::tests::rejects_paths_outside_the_workspace ... ok
+test tool::pptx::tests::invalid_package_is_a_successful_structured_report ... ok
+test tool::search::tests::tool_accepts_a_replaceable_external_backend_and_uses_its_risk ... ok
+test tool::xlsx::tests::definition_is_read_only_and_parallel_safe ... ok
+test tool::filesystem::tests::writes_and_edits_workspace_files_with_medium_risk ... ok
+test tool::xlsx::tests::invalid_package_is_a_successful_report_and_traversal_is_rejected ... ok
+test workspace::contract::tests::normalizes_portable_workspace_paths ... ok
+test store::run::tests::rejects_sequence_gaps_without_partial_writes ... ok
+test store::run::tests::lists_durable_sessions_by_activity_and_status ... ok
+test tool::search::tests::workspace_backend_returns_structured_matches_and_skips_secrets ... ok
+test workspace::native::tests::rejects_symlink_escape_and_symlink_mutation ... ok
+test workspace::native::tests::reads_writes_lists_and_renames_inside_root ... ok
+test store::run::tests::persists_snapshots_and_events_across_reopen ... ok
+test store::run::tests::session_begin_finalize_and_reopen_are_atomic_and_idempotent ... ok
+test store::run::tests::version_five_migration_restores_structured_session_content ... ok
+
+test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running tests/context_engine.rs (target/debug/deps/context_engine-a8e4017f1230b835)
+
+running 1 test
+test builds_deterministic_context_from_session_memory_and_contracts ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/operator_fabric_contract.rs (target/debug/deps/operator_fabric_contract-8240ba5cf1a41ab5)
+
+running 26 tests
+test memory::crashed_workers_eventually_dlq ... ok
+test memory::fencing ... ok
+test memory::retry_dlq ... ok
+test memory::single_publish ... ok
+test memory::outbox_batch_visibility ... ok
+test memory::holes_and_order ... ok
+test memory::stable_offsets_across_partitions ... ok
+test memory::filters_and_receipts ... ok
+test memory::batch_atomic ... ok
+test memory::transaction ... ok
+test sqlite::batch_atomic ... ok
+test sqlite::outbox_batch_visibility ... ok
+test sqlite::fencing ... ok
+test sqlite::holes_and_order ... ok
+test sqlite::crashed_workers_eventually_dlq ... ok
+test sqlite::filters_and_receipts ... ok
+test sqlite::retry_dlq ... ok
+test sqlite::single_publish ... ok
+test sqlite::stable_offsets_across_partitions ... ok
+test memory::bounds ... ok
+test sqlite::transaction ... ok
+test sqlite_dlq_survives_reopen ... ok
+test sqlite_independent_connections_serialize_claims_and_publish ... ok
+test sqlite::bounds ... ok
+test sqlite_reopen_kill_points ... ok
+test sqlite_sql_write_before_commit_failure_rolls_back_everything ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/sqlite_concurrency.rs (target/debug/deps/sqlite_concurrency-0f704e9aef8b7fcf)
+
+running 1 test
+test run_and_memory_queries_progress_during_batched_event_writes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/terminal_tools.rs (target/debug/deps/terminal_tools-ffaaf611639ee451)
+
+running 9 tests
+test terminal_definitions_match_runtime_boundaries ... ok
+test apply_patch_rejects_symlink_destinations ... ok
+test apply_patch_mutates_workspace_and_rejects_unsafe_paths ... ok
+test catalog_registers_terminal_tools_without_request_permissions_bypass ... ok
+test shell_command_executes_with_timeout_and_bounded_output ... ok
+test session_timeout_and_invalid_write_are_structured ... ok
+test sandbox_session_termination_and_cancellation_are_real ... ok
+test terminal_environment_is_allowlisted_and_timeout_kills_descendants ... ok
+test session_supports_write_poll_close_and_structured_lifecycle_errors ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.03s
+
+     Running unittests src/lib.rs (target/debug/deps/agent_harness-dd1b023ad9772854)
+
+running 25 tests
+test config::tests::redacts_literal_api_keys ... ok
+test config::tests::defaults_to_text_modalities ... ok
+test config::tests::maps_parallel_safe_tool_call_strategy ... ok
+test config::tests::maps_and_normalizes_openai_compatible_config ... ok
+test config::tests::rejects_adf_when_no_script_runtime_is_enabled ... ok
+test config::tests::maps_and_validates_numeric_review_level ... ok
+test config::tests::defaults_to_the_native_agent_loop_and_rejects_removed_kinds ... ok
+test config::tests::rejects_an_unknown_default_model ... ok
+test config::tests::validates_agent_timeouts ... ok
+test config::tests::selects_responses_and_anthropic_messages_protocols ... ok
+test run_runtime::tests::cancellation_reaches_a_durable_terminal_state ... ok
+test run_runtime::tests::execution_is_owned_by_runtime_and_persisted_without_a_subscriber ... ok
+test run_runtime::tests::startup_recovery_marks_unfinished_runs_as_interrupted ... ok
+test runtime::tests::executes_an_agent ... ok
+test script::flow::tests::job_flow_materializes_only_allowlisted_job_kinds ... ok
+test script::quickjs::tests::rejects_non_json_results ... ok
+test script::flow::tests::timer_flow_uses_fresh_context_and_resumes_from_json_checkpoint ... ok
+test script::quickjs::tests::verifies_locked_source_digests ... ok
+test adf::runtime::tests::executes_a_locked_javascript_artifact_through_the_script_port ... ok
+test script::quickjs::tests::validates_and_executes_a_json_module ... ok
+test script::quickjs::tests::interrupts_an_infinite_loop ... ok
+test run_runtime::tests::durable_wait_survives_runtime_and_sqlite_reopen_then_resumes ... ok
+test run_runtime::tests::real_agent_loop_approval_resumes_after_runtime_restart ... ok
+test run_runtime::tests::live_deltas_do_not_wait_for_persistence_and_writes_are_batched ... ok
+test run_runtime::tests::heartbeat_prevents_reclaim_during_a_long_activation ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+
+     Running tests/adf_agent_loop.rs (target/debug/deps/adf_agent_loop-3e03c44431cfcb07)
+
+running 2 tests
+test run_adf_grant_is_required_to_expose_management_tools ... ok
+test agent_defines_a_tool_then_sees_and_invokes_it_on_the_next_step ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/async_job_agent_loop.rs (target/debug/deps/async_job_agent_loop-8f1264402f0e0f77)
+
+running 1 test
+test async_job_survives_store_and_agent_reconstruction_then_resumes_once ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/javascript_agent_loop.rs (target/debug/deps/javascript_agent_loop-fc88c03af679fee2)
+
+running 1 test
+test model_generated_eval_without_input_completes_the_agent_loop ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/operator_compat.rs (target/debug/deps/operator_compat-918284a8dbdf5b0f)
+
+running 3 tests
+test legacy_publish_keeps_names_payload_and_only_storage_sequence ... ok
+test public_event_sequence_is_not_an_operator_or_delta_sequence ... ok
+test every_reducer_effect_has_an_offline_target_and_phase ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/operator_fabric_runtime.rs (target/debug/deps/operator_fabric_runtime-daf2b14dffdbf2bc)
+
+running 4 tests
+test coordinator_checks_time_after_handler ... ok
+test coordinator_backoff_then_dlq ... ok
+test coordinator_commits_once_for_duplicate_deliveries ... ok
+test coordinator_sqlite_receipt_survives_reopen ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/quickjs_flow.rs (target/debug/deps/quickjs_flow-8bc089d7bac487e8)
+
+running 2 tests
+test javascript_timer_flow_reopens_fires_and_resumes ... ok
+test javascript_job_flow_reopens_executes_once_and_resumes ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running unittests src/main.rs (target/debug/deps/mina_server-4c95c61f67f3e721)
+
+running 12 tests
+test tests::approval_broker_resolves_and_replays_the_same_decision ... ok
+test p0_contract_tests::p0_all_sse_names_payloads_and_error_frame_fixture ... ok
+test tests::approval_endpoint_resumes_a_pending_request ... ok
+test tests::composes_the_agent_loop_with_tools_from_toml ... ok
+test tests::cancel_endpoint_rejects_invalid_or_inactive_run_ids ... ok
+test p0_contract_tests::p0_session_submit_idempotency_busy_and_cancel_fixture ... ok
+test tests::per_run_step_limit_defaults_to_and_cannot_exceed_the_host_limit ... ok
+test p0_contract_tests::p0_error_and_approval_fixtures ... ok
+test tests::web_backend_drives_responses_through_the_core_reducer ... ok
+test p0_contract_tests::p0_runs_stream_nonstream_replay_follow_fixture ... ok
+test tests::durable_job_completion_event_wakes_a_suspended_flow ... ok
+test tests::durable_memory_approval_event_writes_the_memory ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+   Doc-tests agent_core
+
+running 4 tests
+test crates/core/src/operator.rs - operator (line 12) - compile fail ... ok
+test crates/core/src/operator.rs - operator (line 8) - compile fail ... ok
+test crates/core/src/operator.rs - operator (line 4) - compile fail ... ok
+test crates/core/src/operator.rs - operator (line 16) - compile fail ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+   Doc-tests agent_extension
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests agent_harness
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

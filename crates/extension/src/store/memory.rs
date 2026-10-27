@@ -969,7 +969,7 @@ async fn run_blocking<T: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use agent_core::harness::ContentPart;
+    use agent_core::contracts::ContentPart;
     use agent_core::memory::{MemoryScope, MemorySourceRef};
     use tempfile::tempdir;
 

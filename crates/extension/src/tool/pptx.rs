@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use agent_core::harness::{
+use agent_core::contracts::{
     Tool, ToolCallFuture, ToolCallRequest, ToolConcurrency, ToolDefinition, ToolError,
     ToolExecutionPolicy, ToolOutput, ToolRetryPolicy,
 };
@@ -107,7 +107,7 @@ fn check_failed() -> ToolError {
 
 #[cfg(test)]
 mod tests {
-    use agent_core::harness::{RunCancellation, RunId, ToolRiskLevel};
+    use agent_core::contracts::{RunCancellation, RunId, ToolRiskLevel};
     use serde_json::{Value, json};
     use tempfile::tempdir;
 

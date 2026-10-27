@@ -191,7 +191,7 @@ mod tests {
             ADF_CONTRACT_VERSION, AdfArtifact, AdfArtifactRef, AdfExecutionMode, AdfId, AdfOwner,
             LockedAdfDefinition,
         },
-        harness::{RunCancellation, RunId},
+        contracts::{RunCancellation, RunId},
         tool::ToolRiskLevel,
     };
 

@@ -4,7 +4,7 @@ use agent_core::context::{
     ContextArtifactStore, ContextBudget, ContextBuildRequest, ContextCompressor, ContextEngine,
     HeuristicTokenEstimator, InMemoryContextArtifactStore, SlidingWindowCompressor, TokenEstimator,
 };
-use agent_core::harness::{
+use agent_core::contracts::{
     BeginSessionRun, ContentPart, CreateSession, FinalizeSessionRun, FinishReason, RunEvent,
     RunEventKind, RunSnapshot, RunStore, SessionId, SessionStore,
 };
@@ -29,7 +29,7 @@ async fn builds_deterministic_context_from_session_memory_and_contracts() {
         })
         .await
         .expect("session should be created");
-    let first_run = agent_core::harness::RunId::new();
+    let first_run = agent_core::contracts::RunId::new();
     sessions
         .begin_run(
             BeginSessionRun {
@@ -55,7 +55,7 @@ async fn builds_deterministic_context_from_session_memory_and_contracts() {
                 first_run,
                 2,
                 RunEventKind::OutputDelta {
-                    channel: agent_core::harness::OutputChannel::AssistantText,
+                    channel: agent_core::contracts::OutputChannel::AssistantText,
                     delta: "first answer".into(),
                 },
             ),
@@ -112,7 +112,8 @@ async fn builds_deterministic_context_from_session_memory_and_contracts() {
         Arc::new(InMemoryContextArtifactStore::default());
     let engine = ContextEngine::new(sessions, memories, compressor, artifacts);
     let request = ContextBuildRequest {
-        run_id: agent_core::harness::RunId::new(),
+        prior_messages: vec![],
+        run_id: agent_core::contracts::RunId::new(),
         session_id: Some(session_id),
         through_message_ordinal: Some(finalized.next_message_ordinal - 1),
         current_input: "second concise question".into(),
@@ -139,7 +140,36 @@ async fn builds_deterministic_context_from_session_memory_and_contracts() {
         .build(request.clone())
         .await
         .expect("context should build");
-    let replay = engine.build(request).await.expect("replay should build");
+    let replay = engine
+        .build(request.clone())
+        .await
+        .expect("replay should build");
+    let mut supplied = request;
+    supplied.session_id = None;
+    supplied.through_message_ordinal = None;
+    supplied.prior_messages = vec![
+        agent_core::contracts::ModelMessage::user("old ".repeat(3000)),
+        agent_core::contracts::ModelMessage::user("recent question"),
+    ];
+    supplied.budget.max_history_tokens = 32;
+    let bounded = engine
+        .build(supplied.clone())
+        .await
+        .expect("supplied history fits after trimming");
+    assert!(
+        bounded
+            .messages
+            .iter()
+            .any(|m| m.content == "recent question")
+    );
+    assert!(
+        !bounded
+            .messages
+            .iter()
+            .any(|m| m.content.starts_with("old old"))
+    );
+    supplied.session_id = Some(session_id);
+    assert!(engine.build(supplied).await.is_err());
 
     let rendered = first
         .messages

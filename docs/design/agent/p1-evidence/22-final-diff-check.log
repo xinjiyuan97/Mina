@@ -1,0 +1,4 @@
+tracked diff check exit=0
+new-file whitespace check failures=0 (no-index exit 1 denotes added content)
+feat/event-driven-operator-pipeline
+4c17d95 feat: freeze event operator contracts

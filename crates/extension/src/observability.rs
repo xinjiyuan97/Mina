@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use agent_core::harness::{
+use agent_core::contracts::{
     Agent, AgentEvent, AgentEventStream, AgentMachine, AgentMetadata, ApprovalDecision,
     CheckpointEnvelope, MachineError, MachineOutput, MachineResumeRequest, MachineStartRequest,
     MachineStream, ModelEvent, ModelEventStream, ModelPort, ModelRequest, RunRequest, StepOutcome,
@@ -541,7 +541,7 @@ where
 
     fn tool_set_snapshot(
         &self,
-        run_id: agent_core::harness::RunId,
+        run_id: agent_core::contracts::RunId,
     ) -> Result<ToolSetSnapshot, ToolError> {
         self.inner.tool_set_snapshot(run_id)
     }
@@ -554,13 +554,13 @@ where
         &self,
         name: &str,
         arguments: &serde_json::Value,
-    ) -> Result<(), agent_core::harness::ToolError> {
+    ) -> Result<(), agent_core::contracts::ToolError> {
         self.inner.validate(name, arguments)
     }
 
     fn validate_at(
         &self,
-        run_id: agent_core::harness::RunId,
+        run_id: agent_core::contracts::RunId,
         tool_set_revision: u64,
         name: &str,
         arguments: &serde_json::Value,
@@ -579,7 +579,7 @@ where
         self.observe_call(request, future)
     }
 
-    fn close_run(&self, run_id: agent_core::harness::RunId) {
+    fn close_run(&self, run_id: agent_core::contracts::RunId) {
         self.inner.close_run(run_id);
     }
 }
@@ -1035,13 +1035,13 @@ const fn approval_decision_name(decision: ApprovalDecision) -> &'static str {
     }
 }
 
-const fn finish_reason_name(reason: agent_core::harness::FinishReason) -> &'static str {
+const fn finish_reason_name(reason: agent_core::contracts::FinishReason) -> &'static str {
     match reason {
-        agent_core::harness::FinishReason::Stop => "stop",
-        agent_core::harness::FinishReason::Length => "length",
-        agent_core::harness::FinishReason::ToolCall => "tool_call",
-        agent_core::harness::FinishReason::ContentFilter => "content_filter",
-        agent_core::harness::FinishReason::Unknown => "unknown",
+        agent_core::contracts::FinishReason::Stop => "stop",
+        agent_core::contracts::FinishReason::Length => "length",
+        agent_core::contracts::FinishReason::ToolCall => "tool_call",
+        agent_core::contracts::FinishReason::ContentFilter => "content_filter",
+        agent_core::contracts::FinishReason::Unknown => "unknown",
         _ => "unknown",
     }
 }
@@ -1053,7 +1053,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use agent_core::harness::{
+    use agent_core::contracts::{
         ApprovalId, ApprovalResolution, FinishReason, ModelEvent, ModelEventStream, ModelMessage,
         ModelRequest, RunId, TokenUsage, TokenUsageSource,
     };

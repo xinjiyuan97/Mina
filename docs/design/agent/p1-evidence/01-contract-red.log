@@ -1,0 +1,148 @@
+   Compiling agent-core v0.1.0 (/data/work/Mina/crates/core)
+   Compiling agent-extension v0.1.0 (/data/work/Mina/crates/extension)
+warning: unused import: `super::*`
+   --> crates/extension/tests/operator_fabric_contract.rs:203:17
+    |
+203 |             use super::*;
+    |                 ^^^^^^^^
+...
+213 | contracts!(single_publish, batch_atomic, holes_and_order, fencing, transaction, retry_dlq, filters_and_receipts, bounds);
+    | ------------------------------------------------------------------------------------------------------------------------ in this macro invocation
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+    = note: this warning originates in the macro `contracts` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `agent-extension` (test "operator_fabric_contract") generated 1 warning (run `cargo fix --test "operator_fabric_contract" -p agent-extension` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.17s
+     Running tests/operator_fabric_contract.rs (target/debug/deps/operator_fabric_contract-930451f6e8e496c3)
+
+running 17 tests
+test memory::filters_and_receipts ... FAILED
+test memory::single_publish ... FAILED
+test memory::retry_dlq ... FAILED
+test memory::bounds ... FAILED
+test memory::fencing ... FAILED
+test memory::batch_atomic ... FAILED
+test memory::holes_and_order ... FAILED
+test memory::transaction ... FAILED
+test sqlite::batch_atomic ... FAILED
+test sqlite::retry_dlq ... FAILED
+test sqlite::single_publish ... FAILED
+test sqlite::bounds ... FAILED
+test sqlite::filters_and_receipts ... FAILED
+test sqlite::holes_and_order ... FAILED
+test sqlite::fencing ... FAILED
+test sqlite::transaction ... FAILED
+test sqlite_reopen_kill_points ... FAILED
+
+failures:
+
+---- memory::filters_and_receipts stdout ----
+
+thread 'memory::filters_and_receipts' (599) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- memory::single_publish stdout ----
+
+thread 'memory::single_publish' (602) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+
+---- memory::retry_dlq stdout ----
+
+thread 'memory::retry_dlq' (601) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+
+---- memory::bounds stdout ----
+
+thread 'memory::bounds' (597) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+
+---- memory::fencing stdout ----
+
+thread 'memory::fencing' (598) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+
+---- memory::batch_atomic stdout ----
+
+thread 'memory::batch_atomic' (596) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+
+---- memory::holes_and_order stdout ----
+
+thread 'memory::holes_and_order' (600) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+
+---- memory::transaction stdout ----
+
+thread 'memory::transaction' (603) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+
+---- sqlite::batch_atomic stdout ----
+
+thread 'sqlite::batch_atomic' (604) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+
+---- sqlite::retry_dlq stdout ----
+
+thread 'sqlite::retry_dlq' (609) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+
+---- sqlite::single_publish stdout ----
+
+thread 'sqlite::single_publish' (610) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+
+---- sqlite::bounds stdout ----
+
+thread 'sqlite::bounds' (605) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+
+---- sqlite::filters_and_receipts stdout ----
+
+thread 'sqlite::filters_and_receipts' (607) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+
+---- sqlite::holes_and_order stdout ----
+
+thread 'sqlite::holes_and_order' (608) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+
+---- sqlite::fencing stdout ----
+
+thread 'sqlite::fencing' (606) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+
+---- sqlite::transaction stdout ----
+
+thread 'sqlite::transaction' (611) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+
+---- sqlite_reopen_kill_points stdout ----
+
+thread 'sqlite_reopen_kill_points' (620) panicked at crates/extension/tests/operator_fabric_contract.rs:26:83:
+subscribe: Storage("P1 RED: not implemented")
+
+
+failures:
+    memory::batch_atomic
+    memory::bounds
+    memory::fencing
+    memory::filters_and_receipts
+    memory::holes_and_order
+    memory::retry_dlq
+    memory::single_publish
+    memory::transaction
+    sqlite::batch_atomic
+    sqlite::bounds
+    sqlite::fencing
+    sqlite::filters_and_receipts
+    sqlite::holes_and_order
+    sqlite::retry_dlq
+    sqlite::single_publish
+    sqlite::transaction
+    sqlite_reopen_kill_points
+
+test result: FAILED. 0 passed; 17 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+error: test failed, to rerun pass `-p agent-extension --test operator_fabric_contract`

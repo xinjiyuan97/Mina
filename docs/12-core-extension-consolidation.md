@@ -1,5 +1,7 @@
 # Core / Harness / Extension 三包边界
 
+> 当前分支的运行时分层已更新：单 Agent 引擎集中在 Core，多 Agent 编排在 Harness，Legacy 执行器已移除。新 API 与迁移边界见 [Operator-only API](design/agent/operator-only-api.md)。下文保留原设计背景。
+
 > 状态：物理拆分已完成。Workspace 保留三个产品级内部库，不继续拆成 `agent-script`、`agent-event`、`agent-job` 等细粒度 crate。
 
 ## 1. 目标依赖方向

@@ -6,7 +6,7 @@ import { createRequire } from 'node:module'
 const ssePath = process.argv[2] ?? join(import.meta.dirname, 'fixtures/frame-shapes.sse')
 const temp = mkdtempSync(join(tmpdir(), 'mina-frame-shapes-'))
 try {
-  symlinkSync('/data/work/mina-chat/apps/web/node_modules', join(temp, 'node_modules'), 'dir')
+  symlinkSync(join(import.meta.dirname, '../apps/web/node_modules'), join(temp, 'node_modules'), 'dir')
   const require = createRequire(join(temp, 'runner.cjs'))
   const core = require('@xinjiyuan97/chat-core')
   const applyEvent = core.applyEvent

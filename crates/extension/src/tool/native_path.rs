@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use agent_core::harness::ToolError;
+use agent_core::contracts::ToolError;
 
 /// Native path resolver used only by process and native-only package tools.
 /// Portable file tools use `crate::workspace::WorkspaceFs` instead.

@@ -234,6 +234,11 @@ adapter 将内部 `ModelRequest` 映射为 `model`、`messages`、`max_tokens`�
 
 Composer 附件先上传到 `POST /api/v1/blobs`。文件系统 BlobStore 保存二进制和 metadata，Session 消息、Run、checkpoint 与上下文历史只携带 `BlobId`；provider adapter 在请求即将发出时读取并转换为 data URL 或 base64 source。因此 SQLite 不会按 token/chunk 重复保存图片，刷新后的附件也能回放。当前每个文件上限 10 MiB、每次 Run 上限 8 个，Server 还会依据模型 profile 的 `modalities.input` 拒绝不支持的 image/audio/video/document。
 
+P6 已将该输入链路接入 `operator_v1_text` 和 `operator_v1_tools`，支持纯附件输入与持久化恢复。
+附件身份（含顺序、名称和可用 size）进入请求/Context/重放判断。Provider 的能力并不等价：
+Responses 的 audio/video 只映射 generic file，Chat 拒绝 video，Anthropic 只接受图片/PDF。
+完整能力矩阵、错误契约和 GC 边界见 `design/agent/p6-multimodal-inputs.md`；本轮没有多模态输出。
+
 协议依据：[OpenAI Chat Completions Streaming Events](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)。
 
 ## 8. 配置和运行模式

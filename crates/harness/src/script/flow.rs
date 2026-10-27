@@ -9,12 +9,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use agent_core::{
-    event_runtime::{
+    contracts::events::{
         CreateSubscription, DeliveryTarget, EventFilter, EventId, EventSource, PublishEvent,
         ScheduleOnce, StartPosition, SubscriptionId, SubscriptionMode, SubscriptionOwner,
         SubscriptionScope, TimerId,
     },
-    harness::{
+    contracts::{
         Agent, AgentEvent, AgentEventStream, AgentMachine, AgentMetadata, CheckpointCodec,
         CheckpointEnvelope, EffectRequest, FinishReason, FlowInboxItem, JobId, MachineError,
         MachineOutput, MachineResumeRequest, MachineStartRequest, MachineStream, OutputChannel,
@@ -241,12 +241,12 @@ fn drive_javascript_activation(
     module: ScriptModuleRef,
     limits: ScriptLimits,
     policy: JavaScriptFlowPolicy,
-    run_id: agent_core::harness::RunId,
+    run_id: agent_core::contracts::RunId,
     checkpoint: JavaScriptFlowCheckpoint,
     purpose: ScriptPurpose,
     input: Value,
     activated_at_ms: i64,
-    cancellation: agent_core::harness::RunCancellation,
+    cancellation: agent_core::contracts::RunCancellation,
 ) -> MachineStream {
     Box::pin(stream! {
         if cancellation.is_cancelled() {
@@ -496,7 +496,7 @@ enum EffectReference {
 }
 
 fn materialize_outcome(
-    run_id: agent_core::harness::RunId,
+    run_id: agent_core::contracts::RunId,
     checkpoint: JavaScriptFlowCheckpoint,
     outcome: JavaScriptFlowOutcome,
     activated_at_ms: i64,
@@ -578,7 +578,7 @@ fn materialize_outcome(
 }
 
 fn materialize_effects(
-    run_id: agent_core::harness::RunId,
+    run_id: agent_core::contracts::RunId,
     step: u64,
     effects: Vec<JavaScriptFlowEffect>,
     activated_at_ms: i64,
@@ -627,7 +627,7 @@ fn materialize_effects(
                     recorded_at_ms: activated_at_ms,
                     payload,
                 };
-                agent_core::event_runtime::validate_publish(&command).map_err(|error| {
+                agent_core::contracts::events::validate_publish(&command).map_err(|error| {
                     machine_error("script_flow_invalid_effect", error.to_string(), false)
                 })?;
                 output.push(EffectRequest::PublishEvent { command });
@@ -719,7 +719,7 @@ fn materialize_effects(
 }
 
 fn materialize_waits(
-    run_id: agent_core::harness::RunId,
+    run_id: agent_core::contracts::RunId,
     step: u64,
     waits: Vec<JavaScriptFlowWait>,
     activated_at_ms: i64,
@@ -1018,8 +1018,8 @@ mod tests {
     use super::*;
     use crate::script::QuickJsRuntime;
     use agent_core::{
-        event_runtime::EventEnvelope,
-        harness::{ActivationId, FlowInboxItem, RunCancellation, RunId},
+        contracts::events::EventEnvelope,
+        contracts::{ActivationId, FlowInboxItem, RunCancellation, RunId},
     };
 
     fn resolved_source(source: &str) -> ScriptSource {

@@ -1,6 +1,6 @@
 use std::{future::Future, pin::Pin};
 
-use crate::harness::{ContentPart, RunId, SessionId};
+use crate::contracts::{ContentPart, RunId, SessionId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;

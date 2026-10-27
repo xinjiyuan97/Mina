@@ -1,11 +1,11 @@
 use std::{collections::BTreeSet, time::SystemTime};
 
 use agent_core::{
-    event_runtime::{
+    contracts::events::{
         CreateSubscription, DeliveryTarget, EventFilter, EventSource, StartPosition,
         SubscriptionId, SubscriptionMode, SubscriptionOwner, SubscriptionScope,
     },
-    harness::{
+    contracts::{
         EffectRequest, JobId, StartJob, Tool, ToolArgumentVisibility, ToolCallFuture,
         ToolCallRequest, ToolCompletion, ToolDefinition, ToolError, ToolErrorCategory,
         ToolExecutionPolicy, ToolOutput, ToolRiskLevel, WaitSpec,
@@ -184,7 +184,7 @@ fn unix_time_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use agent_core::harness::{RunCancellation, RunId};
+    use agent_core::contracts::{RunCancellation, RunId};
 
     use super::*;
 

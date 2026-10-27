@@ -1,0 +1,39 @@
+Gateway Context/Skills business orchestration:
+PASS: none
+Context operator Model/Tool/operator_v1 execution:
+PASS: none
+P0 fixture, RunEvent projection, native machine, provider, tool, multi bus changes:
+PASS: unchanged
+Pinned engine and explicit legacy bridge:
+apps/server/src/main.rs:1507:    let started = match state.runtime.start_context_plan(prepared.plan, false).await {
+apps/server/src/main.rs:1768:    let started = match state.runtime.start_context_plan(prepared.plan, true).await {
+apps/server/src/admission.rs:141:                    .start_context_plan(legacy_plan(request, prepared), persisted)
+crates/harness/src/run_runtime.rs:190:    /// P2-only idempotent bridge; the existing flow row is the durable start receipt.
+crates/harness/src/run_runtime.rs:191:    pub async fn start_context_plan(
+crates/harness/src/run_runtime.rs:1856:                    runtime.start_context_plan(plan(), persisted),
+crates/harness/src/run_runtime.rs:1857:                    runtime.start_context_plan(plan(), persisted)
+crates/harness/src/run_runtime.rs:1884:                .start_context_plan(plan(), persisted)
+crates/harness/src/context_operator.rs:298:                || delivery.event.envelope.engine_version != EngineVersion::LegacyMachine
+crates/harness/src/context_operator.rs:373:            engine_version: EngineVersion::LegacyMachine,
+crates/harness/src/context_operator.rs:486:pub fn legacy_plan(request: ContextRequest, prepared: PreparedContext) -> PlannedRun {
+Changed files:
+apps/server/src/main.rs
+crates/core/src/lib.rs
+crates/core/src/operator_fabric.rs
+crates/extension/src/operator_fabric.rs
+crates/extension/src/store/operator.rs
+crates/harness/Cargo.toml
+crates/harness/src/lib.rs
+crates/harness/src/run_runtime.rs
+apps/server/src/admission.rs
+crates/core/src/context_operator.rs
+crates/harness/src/context_operator.rs
+crates/harness/tests/context_operator.rs
+docs/design/agent/p2-evidence/.gitignore
+docs/design/agent/p2-evidence/01-contract-red.log
+docs/design/agent/p2-evidence/02-disconnect-red.log
+docs/design/agent/p2-evidence/03-large-error-red.log
+docs/design/agent/p2-evidence/04-targeted-green.log
+docs/design/agent/p2-evidence/05-scope.log
+docs/design/agent/p2-evidence/acceptance.md
+docs/design/agent/p2-request-context.md

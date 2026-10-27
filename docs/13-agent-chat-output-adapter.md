@@ -55,7 +55,7 @@ pub use agent_core as core;
 
 ## 2. 映射要求（本适配器的实质内容）
 
-源事件在 `crates/core/src/harness/event.rs`（`AgentEvent` 是语义事件，`RunEvent = { run_id, seq, kind }`。
+源事件在 `crates/core/src/contracts/event.rs`（`AgentEvent` 是语义事件，`RunEvent = { run_id, seq, kind }`。
 它的注释写明：*transport-neutral; SSE event names are derived at the Gateway boundary* ——
 **这个适配器正是那个 boundary**）。至少要覆盖：
 

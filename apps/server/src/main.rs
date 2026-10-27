@@ -1,3 +1,4 @@
+use agent_core::agent::AgentLoop;
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -8,26 +9,25 @@ use std::{
 
 use agent_core::adf::RunScopedJavaScriptPolicy;
 use agent_core::context::{
-    ContextArtifactStore, ContextBudget, ContextBuildRequest, ContextCompressor, ContextEngine,
+    ContextArtifactStore, ContextBudget, ContextCompressor, ContextEngine,
     DeterministicSummaryGenerator, FallbackSummaryGenerator, HeuristicTokenEstimator,
     HybridCompressor, NoopFailCompressor, SlidingWindowCompressor, SummaryGenerator,
     TokenEstimator,
 };
-use agent_core::event_runtime::{
+use agent_core::contracts::events::{
     CreateSubscription, Delivery, DeliveryRouter, DeliveryTarget, EventEnvelope, EventError,
     EventFilter, EventFuture, EventId, EventSource, EventStore, PublishEvent, StartPosition,
     SubscriptionId, SubscriptionMode, SubscriptionOwner, SubscriptionScope,
 };
-use agent_core::harness::{
-    AGENT_LOOP_CHECKPOINT_SCHEMA_VERSION, AGENT_LOOP_REDUCER_PROTOCOL_VERSION, Agent, AgentLoop,
-    AgentMetadata, ApprovalDecision, ApprovalError, ApprovalFuture, ApprovalId, ApprovalPort,
-    ApprovalRequest, ApprovalResolution, ArchiveSession, BeginSessionRun, BlobId, BlobStore,
-    ContentPart, CreateSession, EffectRequest, FinalizeSessionRun, FinishReason, FlowEffect,
-    FlowEffectRouter, FlowError, FlowStore, JobExecutionError, JobExecutionFuture, JobRecord,
-    JobRouter, JobStore, MAX_SESSION_PAGE_SIZE, ModelAttachment, PutBlob, RunEvent, RunFailure,
-    RunId, RunResponse, RunSnapshot, RunStatus, RunStore, RunStoreError, SessionId, SessionStatus,
-    SessionStore, SessionStoreError, ToolDefinition, ToolPort, ToolRegistry, ToolRiskLevel,
-    WakeFlowRun,
+use agent_core::contracts::{
+    Agent, AgentMetadata, ApprovalDecision, ApprovalError, ApprovalFuture, ApprovalId,
+    ApprovalPort, ApprovalRequest, ApprovalResolution, ArchiveSession, BeginSessionRun, BlobId,
+    BlobStore, ContentPart, CreateSession, EffectRequest, FinalizeSessionRun, FinishReason,
+    FlowEffect, FlowEffectRouter, FlowError, FlowStore, JobExecutionError, JobExecutionFuture,
+    JobRecord, JobRouter, JobStore, MAX_SESSION_PAGE_SIZE, ModelAttachment, PutBlob, RunEvent,
+    RunFailure, RunId, RunResponse, RunSnapshot, RunStatus, RunStore, RunStoreError, SessionId,
+    SessionStatus, SessionStore, SessionStoreError, ToolDefinition, ToolPort, ToolRegistry,
+    ToolRiskLevel, WakeFlowRun,
 };
 use agent_core::memory::{
     CreateMemoryWriteProposal, HostMemoryWritePolicy, MemoryApprovalId, MemoryApprovalStatus,
@@ -40,14 +40,13 @@ use agent_core::observability::ObservationHook;
 use agent_core::sandbox::{ProcessSandbox, ProcessSandboxDescriptor};
 use agent_core::script::{ScriptLimits, ScriptRuntime, ScriptRuntimeDescriptor};
 use agent_core::skill::{
-    ComponentDescriptor, ResolveSkillsRequest, ResolvedSkill, SkillDescriptor, SkillId,
-    SkillOrchestrator, SkillStore,
+    ComponentDescriptor, SkillDescriptor, SkillId, SkillOrchestrator, SkillStore,
 };
 use agent_extension::adf::{InMemoryAdfArtifactStore, RunAdfToolSession};
 use agent_extension::context::ModelSummaryGenerator;
 use agent_extension::observability::{
-    AsyncObservationConfig, AsyncObservationHook, HookObservationExporter, ObservedMachine,
-    ObservedModel, ObservedTools, TracingObservationHook,
+    AsyncObservationConfig, AsyncObservationHook, HookObservationExporter, ObservedModel,
+    ObservedTools, TracingObservationHook,
 };
 use agent_extension::provider::{ConfiguredModelProvider, Modality};
 use agent_extension::sandbox::HostProcessSandbox;
@@ -61,8 +60,8 @@ use agent_extension::tool::{
 use agent_extension::workspace::{NativeWorkspaceFs, WorkspaceFs};
 use agent_harness::{
     ContextStrategy, EventRuntime, EventRuntimeConfig, FlowEffectRuntime, FlowEffectRuntimeConfig,
-    Harness, HarnessConfig, HarnessError, JobRuntime, JobRuntimeConfig, OrchestrationConfig,
-    PlannedRun, QuickJsConfig, RunRuntime, RunRuntimeError, StartedRun,
+    HarnessConfig, HarnessError, JobRuntime, JobRuntimeConfig, OrchestrationConfig, QuickJsConfig,
+    RunRepository, RunRuntimeError, StartedRun,
     adf::JavaScriptAdfExecutor,
     script::{QuickJsRuntime, QuickJsRuntimeConfig},
 };
@@ -86,7 +85,15 @@ use tokio::{
 };
 use tracing_subscriber::EnvFilter;
 
+use agent_core::agent::host::preparation::PreparedRun;
 use agent_harness as run_runtime;
+mod admission;
+#[cfg(test)]
+mod p4_approval_tests;
+#[cfg(test)]
+mod p4_tools_tests;
+mod pipeline;
+mod tools_pipeline;
 
 const MAX_BLOB_BYTES: usize = 10 * 1_048_576;
 const MAX_RUN_ATTACHMENTS: usize = 8;
@@ -95,11 +102,14 @@ type ServerAgentLoop = AgentLoop<
     ObservedModel<ConfiguredModelProvider>,
     ObservedTools<RunAdfToolSession<ToolRegistry>>,
 >;
-type AppRuntimeAgent = ObservedMachine<ServerAgentLoop>;
 
 #[derive(Clone)]
 struct AppState {
-    runtime: RunRuntime<AppRuntimeAgent>,
+    pipeline: Option<Arc<tools_pipeline::ServerAgentRuntime>>,
+    pipeline_profile: tools_pipeline::EngineProfile,
+    tools_pipeline: Option<Arc<tools_pipeline::ServerAgentRuntime>>,
+    admission: Arc<agent_core::agent::host::preparation::AdmissionFacade>,
+    runtime: RunRepository,
     config: Arc<HarnessConfig>,
     approvals: InMemoryApprovalBroker,
     events: Arc<EventRuntime>,
@@ -109,8 +119,7 @@ struct AppState {
 
 struct OrchestrationRuntime {
     sessions: Arc<dyn SessionStore>,
-    context: ContextEngine,
-    skills: SkillOrchestrator,
+    skills: Arc<SkillOrchestrator>,
     memory_store: Arc<dyn MemoryStore>,
     memory_proposals: Arc<dyn MemoryProposalStore>,
     memory_extractor: Arc<dyn MemoryExtractor>,
@@ -167,7 +176,7 @@ struct ServerFlowEffectRouter {
 }
 
 impl FlowEffectRouter for ServerFlowEffectRouter {
-    fn execute(&self, effect: FlowEffect) -> agent_core::harness::FlowFuture<'_, ()> {
+    fn execute(&self, effect: FlowEffect) -> agent_core::contracts::FlowFuture<'_, ()> {
         Box::pin(async move {
             match effect.request {
                 EffectRequest::PublishEvent { command } => self
@@ -337,12 +346,12 @@ fn event_flow_error(error: EventError) -> FlowError {
     }
 }
 
-fn job_flow_error(error: agent_core::harness::JobStoreError) -> FlowError {
+fn job_flow_error(error: agent_core::contracts::JobStoreError) -> FlowError {
     match error {
-        agent_core::harness::JobStoreError::Invalid(message) => FlowError::Invalid(message),
-        agent_core::harness::JobStoreError::NotFound => FlowError::NotFound,
-        agent_core::harness::JobStoreError::Conflict(message) => FlowError::Conflict(message),
-        agent_core::harness::JobStoreError::Backend(message) => FlowError::Backend(message),
+        agent_core::contracts::JobStoreError::Invalid(message) => FlowError::Invalid(message),
+        agent_core::contracts::JobStoreError::NotFound => FlowError::NotFound,
+        agent_core::contracts::JobStoreError::Conflict(message) => FlowError::Conflict(message),
+        agent_core::contracts::JobStoreError::Backend(message) => FlowError::Backend(message),
     }
 }
 
@@ -456,13 +465,6 @@ impl InMemoryApprovalBroker {
             .send(resolution)
             .map_err(|_| ResolveApprovalError::NotPending)?;
         Ok(ResolveApprovalOutcome::Accepted)
-    }
-
-    fn remove_run(&self, run_id: RunId) {
-        self.records
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|_, record| record.request.run_id != run_id);
     }
 }
 
@@ -621,10 +623,20 @@ struct BlobInput {
     blob_id: BlobId,
     #[serde(default)]
     media_type: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_attachment_name")]
+    name: agent_core::contracts::preparation::AttachmentNameInput,
     #[serde(default)]
     size_bytes: Option<u64>,
+}
+
+fn deserialize_attachment_name<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<agent_core::contracts::preparation::AttachmentNameInput, D::Error> {
+    use agent_core::contracts::preparation::AttachmentNameInput;
+    Ok(match Option::<String>::deserialize(deserializer)? {
+        Some(name) => AttachmentNameInput::Named(name),
+        None => AttachmentNameInput::Null,
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -768,17 +780,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&blobs),
     )?;
     let agent_metadata = agent.metadata();
+    let operator_model = agent.model_port();
+    let operator_tools = agent.tool_port();
     let engine = agent_engine_info();
     tracing::info!(
         agent = agent_metadata.name,
         engine = engine.kind,
-        reducer_protocol_version = engine.protocol_version,
+        graph_protocol_version = engine.protocol_version,
         checkpoint_schema_version = engine.checkpoint_schema_version,
         "configured agent runtime"
     );
 
-    let harness = Harness::new(ObservedMachine::new(agent, Arc::clone(&observation_hook)))
-        .with_run_timeout(Duration::from_secs(config.agent().run_timeout_seconds));
     let store_path = env::var_os("MINA_RUN_STORE_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("data/runs.sqlite3"));
@@ -826,17 +838,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         orchestration_config.skill_directory.clone(),
         "skills:filesystem-primary",
     ));
-    let skills = SkillOrchestrator::new(skill_store);
+    let skills = Arc::new(SkillOrchestrator::new(skill_store));
     let event_adapter =
         Arc::new(SqliteEventStore::open(&store_path, "events:sqlite-primary").await?);
     let event_store: Arc<dyn EventStore> = event_adapter.clone();
     let flow_store: Arc<dyn FlowStore> = event_adapter.clone();
-    let job_store: Arc<dyn JobStore> = event_adapter;
-    let delivery_router: Arc<dyn DeliveryRouter> = Arc::new(ServerDeliveryRouter {
+    let job_store: Arc<dyn JobStore> = event_adapter.clone();
+    let admission = Arc::new(agent_core::agent::host::preparation::AdmissionFacade::new(
+        event_adapter.clone(),
+        Arc::clone(&blobs),
+        Arc::new(agent_core::agent::host::preparation::ContextPreparation {
+            context,
+            skills: Arc::clone(&skills),
+        }),
+    ));
+    admission.start_worker();
+    let auxiliary_router: Arc<dyn DeliveryRouter> = Arc::new(ServerDeliveryRouter {
         memories: Arc::clone(&memory_store),
         proposals: Arc::clone(&memory_proposals),
         flows: Some(Arc::clone(&flow_store)),
     });
+    let wait_bridge = Arc::new(agent_core::agent::GraphWaitBridge::new(
+        event_adapter.clone(),
+        event_adapter.clone(),
+        event_adapter.clone(),
+    ));
+    let delivery_router: Arc<dyn DeliveryRouter> =
+        Arc::new(tools_pipeline::EngineDeliveryRouter::new(
+            sqlite_store.clone(),
+            auxiliary_router,
+            wait_bridge.clone(),
+        ));
     let events = Arc::new(EventRuntime::new(
         event_store,
         delivery_router,
@@ -844,7 +876,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let jobs = Arc::new(JobRuntime::new(
         job_store,
-        Arc::new(ServerJobRouter),
+        wait_bridge.job_router(Arc::new(ServerJobRouter)),
         Arc::clone(&events),
         JobRuntimeConfig::default(),
     ));
@@ -859,18 +891,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for proposal in memory_proposals.pending_proposals(1_000).await? {
         ensure_memory_approval(&events, &proposal).await?;
     }
-    let approval_cleanup = approvals.clone();
-    let runtime = RunRuntime::new_durable(harness, store, flow_store, move |run_id| {
-        approval_cleanup.remove_run(run_id);
-    });
-    let recovered = runtime.recover_interrupted().await?;
-    if recovered > 0 {
-        tracing::warn!(
-            recovered,
-            "closed runs interrupted by the previous server process"
-        );
-    }
-    runtime.start_flow_worker();
+    let runtime = RunRepository::new(agent_metadata, store);
     let pending_session_finalizations = sessions.pending_finalizations().await?;
     let reconciled_sessions = pending_session_finalizations.len();
     for (session_id, run) in pending_session_finalizations {
@@ -890,7 +911,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     start_session_finalization_worker(Arc::clone(&sessions));
 
+    let profile = tools_pipeline::configured_profile()?;
+    let graph_resources = agent_core::agent::AgentResources::new(event_adapter.clone())
+        .model("primary", "server-v1", operator_model)
+        .toolset("workspace", "server-v1", operator_tools)
+        .wait_service("durable", "server-v1", wait_bridge);
+    let tools_runtime = if let Some(path) = env::var_os("MINA_AGENT_GRAPH") {
+        tools_pipeline::ServerAgentRuntime::with_graph(
+            graph_resources,
+            sqlite_store.clone(),
+            agent_core::agent::AgentDefinition::from_file(path)?,
+            agent_core::agent::OperatorRegistry::builtins(),
+        )?
+    } else {
+        tools_pipeline::ServerAgentRuntime::new(graph_resources, sqlite_store.clone())
+    };
+    let tools_pipeline = Arc::new(tools_runtime);
     let state = AppState {
+        pipeline: Some(Arc::new(pipeline::build(
+            &store_path,
+            sqlite_store.clone(),
+            blobs.clone(),
+            event_adapter.clone(),
+            &config,
+        )?)),
+        pipeline_profile: profile,
+        tools_pipeline: Some(tools_pipeline),
+        admission,
         runtime,
         config: Arc::clone(&config),
         approvals,
@@ -898,7 +945,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         blobs,
         orchestration: Arc::new(OrchestrationRuntime {
             sessions,
-            context,
             skills,
             memory_store,
             memory_proposals,
@@ -922,8 +968,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tool_runtime,
         }),
     };
+    admission::start_recovery_worker(state.clone());
     start_event_workers(events, flow_effects, jobs);
-    let app = Router::new()
+    let app = app_router(state);
+
+    let address = env::var("MINA_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
+    let listener = TcpListener::bind(&address).await?;
+    let local_address = listener.local_addr()?;
+    tracing::info!(address = %local_address, "mina server listening");
+    let serve_result = axum::serve(listener, app).await;
+    let observation_result = observation_worker.shutdown().await;
+    serve_result?;
+    observation_result?;
+    Ok(())
+}
+
+fn app_router(state: AppState) -> Router {
+    Router::new()
         .route("/healthz", get(health))
         .route("/api/v1/info", get(info))
         .route("/api/v1/debug/agent", get(inspect_agent))
@@ -957,18 +1018,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(resolve_memory_approval),
         )
         .layer(DefaultBodyLimit::max(MAX_BLOB_BYTES))
-        .with_state(state);
-
-    let address = env::var("MINA_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
-    let listener = TcpListener::bind(&address).await?;
-    let local_address = listener.local_addr()?;
-    tracing::info!(address = %local_address, "mina server listening");
-
-    let serve_result = axum::serve(listener, app).await;
-    let observation_result = observation_worker.shutdown().await;
-    serve_result?;
-    observation_result?;
-    Ok(())
+        .with_state(state)
 }
 
 fn build_agent(
@@ -1253,10 +1303,10 @@ async fn upload_blob(
             }),
         )
             .into_response(),
-        Err(error) => api_error(
+        Err(_) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "blob_store_error",
-            error.to_string(),
+            "attachment storage is unavailable",
             true,
         ),
     }
@@ -1281,11 +1331,11 @@ async fn download_blob(State(state): State<AppState>, Path(blob_id): Path<String
                 false,
             );
         }
-        Err(error) => {
+        Err(_) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "blob_store_error",
-                error.to_string(),
+                "attachment storage is unavailable",
                 true,
             );
         }
@@ -1435,9 +1485,9 @@ async fn inspect_agent(State(state): State<AppState>) -> Response {
 
 const fn agent_engine_info() -> AgentEngineInfo {
     AgentEngineInfo {
-        kind: "reducer",
-        protocol_version: AGENT_LOOP_REDUCER_PROTOCOL_VERSION,
-        checkpoint_schema_version: AGENT_LOOP_CHECKPOINT_SCHEMA_VERSION,
+        kind: "static_graph",
+        protocol_version: 1,
+        checkpoint_schema_version: 1,
     }
 }
 
@@ -1457,6 +1507,10 @@ async fn create_run(
     State(state): State<AppState>,
     Json(request): Json<CreateRunRequest>,
 ) -> Response {
+    admission::owned(async move { create_run_owned(state, request).await }).await
+}
+
+async fn create_run_owned(state: AppState, request: CreateRunRequest) -> Response {
     let run_id = RunId::new();
     let max_steps = match effective_run_max_steps(&state, request.max_steps) {
         Ok(max_steps) => max_steps,
@@ -1472,6 +1526,7 @@ async fn create_run(
             run_id,
             input: request.input,
             attachments: attachments.model,
+            attachment_names: attachments.names,
             explicit_skills: request.skills,
             max_steps,
             session_id: None,
@@ -1483,12 +1538,14 @@ async fn create_run(
         Ok(prepared) => prepared,
         Err(error) => return error,
     };
-    let started = match state.runtime.start_planned(prepared.plan).await {
+    let started = match pipeline::start(&state, prepared.plan, false).await {
         Ok(started) => started,
         Err(error) => return map_runtime_error(error),
     };
 
     if request.stream {
+        // Preview deltas may precede a durable checkpoint. Keep the engine's
+        // live receiver so a provider awaiting client interaction cannot stall.
         return run_event_response(state.runtime, started.run_id, 0, true, Some(started.events));
     }
 
@@ -1498,16 +1555,11 @@ async fn create_run(
     }
 }
 
-struct PreparedRun {
-    plan: PlannedRun,
-    context_fingerprint: String,
-    max_steps: u32,
-}
-
 struct PrepareRunRequest {
     run_id: RunId,
     input: String,
     attachments: Vec<ModelAttachment>,
+    attachment_names: Option<Vec<agent_core::contracts::preparation::AttachmentNameInput>>,
     explicit_skills: Vec<SkillChoice>,
     max_steps: u32,
     session_id: Option<SessionId>,
@@ -1518,145 +1570,7 @@ async fn prepare_run_plan(
     state: &AppState,
     request: PrepareRunRequest,
 ) -> Result<PreparedRun, Response> {
-    let PrepareRunRequest {
-        run_id,
-        input,
-        attachments,
-        explicit_skills,
-        max_steps,
-        session_id,
-        through_message_ordinal,
-    } = request;
-    if input.trim().is_empty() && attachments.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_input",
-            "input or attachments must not be empty",
-            false,
-        ));
-    }
-    let defaults = state
-        .orchestration
-        .config
-        .default_skills
-        .iter()
-        .map(|skill| (SkillId(skill.skill_id.clone()), skill.version.clone()))
-        .collect();
-    let explicit = explicit_skills
-        .into_iter()
-        .map(|skill| (SkillId(skill.skill_id), skill.version))
-        .collect();
-    let resolved_skills = state
-        .orchestration
-        .skills
-        .resolve(ResolveSkillsRequest {
-            explicit,
-            profile_defaults: defaults,
-            current_input: input.clone(),
-            max_skills: state.orchestration.config.max_skills,
-        })
-        .await
-        .map_err(|error| {
-            api_error(
-                StatusCode::BAD_REQUEST,
-                "skill_resolution_failed",
-                error.to_string(),
-                false,
-            )
-        })?;
-    let request_digest = request_digest(&input, &attachments, &resolved_skills);
-    let memory_scopes = if state.orchestration.config.memory_enabled {
-        let mut scopes = vec![MemoryScope(state.orchestration.config.memory_scope.clone())];
-        if let Some(session_id) = session_id {
-            scopes.push(MemoryScope(format!("session:{session_id}")));
-        }
-        scopes
-    } else {
-        vec![MemoryScope("__memory_disabled__".into())]
-    };
-    let pack = state
-        .orchestration
-        .context
-        .build(ContextBuildRequest {
-            run_id,
-            session_id,
-            through_message_ordinal,
-            current_input: input.clone(),
-            request_digest: request_digest.clone(),
-            agent_profile: state.orchestration.agent_profile.clone(),
-            agent_instruction: state.orchestration.agent_instruction.clone(),
-            model_profile: state.orchestration.model_profile.clone(),
-            resolved_skills,
-            memory_scopes,
-            available_tools: state
-                .orchestration
-                .tools
-                .iter()
-                .map(|tool| tool.name.clone())
-                .collect(),
-            max_memories: state.orchestration.config.max_memories,
-            budget: ContextBudget {
-                model_context_tokens: state.orchestration.model_context_tokens,
-                reserved_output_tokens: state.orchestration.reserved_output_tokens,
-                reserved_tool_schema_tokens: state.orchestration.config.reserved_tool_schema_tokens,
-                max_skill_tokens: state.orchestration.config.max_skill_tokens,
-                max_memory_tokens: state.orchestration.config.max_memory_tokens,
-                max_history_tokens: state.orchestration.config.max_history_tokens,
-            },
-            policy_version: state.orchestration.config.context_policy_version,
-            now_ms: run_runtime::unix_time_ms(),
-        })
-        .await
-        .map_err(|error| {
-            api_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "context_build_failed",
-                error.to_string(),
-                false,
-            )
-        })?;
-    let context_fingerprint = pack.fingerprint.clone();
-    let allow_run_adf = state.config.adf().enabled;
-    let manifest = serde_json::json!({
-        "schema_version": 1,
-        "context_fingerprint": pack.fingerprint,
-        "context_budget": pack.budget,
-        "skill_refs": pack.skill_refs,
-        "memory_refs": pack.memory_refs,
-        "artifact_refs": pack.artifact_refs,
-        "components": pack.component_descriptors,
-        "token_accounting": {
-            "provider_usage_preferred": true,
-            "fallback": "token_estimator"
-        },
-        "step_budget": {
-            "max_steps": max_steps,
-            "final_summary_step": true
-        },
-        "tool_grants": {
-            "static_tools": &pack.effective_tools,
-            "allow_run_adf": allow_run_adf,
-        },
-        "tool_runtime": {
-            "script": state.orchestration.tool_runtime.script_runtime.as_ref(),
-            "adf_enabled": allow_run_adf,
-        }
-    });
-    Ok(PreparedRun {
-        plan: PlannedRun {
-            run_id,
-            input,
-            attachments,
-            prior_messages: pack.messages,
-            allowed_tools: Some(pack.effective_tools),
-            allow_run_adf,
-            max_steps: Some(max_steps),
-            context_fingerprint: Some(context_fingerprint.clone()),
-            execution_manifest: Some(manifest),
-        },
-        context_fingerprint,
-        max_steps,
-    })
+    admission::prepare(state, request).await
 }
 
 async fn create_session(
@@ -1749,6 +1663,15 @@ async fn submit_session_run(
     Path(session_id): Path<String>,
     Json(request): Json<SubmitSessionRunRequest>,
 ) -> Response {
+    admission::owned(async move { submit_session_run_owned(state, session_id, request).await })
+        .await
+}
+
+async fn submit_session_run_owned(
+    state: AppState,
+    session_id: String,
+    request: SubmitSessionRunRequest,
+) -> Response {
     let Some(session_id) = parse_session_id(&session_id) else {
         return invalid_session_id();
     };
@@ -1764,10 +1687,11 @@ async fn submit_session_run(
         Ok(max_steps) => max_steps,
         Err(error) => return map_run_max_steps_error(error),
     };
-    let attachments = match resolve_blob_inputs(&state, request.attachments).await {
-        Ok(attachments) => attachments,
-        Err(error) => return error,
-    };
+    let (attachments, hash) =
+        match admission::session_inputs(&state, session_id, &request, max_steps).await {
+            Ok(resolved) => resolved,
+            Err(error) => return error,
+        };
     if request.input.trim().is_empty() && attachments.model.is_empty() {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -1778,12 +1702,6 @@ async fn submit_session_run(
     }
     let run_id = RunId::new();
     let now_ms = run_runtime::unix_time_ms();
-    let hash = raw_request_hash(
-        &request.input,
-        &attachments.model,
-        &request.skills,
-        max_steps,
-    );
     let mut input_parts = Vec::with_capacity(attachments.content.len() + 1);
     if !request.input.is_empty() {
         input_parts.push(ContentPart::text(request.input.clone()));
@@ -1843,6 +1761,7 @@ async fn submit_session_run(
             run_id,
             input: request.input.clone(),
             attachments: attachments.model,
+            attachment_names: attachments.names,
             explicit_skills: request.skills,
             max_steps,
             session_id: Some(session_id),
@@ -1853,9 +1772,14 @@ async fn submit_session_run(
     {
         Ok(prepared) => prepared,
         Err(response) => {
+            if response.status().is_server_error()
+                && response.status() != StatusCode::SERVICE_UNAVAILABLE
+            {
+                return response;
+            }
             if let Ok(snapshot) = state
                 .runtime
-                .fail_persisted(
+                .reject_unadmitted(
                     run_id,
                     "context_build_failed",
                     "context orchestration failed",
@@ -1876,12 +1800,12 @@ async fn submit_session_run(
         }
     };
     let context_fingerprint = prepared.context_fingerprint.clone();
-    let started = match state.runtime.start_persisted(prepared.plan).await {
+    let started = match pipeline::start(&state, prepared.plan, true).await {
         Ok(started) => started,
         Err(error) => {
             if let Ok(snapshot) = state
                 .runtime
-                .fail_persisted(run_id, "run_start_failed", "run executor could not start")
+                .reject_unadmitted(run_id, "run_start_failed", "run executor could not start")
                 .await
             {
                 let _ = state
@@ -2062,7 +1986,7 @@ async fn get_run_events(
             run_id,
             after_seq,
             query.follow.unwrap_or(true),
-            state.runtime.subscribe(run_id),
+            None,
         ),
         Ok(None) => run_not_found(),
         Err(error) => map_store_error(error),
@@ -2070,7 +1994,7 @@ async fn get_run_events(
 }
 
 fn run_event_response(
-    runtime: RunRuntime<AppRuntimeAgent>,
+    runtime: RunRepository,
     run_id: RunId,
     after_seq: u64,
     follow: bool,
@@ -2123,6 +2047,10 @@ fn run_event_response(
                         return;
                     }
                 };
+                if snapshot.last_seq > cursor {
+                    replay_required = true;
+                    continue;
+                }
                 if snapshot.is_terminal() {
                     return;
                 }
@@ -2134,7 +2062,7 @@ fn run_event_response(
             }
 
             if live_events.is_none() {
-                live_events = runtime.subscribe(run_id);
+                live_events = None;
             }
             let Some(receiver) = live_events.as_mut() else {
                 // A durable machine deliberately releases its executor while it is
@@ -2210,7 +2138,7 @@ fn stream_error_event(message: impl Into<String>) -> Event {
 }
 
 async fn wait_for_terminal(
-    runtime: &RunRuntime<AppRuntimeAgent>,
+    runtime: &RunRepository,
     mut started: StartedRun,
 ) -> Result<RunResponse, HarnessError> {
     loop {
@@ -2463,6 +2391,12 @@ async fn resolve_approval(
         reason,
     };
 
+    if let Some(response) =
+        pipeline::resolve_operator_approval(&state, run_id, approval_id, resolution.clone()).await
+    {
+        return response;
+    }
+
     match state
         .approvals
         .resolve(run_id, approval_id, resolution.clone())
@@ -2530,63 +2464,12 @@ async fn resolve_persisted_approval(
             "the run terminated before this approval was resolved",
             false,
         ),
-        None => {
-            let now_ms = run_runtime::unix_time_ms();
-            let event_id = EventId::stable("tool-approval-resolved", &approval_id.to_string());
-            let decision = match requested.decision {
-                ApprovalDecision::AllowOnce => "allow-once",
-                ApprovalDecision::Deny => "deny",
-            };
-            match state
-                .events
-                .publish(PublishEvent {
-                    event_id,
-                    topic: "tool.approval.resolved".into(),
-                    event_type: "tool.approval.resolved".into(),
-                    schema_version: 1,
-                    source: EventSource::Gateway,
-                    subject: Some(format!("run/{run_id}")),
-                    correlation_id: Some(approval_id.to_string()),
-                    causation_id: None,
-                    occurred_at_ms: now_ms,
-                    recorded_at_ms: now_ms,
-                    payload: serde_json::json!({
-                        "decision": decision,
-                        "reason": requested.reason.clone(),
-                    }),
-                })
-                .await
-            {
-                Ok(result) => (
-                    StatusCode::ACCEPTED,
-                    Json(ResolveApprovalResponse {
-                        run_id,
-                        approval_id,
-                        resolution: requested,
-                        replayed: result.replayed,
-                    }),
-                )
-                    .into_response(),
-                Err(EventError::Conflict(message)) => api_error(
-                    StatusCode::CONFLICT,
-                    "approval_already_resolved",
-                    message,
-                    false,
-                ),
-                Err(EventError::Invalid(message)) => api_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_approval_event",
-                    message,
-                    false,
-                ),
-                Err(error) => api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "event_runtime_error",
-                    error.to_string(),
-                    true,
-                ),
-            }
-        }
+        None => api_error(
+            StatusCode::CONFLICT,
+            "legacy_execution_removed",
+            "this historical run cannot resume; create a new operator run",
+            false,
+        ),
     }
 }
 
@@ -2594,31 +2477,8 @@ async fn cancel_run(State(state): State<AppState>, Path(run_id): Path<String>) -
     let Some(run_id) = parse_run_id(&run_id) else {
         return invalid_run_id();
     };
-
-    match state.runtime.cancel_durable(run_id).await {
-        Ok(true) => {
-            return (
-                StatusCode::ACCEPTED,
-                Json(CancelRunResponse {
-                    run_id,
-                    status: "cancellation_requested",
-                }),
-            )
-                .into_response();
-        }
-        Ok(false) => {}
-        Err(error) => return map_runtime_error(error),
-    }
-
-    if state.runtime.cancel(run_id) {
-        return (
-            StatusCode::ACCEPTED,
-            Json(CancelRunResponse {
-                run_id,
-                status: "cancellation_requested",
-            }),
-        )
-            .into_response();
+    if let Some(response) = tools_pipeline::cancel(&state, run_id).await {
+        return response;
     }
 
     match state.runtime.get_run(run_id).await {
@@ -2665,6 +2525,7 @@ fn effective_run_max_steps(
 struct ResolvedBlobInputs {
     model: Vec<ModelAttachment>,
     content: Vec<ContentPart>,
+    names: Option<Vec<agent_core::contracts::preparation::AttachmentNameInput>>,
 }
 
 async fn resolve_blob_inputs(
@@ -2683,9 +2544,11 @@ async fn resolve_blob_inputs(
         return Ok(ResolvedBlobInputs {
             model: Vec::new(),
             content: Vec::new(),
+            names: None,
         });
     }
     let allowed = &state.config.default_model().modalities.input;
+    let names = Some(inputs.iter().map(|input| input.name.clone()).collect());
     let mut model = Vec::with_capacity(inputs.len());
     let mut content = Vec::with_capacity(inputs.len());
     for input in inputs {
@@ -2704,11 +2567,11 @@ async fn resolve_blob_inputs(
             .blobs
             .get(input.blob_id)
             .await
-            .map_err(|error| {
+            .map_err(|_| {
                 api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "blob_store_error",
-                    error.to_string(),
+                    "attachment storage is unavailable",
                     true,
                 )
             })?
@@ -2727,6 +2590,13 @@ async fn resolve_blob_inputs(
             || input
                 .size_bytes
                 .is_some_and(|size_bytes| size_bytes != object.metadata.size_bytes)
+            || input.name.as_ref().is_some_and(|name| {
+                object
+                    .metadata
+                    .name
+                    .as_ref()
+                    .is_some_and(|stored| name != stored)
+            })
         {
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
@@ -2735,8 +2605,30 @@ async fn resolve_blob_inputs(
                 false,
             ));
         }
+        if object.metadata.size_bytes > MAX_BLOB_BYTES as u64 {
+            return Err(api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "blob_too_large",
+                "attachment exceeds the file size limit",
+                false,
+            ));
+        }
+        if input.name.as_ref().is_some_and(|name| name.len() > 512) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_blob_name",
+                "attachment name must not exceed 512 bytes",
+                false,
+            ));
+        }
         let modality = input_modality(&object.metadata.media_type);
-        if !allowed.contains(&modality) {
+        if !allowed.contains(&modality)
+            || (modality == Modality::Image
+                && !matches!(
+                    object.metadata.media_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                ))
+        {
             return Err(api_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "unsupported_input_modality",
@@ -2747,11 +2639,16 @@ async fn resolve_blob_inputs(
                 false,
             ));
         }
-        let name = object.metadata.name.clone().or(input.name);
+        let name = object
+            .metadata
+            .name
+            .clone()
+            .or_else(|| input.name.as_ref().cloned());
         model.push(ModelAttachment {
             blob_id: object.metadata.blob_id,
             media_type: object.metadata.media_type.clone(),
             name: name.clone(),
+            size_bytes: Some(object.metadata.size_bytes),
         });
         content.push(ContentPart::BlobRef {
             blob_id: object.metadata.blob_id,
@@ -2760,7 +2657,19 @@ async fn resolve_blob_inputs(
             size_bytes: Some(object.metadata.size_bytes),
         });
     }
-    Ok(ResolvedBlobInputs { model, content })
+    tracing::info!(
+        attachment_count = model.len(),
+        attachment_total_bytes = model
+            .iter()
+            .filter_map(|attachment| attachment.size_bytes)
+            .sum::<u64>(),
+        "attachments validated"
+    );
+    Ok(ResolvedBlobInputs {
+        model,
+        content,
+        names,
+    })
 }
 
 fn input_modality(media_type: &str) -> Modality {
@@ -2798,23 +2707,24 @@ fn map_run_max_steps_error(error: RunMaxStepsError) -> Response {
     )
 }
 
-fn request_digest(
+fn attachment_request_hash(
     input: &str,
     attachments: &[ModelAttachment],
-    skills: &[ResolvedSkill],
+    skills: &[SkillChoice],
+    max_steps: u32,
+    names: Option<&[agent_core::contracts::preparation::AttachmentNameInput]>,
 ) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    for attachment in attachments {
-        hasher.update(attachment.blob_id.to_string().as_bytes());
-        hasher.update(attachment.media_type.as_bytes());
+    let original = raw_request_hash(input, attachments, skills, max_steps);
+    match names {
+        Some(names) => {
+            let mut hasher = Sha256::new();
+            hasher.update(original.as_bytes());
+            hasher.update(b"\0attachment-names:v1\0");
+            hasher.update(serde_json::to_vec(names).expect("attachment name identity"));
+            format!("sha256:{:x}", hasher.finalize())
+        }
+        None => original,
     }
-    for skill in skills {
-        hasher.update((skill.locked.skill_id).0.as_bytes());
-        hasher.update(skill.locked.version.as_bytes());
-        hasher.update(skill.locked.digest.as_bytes());
-    }
-    format!("sha256:{:x}", hasher.finalize())
 }
 
 fn raw_request_hash(
@@ -2830,9 +2740,9 @@ fn raw_request_hash(
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     hasher.update(max_steps.to_le_bytes());
-    for attachment in attachments {
-        hasher.update(attachment.blob_id.to_string().as_bytes());
-        hasher.update(attachment.media_type.as_bytes());
+    if !attachments.is_empty() {
+        hasher.update(b"\0attachments:v1\0");
+        hasher.update(serde_json::to_vec(attachments).expect("attachment identity"));
     }
     for skill in skills {
         hasher.update(skill.skill_id.as_bytes());
@@ -2993,14 +2903,15 @@ fn map_session_error(error: SessionStoreError) -> Response {
 }
 
 #[cfg(test)]
+mod p0_contract_tests;
+
+#[cfg(test)]
 mod tests {
     use agent_core::context::InMemoryContextArtifactStore;
-    use agent_core::event_runtime::{
+    use agent_core::contracts::AgentEvent;
+    use agent_core::contracts::events::{
         ClaimDeliveries, ClaimTimers, CompleteDelivery, EventComponentDescriptor, PublishResult,
         RetryDelivery, ScheduleOnce, Subscription, Timer, TimerId,
-    };
-    use agent_core::harness::{
-        AgentEvent, MachineOutput, MachineResumeRequest, MachineStartRequest, StepOutcome,
     };
     use agent_core::tool::ToolRiskLevel;
     use agent_extension::store::{InMemoryMemoryStore, InMemoryRunStore};
@@ -3089,7 +3000,7 @@ mod tests {
         }
     }
 
-    fn test_state() -> AppState {
+    pub(super) fn test_state() -> AppState {
         test_state_with_approvals(InMemoryApprovalBroker::default())
     }
 
@@ -3124,8 +3035,15 @@ api_key = "test-key"
         .expect("test config should parse")
     }
 
-    fn test_state_with_approvals(approvals: InMemoryApprovalBroker) -> AppState {
-        let config = Arc::new(test_config());
+    pub(super) fn test_state_with_approvals(approvals: InMemoryApprovalBroker) -> AppState {
+        test_state_with_config(test_config(), approvals)
+    }
+
+    pub(super) fn test_state_with_config(
+        config: HarnessConfig,
+        approvals: InMemoryApprovalBroker,
+    ) -> AppState {
+        let config = Arc::new(config);
         let state_store = Arc::new(InMemoryRunStore::default());
         let store: Arc<dyn RunStore> = state_store.clone();
         let sessions: Arc<dyn SessionStore> = state_store;
@@ -3134,7 +3052,7 @@ api_key = "test-key"
         let memory_proposals: Arc<dyn MemoryProposalStore> = memory_adapter.clone();
         let memory_retriever: Arc<dyn MemoryRetriever> = memory_adapter;
         let estimator: Arc<dyn TokenEstimator> = Arc::new(HeuristicTokenEstimator);
-        let blobs: Arc<dyn BlobStore> = Arc::new(FilesystemBlobStore::new("target/test-blobs"));
+        let blobs = admission::test_blobs();
         let hook: Arc<dyn ObservationHook> = Arc::new(TracingObservationHook);
         let (agent, tools, tool_runtime) = build_agent(
             &config,
@@ -3143,7 +3061,7 @@ api_key = "test-key"
             Arc::clone(&hook),
             Arc::clone(&blobs),
         )
-        .expect("native Agent loop should compose for tests");
+        .expect("operator Agent loop should compose for tests");
         let compressor: Arc<dyn ContextCompressor> =
             Arc::new(SlidingWindowCompressor::new(Arc::clone(&estimator)));
         let artifacts: Arc<dyn ContextArtifactStore> =
@@ -3158,7 +3076,6 @@ api_key = "test-key"
             "target/nonexistent-test-skills",
             "test-skills",
         ));
-        let approval_cleanup = approvals.clone();
         let events = Arc::new(EventRuntime::new(
             Arc::new(UnavailableEventStore),
             Arc::new(ServerDeliveryRouter {
@@ -3168,20 +3085,37 @@ api_key = "test-key"
             }),
             EventRuntimeConfig::default(),
         ));
+        let skills = Arc::new(SkillOrchestrator::new(skill_store));
+        let admission = Arc::new(agent_core::agent::host::preparation::AdmissionFacade::new(
+            Arc::new(agent_extension::operator_fabric::MemoryFabric::default()),
+            Arc::clone(&blobs),
+            Arc::new(agent_core::agent::host::preparation::ContextPreparation {
+                context,
+                skills: Arc::clone(&skills),
+            }),
+        ));
+        if tokio::runtime::Handle::try_current().is_ok() {
+            admission.start_worker();
+        }
+        let tools_pipeline = Arc::new(tools_pipeline::ServerAgentRuntime::new(
+            agent_core::agent::AgentResources::new(admission.fabric())
+                .model("primary", "server-v1", agent.model_port())
+                .toolset("workspace", "server-v1", agent.tool_port()),
+            store.clone(),
+        ));
         AppState {
-            runtime: RunRuntime::new(
-                Harness::new(ObservedMachine::new(agent, hook)),
-                store,
-                move |run_id| approval_cleanup.remove_run(run_id),
-            ),
+            pipeline: None,
+            pipeline_profile: tools_pipeline::EngineProfile::Tools,
+            tools_pipeline: Some(tools_pipeline),
+            admission,
+            runtime: RunRepository::new(agent.metadata(), store),
             config: Arc::clone(&config),
             approvals,
             events,
             blobs,
             orchestration: Arc::new(OrchestrationRuntime {
                 sessions,
-                context,
-                skills: SkillOrchestrator::new(skill_store),
+                skills,
                 memory_store: Arc::clone(&memory_store),
                 memory_proposals,
                 memory_extractor: Arc::new(RuleMemoryExtractor),
@@ -3305,7 +3239,7 @@ api_key = "test-key"
 
     #[tokio::test]
     async fn durable_job_completion_event_wakes_a_suspended_flow() {
-        use agent_core::harness::{
+        use agent_core::contracts::{
             CheckpointCodec, CheckpointEnvelope, FlowRunState, FlowRunStatus, SuspendFlowRun,
             WaitSpec,
         };
@@ -3339,7 +3273,7 @@ api_key = "test-key"
             JobRuntimeConfig::default(),
         );
         let run_id = RunId::new();
-        let job_id = agent_core::harness::JobId::new();
+        let job_id = agent_core::contracts::JobId::new();
         let checkpoint = CheckpointEnvelope {
             agent_kind: "test".into(),
             schema_version: 1,
@@ -3404,7 +3338,7 @@ api_key = "test-key"
             })
             .await
             .expect("flow should suspend");
-        jobs.submit(agent_core::harness::StartJob {
+        jobs.submit(agent_core::contracts::StartJob {
             job_id,
             run_id,
             kind: "builtin.delay".into(),
@@ -3504,7 +3438,7 @@ api_key = "test-key"
     }
 
     #[tokio::test]
-    async fn web_backend_drives_responses_through_the_core_reducer() {
+    async fn web_backend_drives_responses_through_the_static_graph() {
         use std::convert::Infallible;
 
         use axum::{
@@ -3588,59 +3522,37 @@ api_key = "test-key"
         )
         .expect("agent should compose");
         let run_id = RunId::new();
-        let start = MachineStartRequest {
-            run_id,
-            input: "hello".into(),
-            attachments: Vec::new(),
-            prior_messages: Vec::new(),
-            allowed_tools: Some(Vec::new()),
-            allow_run_adf: false,
-            max_steps: Some(2),
-            context_fingerprint: Some("test-context".into()),
-            activated_at_ms: 1,
-            cancellation: agent_core::harness::RunCancellation::new(),
-        };
-        let checkpoint = agent_core::harness::AgentMachine::initial_checkpoint(&agent, &start)
-            .expect("reducer checkpoint should be created");
-        assert_eq!(checkpoint.agent_kind, "agent-loop");
-        assert_eq!(
-            checkpoint.schema_version,
-            AGENT_LOOP_CHECKPOINT_SCHEMA_VERSION
-        );
-        assert_eq!(
-            checkpoint.payload["protocol_version"],
-            AGENT_LOOP_REDUCER_PROTOCOL_VERSION
-        );
-
-        let outputs: Vec<_> = agent_core::harness::AgentMachine::resume(
+        let outputs: Vec<_> = agent_core::contracts::Agent::run(
             &agent,
-            MachineResumeRequest {
+            agent_core::contracts::RunRequest {
                 run_id,
-                activation_id: agent_core::harness::ActivationId::new(),
-                checkpoint,
-                inbox: Vec::new(),
-                activated_at_ms: 1,
-                cancellation: start.cancellation,
+                input: "hello".into(),
+                attachments: vec![],
+                prior_messages: vec![],
+                allowed_tools: Some(vec![]),
+                allow_run_adf: false,
+                max_steps: Some(2),
+                cancellation: agent_core::contracts::RunCancellation::new(),
             },
         )
         .collect()
         .await;
-        let deltas = outputs
+        let output: String = outputs
             .iter()
-            .filter_map(|output| match output {
-                MachineOutput::Event(AgentEvent::OutputDelta {
-                    channel: agent_core::harness::OutputChannel::AssistantText,
+            .filter_map(|event| match event {
+                AgentEvent::OutputDelta {
+                    channel: agent_core::contracts::OutputChannel::AssistantText,
                     delta,
-                }) => Some(delta.as_str()),
+                } => Some(delta.as_str()),
                 _ => None,
             })
-            .collect::<Vec<_>>();
-        assert_eq!(deltas, vec!["hel", "lo"]);
+            .collect();
+        assert_eq!(output, "hello");
         assert!(matches!(
             outputs.last(),
-            Some(MachineOutput::Yield(StepOutcome::Complete {
+            Some(AgentEvent::Completed {
                 finish_reason: FinishReason::Stop
-            }))
+            })
         ));
         provider_server.abort();
     }

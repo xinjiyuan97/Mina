@@ -1,0 +1,37 @@
+   Compiling agent-extension v0.1.0 (/data/work/Mina/crates/extension)
+warning: unused import: `super::*`
+   --> crates/extension/tests/operator_fabric_contract.rs:203:17
+    |
+203 |             use super::*;
+    |                 ^^^^^^^^
+...
+213 | contracts!(single_publish, batch_atomic, holes_and_order, fencing, transaction, retry_dlq, filters_and_receipts, bounds);
+    | ------------------------------------------------------------------------------------------------------------------------ in this macro invocation
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+    = note: this warning originates in the macro `contracts` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: `agent-extension` (test "operator_fabric_contract") generated 1 warning (run `cargo fix --test "operator_fabric_contract" -p agent-extension` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.30s
+     Running tests/operator_fabric_contract.rs (target/debug/deps/operator_fabric_contract-930451f6e8e496c3)
+
+running 17 tests
+test memory::fencing ... ok
+test memory::bounds ... ok
+test memory::retry_dlq ... ok
+test memory::filters_and_receipts ... ok
+test memory::single_publish ... ok
+test memory::holes_and_order ... ok
+test memory::batch_atomic ... ok
+test memory::transaction ... ok
+test sqlite::batch_atomic ... ok
+test sqlite::single_publish ... ok
+test sqlite::bounds ... ok
+test sqlite::fencing ... ok
+test sqlite::holes_and_order ... ok
+test sqlite::retry_dlq ... ok
+test sqlite::filters_and_receipts ... ok
+test sqlite::transaction ... ok
+test sqlite_reopen_kill_points ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s

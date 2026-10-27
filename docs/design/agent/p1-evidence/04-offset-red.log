@@ -1,0 +1,29 @@
+   Compiling agent-extension v0.1.0 (/data/work/Mina/crates/extension)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.08s
+     Running tests/operator_fabric_contract.rs (target/debug/deps/operator_fabric_contract-930451f6e8e496c3)
+
+running 2 tests
+test memory::stable_offsets_across_partitions ... FAILED
+test sqlite::stable_offsets_across_partitions ... FAILED
+
+failures:
+
+---- memory::stable_offsets_across_partitions stdout ----
+
+thread 'memory::stable_offsets_across_partitions' (887) panicked at crates/extension/tests/operator_fabric_contract.rs:207:26:
+replay offset must never change after publication
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- sqlite::stable_offsets_across_partitions stdout ----
+
+thread 'sqlite::stable_offsets_across_partitions' (888) panicked at crates/extension/tests/operator_fabric_contract.rs:207:26:
+replay offset must never change after publication
+
+
+failures:
+    memory::stable_offsets_across_partitions
+    sqlite::stable_offsets_across_partitions
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p agent-extension --test operator_fabric_contract`

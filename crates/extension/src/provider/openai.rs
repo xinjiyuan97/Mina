@@ -1,12 +1,12 @@
 //! OpenAI-compatible Chat Completions streaming adapter.
 //!
 //! Provider SSE, JSON, HTTP headers, credentials, and transport errors terminate
-//! in this crate. The Agent only sees `agent_core::harness::ModelEvent` values.
+//! in this crate. The Agent only sees `agent_core::contracts::ModelEvent` values.
 
 use std::{collections::BTreeMap, sync::Arc};
 
 use agent_core::context::{TokenEstimateRequest, TokenEstimator, TokenSegment};
-use agent_core::harness::{
+use agent_core::contracts::{
     BlobStore, FinishReason, ModelError, ModelErrorKind, ModelEvent, ModelEventStream,
     ModelMessage, ModelPort, ModelRequest, ModelRole, TokenUsage, TokenUsageSource, ToolDefinition,
 };
@@ -457,8 +457,8 @@ struct ChatMessageToolCall {
     function: ChatMessageToolFunction,
 }
 
-impl From<&agent_core::harness::ModelToolCall> for ChatMessageToolCall {
-    fn from(call: &agent_core::harness::ModelToolCall) -> Self {
+impl From<&agent_core::contracts::ModelToolCall> for ChatMessageToolCall {
+    fn from(call: &agent_core::contracts::ModelToolCall) -> Self {
         Self {
             id: call.id.clone(),
             kind: "function",
@@ -785,7 +785,40 @@ mod tests {
     use std::convert::Infallible;
 
     use super::*;
-    use agent_core::harness::{
+
+    #[tokio::test]
+    async fn p6_chat_input_matrix() {
+        for (mime, kind) in [
+            ("image/png", Some("image_url")),
+            ("audio/wav", Some("input_audio")),
+            ("audio/mpeg", Some("input_audio")),
+            ("application/pdf", Some("file")),
+            ("application/octet-stream", Some("file")),
+            ("video/mp4", None),
+            ("audio/ogg", None),
+            ("image/svg+xml", None),
+        ] {
+            let (request, store, _directory) = crate::provider::attachment::fixture(mime).await;
+            let result = ChatCompletionRequest::from_model_request(&request, Some(&store)).await;
+            if let Some(kind) = kind {
+                let body = serde_json::to_value(result.expect("supported")).expect("json");
+                assert_eq!(body["messages"][0]["content"][0]["type"], kind);
+            } else {
+                assert!(result.is_err(), "must reject {mime}");
+            }
+            for role in [ModelRole::System, ModelRole::Assistant, ModelRole::Tool] {
+                let mut invalid = request.clone();
+                invalid.messages[0].role = role;
+                invalid.messages[0].tool_call_id = Some("call".into());
+                assert!(
+                    ChatCompletionRequest::from_model_request(&invalid, Some(&store))
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
+    use agent_core::contracts::{
         BlobId, BlobMetadata, BlobObject, BlobStoreError, BlobStoreFuture, ModelAttachment,
         PutBlob, RunId,
     };
@@ -854,7 +887,7 @@ mod tests {
                 ModelMessage::assistant_tool_calls(
                     "",
                     "considering the clock",
-                    vec![agent_core::harness::ModelToolCall {
+                    vec![agent_core::contracts::ModelToolCall {
                         id: "call_1".into(),
                         name: "get_current_time".into(),
                         arguments: "{}".into(),
@@ -915,6 +948,7 @@ mod tests {
                     blob_id,
                     media_type: "image/png".into(),
                     name: Some("screen.png".into()),
+                    size_bytes: None,
                 }],
             )],
             tools: Vec::new(),

@@ -8,7 +8,7 @@ use std::{
 use serde::Deserialize;
 use thiserror::Error;
 
-use agent_core::harness::{ToolApprovalPolicy, ToolCallStrategy};
+use agent_core::contracts::{ToolApprovalPolicy, ToolCallStrategy};
 use agent_extension::provider::{ModelConfig, ProviderConfigError};
 
 /// Validated, transport-independent configuration for an agent harness.

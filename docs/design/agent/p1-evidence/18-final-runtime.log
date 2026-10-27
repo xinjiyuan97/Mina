@@ -1,0 +1,13 @@
+   Compiling agent-core v0.1.0 (/data/work/Mina/crates/core)
+   Compiling agent-extension v0.1.0 (/data/work/Mina/crates/extension)
+   Compiling agent-harness v0.1.0 (/data/work/Mina/crates/harness)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.05s
+     Running tests/operator_fabric_runtime.rs (target/debug/deps/operator_fabric_runtime-dc1501922c185897)
+
+running 4 tests
+test coordinator_checks_time_after_handler ... ok
+test coordinator_backoff_then_dlq ... ok
+test coordinator_commits_once_for_duplicate_deliveries ... ok
+test coordinator_sqlite_receipt_survives_reopen ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s

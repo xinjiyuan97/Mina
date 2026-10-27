@@ -6,14 +6,14 @@ use std::{
     time::Duration,
 };
 
-use agent_core::event_runtime::{
+use agent_core::contracts::events::{
     ClaimDeliveries, ClaimTimers, CompleteDelivery, CreateSubscription, Delivery, DeliveryId,
     DeliveryStatus, EventComponentDescriptor, EventEnvelope, EventError, EventFuture, EventId,
     EventStore, PublishEvent, PublishResult, RetryDelivery, ScheduleOnce, StartPosition,
     Subscription, SubscriptionId, SubscriptionMode, SubscriptionScope, SubscriptionStatus, Timer,
     TimerId, TimerStatus, validate_publish,
 };
-use agent_core::harness::{
+use agent_core::contracts::{
     ActivationId, ClaimedActivation, CompleteFlowEffect, CompleteFlowRun, ContinueFlowRun,
     EffectRequest, FlowEffect, FlowEffectId, FlowEffectStatus, FlowError, FlowFuture,
     FlowInboxItem, FlowRunState, FlowRunStatus, FlowStore, RenewFlowLease, RetryFlowEffect, RunId,
@@ -25,6 +25,7 @@ const MAX_CLAIM_BATCH: usize = 1_000;
 
 #[derive(Debug, Clone)]
 pub struct SqliteEventStore {
+    pub(super) fabric_changed: tokio::sync::watch::Sender<u64>,
     pub(super) connection: Arc<Mutex<Connection>>,
     pub(super) identity: String,
 }
@@ -51,6 +52,7 @@ impl SqliteEventStore {
         .await?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            fabric_changed: tokio::sync::watch::channel(0).0,
             identity: identity.into(),
         })
     }
@@ -135,6 +137,7 @@ impl EventStore for SqliteEventStore {
                     if event.sequence <= subscription.cursor
                         || !scope_matches(subscription.definition.scope, &event)
                         || !subscription.definition.filter.matches(&event)
+                        || !subscription.definition.start_position.includes_recorded_time(event.event.recorded_at_ms)
                         || (subscription.definition.mode == SubscriptionMode::Once
                             && subscription_has_delivery(
                                 &transaction,
@@ -219,7 +222,7 @@ impl EventStore for SqliteEventStore {
                 let latest = latest_event_sequence(&transaction)?;
                 let cursor = match command.start_position {
                     StartPosition::Now => latest,
-                    StartPosition::Beginning => 0,
+                    StartPosition::Beginning | StartPosition::RecordedSince { .. } => 0,
                     StartPosition::After { sequence } => sequence,
                 };
                 let subscription = Subscription {
@@ -597,7 +600,7 @@ fn suspend_flow_blocking(
                 StartPosition::Now => {
                     latest_event_sequence(&transaction).map_err(flow_from_event)?
                 }
-                StartPosition::Beginning => 0,
+                StartPosition::Beginning | StartPosition::RecordedSince { .. } => 0,
                 StartPosition::After { sequence } => sequence,
             };
             let subscription = Subscription {
@@ -1166,7 +1169,7 @@ fn parse_flow_effect_id(
 
 fn validate_flow_wait(
     run_id: RunId,
-    wait: &agent_core::harness::WaitSpec,
+    wait: &agent_core::contracts::WaitSpec,
 ) -> Result<(), FlowError> {
     match (
         &wait.subscription.owner,
@@ -1174,9 +1177,9 @@ fn validate_flow_wait(
         &wait.subscription.delivery,
     ) {
         (
-            agent_core::event_runtime::SubscriptionOwner::Run { run_id: owner },
+            agent_core::contracts::events::SubscriptionOwner::Run { run_id: owner },
             SubscriptionScope::Run { run_id: scope },
-            agent_core::event_runtime::DeliveryTarget::WakeRun {
+            agent_core::contracts::events::DeliveryTarget::WakeRun {
                 run_id: target,
                 wait_key,
             },
@@ -1437,6 +1440,10 @@ fn enqueue_historical_deliveries(
         )?;
         if scope_matches(subscription.definition.scope, &event)
             && subscription.definition.filter.matches(&event)
+            && subscription
+                .definition
+                .start_position
+                .includes_recorded_time(event.event.recorded_at_ms)
         {
             let delivery_id = DeliveryId {
                 subscription_id: subscription.definition.subscription_id,
@@ -2051,6 +2058,31 @@ fn migrate(connection: &Connection) -> Result<(), EventError> {
     connection
         .execute_batch(
             "BEGIN IMMEDIATE;
+         CREATE TABLE IF NOT EXISTS workflow_fabric_records (
+             section TEXT NOT NULL,
+             identity TEXT NOT NULL,
+             position INTEGER NOT NULL,
+             value_json TEXT NOT NULL,
+             PRIMARY KEY(section, identity, position)
+         );
+         CREATE INDEX IF NOT EXISTS workflow_fabric_subscription_lookup
+             ON workflow_fabric_records(json_extract(value_json,'$.spec.consumer'),json_extract(value_json,'$.spec.subscription')) WHERE section='subscriptions';
+         CREATE INDEX IF NOT EXISTS workflow_fabric_subscription_due
+             ON workflow_fabric_records(json_extract(value_json,'$.due_at_ms'),position) WHERE section='subscriptions';
+         CREATE INDEX IF NOT EXISTS workflow_fabric_event_topic
+             ON workflow_fabric_records(json_extract(value_json,'$.event.topic'),position) WHERE section='events';
+         CREATE INDEX IF NOT EXISTS workflow_fabric_event_barrier
+             ON workflow_fabric_records(json_extract(value_json,'$.visible'),position) WHERE section='events';
+         CREATE INDEX IF NOT EXISTS workflow_fabric_receipt_lookup
+             ON workflow_fabric_records(json_extract(value_json,'$.key.consumer'),json_extract(value_json,'$.key.event_id')) WHERE section='receipts';
+         CREATE INDEX IF NOT EXISTS workflow_fabric_event_partition
+             ON workflow_fabric_records(json_extract(value_json,'$.event.envelope.tenant_id'),json_extract(value_json,'$.event.envelope.run_id'),position) WHERE section='events';
+         CREATE INDEX IF NOT EXISTS workflow_fabric_event_id
+             ON workflow_fabric_records(json_extract(value_json,'$.event.envelope.event_id')) WHERE section='events';
+         CREATE TABLE IF NOT EXISTS workflow_operator_fabric_v1 (
+             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+             state_json TEXT NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS workflow_events (
             sequence INTEGER PRIMARY KEY AUTOINCREMENT,
             event_id TEXT NOT NULL UNIQUE,
@@ -2213,8 +2245,8 @@ fn from_i64(value: i64, label: &str) -> Result<u64, EventError> {
     u64::try_from(value).map_err(|_| EventError::backend(format!("stored {label} is invalid")))
 }
 
-const fn source_key(source: agent_core::event_runtime::EventSource) -> &'static str {
-    use agent_core::event_runtime::EventSource;
+const fn source_key(source: agent_core::contracts::events::EventSource) -> &'static str {
+    use agent_core::contracts::events::EventSource;
     match source {
         EventSource::System => "system",
         EventSource::Gateway => "gateway",
@@ -2269,10 +2301,10 @@ const fn timer_status_key(status: TimerStatus) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use agent_core::event_runtime::{
+    use agent_core::contracts::events::{
         DeliveryTarget, EventFilter, EventSource, PayloadPredicate, SubscriptionOwner,
     };
-    use agent_core::harness::{
+    use agent_core::contracts::{
         CheckpointCodec, CheckpointEnvelope, CompleteFlowRun, FlowRunState, FlowRunStatus,
         FlowStore, RenewFlowLease, SuspendFlowRun, WaitSpec, WakeFlowRun,
     };

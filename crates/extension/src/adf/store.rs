@@ -198,7 +198,7 @@ mod tests {
         adf::{
             AdfExecutionMode, AdfOwner, AdfRuntimeDescriptor, AdfRuntimeKind, LockedAdfDefinition,
         },
-        harness::RunId,
+        contracts::RunId,
         tool::ToolRiskLevel,
     };
     use serde_json::json;

@@ -4,7 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use agent_core::{
     context::TokenEstimator,
-    harness::{
+    contracts::{
         BlobStore, FinishReason, ModelError, ModelErrorKind, ModelEvent, ModelEventStream,
         ModelPort, ModelRequest, ModelRole, TokenUsage, TokenUsageSource,
     },
@@ -307,6 +307,13 @@ async fn anthropic_request(
     let mut system = Vec::new();
     let mut messages: Vec<AnthropicMessage> = Vec::new();
     for message in &request.messages {
+        if message.role != ModelRole::User && !message.attachments.is_empty() {
+            return Err(ModelError::new(
+                ModelErrorKind::InvalidRequest,
+                "binary input is only supported on user messages",
+                false,
+            ));
+        }
         if message.role == ModelRole::System {
             if !message.content.is_empty() {
                 system.push(message.content.clone());
@@ -481,7 +488,7 @@ fn map_http_error(status: StatusCode) -> ModelError {
 mod tests {
     use std::convert::Infallible;
 
-    use agent_core::harness::{ModelMessage, RunId};
+    use agent_core::contracts::{ModelMessage, RunId};
     use axum::{
         Json, Router,
         http::HeaderMap,
@@ -494,6 +501,55 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn p6_anthropic_input_matrix() {
+        for (mime, kind) in [
+            ("image/png", Some("image")),
+            ("application/pdf", Some("document")),
+            ("audio/wav", None),
+            ("video/mp4", None),
+            ("application/octet-stream", None),
+            ("image/svg+xml", None),
+        ] {
+            let (request, store, _directory) = crate::provider::attachment::fixture(mime).await;
+            let result = anthropic_request(&request, Some(&store)).await;
+            if let Some(kind) = kind {
+                let body = serde_json::to_value(result.expect("supported")).expect("json");
+                assert_eq!(body["messages"][0]["content"][0]["type"], kind);
+            } else {
+                assert!(result.is_err(), "must reject {mime}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn p6_rejects_non_user_attachments() {
+        for role in [ModelRole::System, ModelRole::Assistant, ModelRole::Tool] {
+            let mut message = ModelMessage::user_with_attachments(
+                "",
+                vec![agent_core::contracts::ModelAttachment {
+                    blob_id: agent_core::contracts::BlobId::new(),
+                    media_type: "image/png".into(),
+                    name: None,
+                    size_bytes: None,
+                }],
+            );
+            message.role = role;
+            message.tool_call_id = Some("call".into());
+            let request = ModelRequest {
+                run_id: RunId::new(),
+                model: "fake".into(),
+                messages: vec![message],
+                tools: vec![],
+                max_output_tokens: None,
+            };
+            assert!(
+                anthropic_request(&request, None).await.is_err(),
+                "must reject {role:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn maps_tool_history_to_messages_blocks() {
         let request = ModelRequest {
             run_id: RunId::new(),
@@ -504,7 +560,7 @@ mod tests {
                 ModelMessage::assistant_tool_calls(
                     "",
                     "",
-                    vec![agent_core::harness::ModelToolCall {
+                    vec![agent_core::contracts::ModelToolCall {
                         id: "toolu_1".into(),
                         name: "lookup".into(),
                         arguments: "{\"q\":\"x\"}".into(),

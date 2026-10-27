@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use agent_core::harness::{
+use agent_core::contracts::{
     ApprovalId, ApprovalResolution, FinishReason, OutputChannel, RunEvent, RunEventKind, RunId,
     ToolRiskLevel,
 };

@@ -1,0 +1,35 @@
+listen = "127.0.0.1:8081"
+graph = "config/agents/demo.yaml"
+system_prompt = "You are Mina, a helpful assistant."
+
+# Tools execute directly in this local demo (no approval UI).
+# Terminal uses host processes, not an OS security sandbox.
+[workspace]
+root = "data/agent-chat-demo-workspace"
+terminal = true
+
+[model]
+model = "your-model-name"
+max_output_tokens = 4096
+
+[model.provider]
+type = "openai-compatible"
+base_url = "https://api.openai.com/v1/"
+protocol = "chat-completions"
+# Alternatively: api_key = "your-api-key"
+api_key = { env = "OPENAI_API_KEY" }
+
+# Remove this section to disable image generation; workspace tools still work.
+# The image provider may differ from the conversation model provider.
+[image_generation]
+model = "your-image-model-name"
+timeout_ms = 180000
+
+[image_generation.provider]
+type = "openai-compatible"
+base_url = "https://api.openai.com/v1/"
+api_key = { env = "OPENAI_API_KEY" }
+
+# Optional: reuse the same Skill/context preparation service as the formal server.
+# [context]
+# skill_directory = "skills"

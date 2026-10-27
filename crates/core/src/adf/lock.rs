@@ -1,7 +1,7 @@
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::harness::RunId;
+use crate::contracts::RunId;
 
 use super::{
     ADF_CONTRACT_VERSION, AdfArtifact, AdfArtifactRef, AdfDefinitionRequest, AdfError,

@@ -1,0 +1,170 @@
+
+== cargo fmt --all -- --check ==
+
+== cargo build -p agent-core -p agent-extension --features agent-chat ==
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.23s
+
+== cargo build -p agent-extension --example frame_shapes --features agent-chat ==
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.26s
+
+== cargo test -p agent-core -p agent-extension --features agent-chat ==
+   Compiling agent-extension v0.1.0 (/data/work/Mina/crates/extension)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.88s
+     Running unittests src/lib.rs (target/debug/deps/agent_core-496f5fdbc38c6a2c)
+
+running 72 tests
+test adf::policy::tests::validates_schema_and_source_limits ... ok
+test event_runtime::tests::publication_rejects_wildcard_topics ... ok
+test context::strategies::tests::estimator_counts_non_ascii_and_marks_estimates ... ok
+test event_runtime::tests::declarative_filter_matches_topic_and_payload ... ok
+test context::strategies::tests::noop_fails_when_a_partition_exceeds_its_budget ... ok
+test context::strategies::tests::sliding_window_never_drops_required_context ... ok
+test adf::lock::tests::locks_source_and_manifest_digests_independently_of_generated_identity ... ok
+test harness::agent_loop::machine::tests::does_not_retry_tool_with_unknown_idempotency ... ok
+test harness::agent_loop::reducer::tests::checkpoint_round_trip_preserves_skill_lock ... ok
+test harness::agent_loop::reducer::tests::completed_checkpoint_retains_final_answer_and_reasoning_for_next_turn ... ok
+test harness::agent_loop::reducer::tests::drives_model_tool_model_without_host_specific_io ... ok
+test harness::agent_loop::reducer::tests::exposes_provider_tools_without_entering_local_tool_execution ... ok
+test harness::agent_loop::reducer::tests::exposes_reasoning_lifecycle_without_reasoning_text ... ok
+test harness::agent_loop::reducer::tests::model_errors_are_portable_inputs ... ok
+test harness::agent_loop::reducer::tests::json_dispatch_contract_round_trips ... ok
+test harness::agent_loop::reducer::tests::rejects_stale_effect_results ... ok
+test harness::agent_loop::machine::tests::approval_suspends_serializes_resumes_and_completes ... ok
+test harness::agent_loop::reducer::tests::parses_empty_tool_arguments_as_an_empty_object_and_rejects_malformed_json ... ok
+test harness::agent_loop::tests::executes_a_risky_tool_only_after_approval ... ok
+test harness::agent_loop::machine::tests::tool_suspension_resumes_from_inbox_and_defers_remaining_calls ... ok
+test harness::agent_loop::tests::executes_a_tool_and_continues_until_the_model_finishes ... ok
+test harness::agent_loop::tests::numeric_review_level_can_filter_high_risk_tools ... ok
+test harness::agent_loop::tests::legacy_agent_run_returns_suspension_as_a_structured_tool_error ... ok
+test harness::agent_loop::tests::returns_step_limit_as_tool_error_then_runs_a_tool_free_final_summary ... ok
+test harness::agent_loop::tests::returns_a_rejected_risky_tool_to_the_model_without_executing_it ... ok
+test harness::approval::tests::numeric_review_threshold_filters_tool_risk ... ok
+test harness::event::tests::cancellation_produces_a_unique_cancelled_terminal_event ... ok
+test adf::policy::tests::foundational_policy_allows_only_pure_run_scoped_javascript ... ok
+test harness::agent_loop::machine::tests::retries_retryable_read_only_tool_within_its_bound ... ok
+test harness::event::tests::sequences_events_and_preserves_one_terminal_event ... ok
+test harness::machine::tests::checkpoint_requires_a_version_and_has_a_size_limit ... ok
+test harness::event::tests::synthesizes_a_failure_when_agent_omits_a_terminal_event ... ok
+test harness::run_state::tests::allows_recovery_to_fail_an_unstarted_persisted_run ... ok
+test harness::run_state::tests::projects_a_complete_run ... ok
+test harness::run_state::tests::projects_the_current_tool_set_revision ... ok
+test harness::run_state::tests::projects_tool_and_approval_lifecycle ... ok
+test harness::run_state::tests::rejects_sequence_gaps ... ok
+test harness::run_state::tests::separates_model_rounds_in_flattened_output ... ok
+test harness::session::tests::projects_redacted_reasoning_without_text ... ok
+test harness::session::tests::projects_ordered_reasoning_tools_approvals_and_text ... ok
+test harness::single_turn::tests::executes_one_task_through_the_model_port ... ok
+test harness::single_turn::tests::keeps_reasoning_separate_from_assistant_text ... ok
+test harness::tests::harness_executes_an_agent ... ok
+test harness::tests::harness_rejects_empty_input ... ok
+test harness::tests::harness_streams_sequenced_events ... ok
+test harness::tests::harness_validates_per_run_step_limits ... ok
+test harness::title::tests::completes_without_touching_conversation_history ... ok
+test harness::title::tests::manual_title_lock_discards_a_late_result ... ok
+test harness::title::tests::short_source_is_deferred ... ok
+test harness::title::tests::title_effect_is_tool_free_and_idempotent ... ok
+test harness::tool::tests::preserves_declared_tool_risk ... ok
+test harness::tool::tests::preserves_retry_guidance_for_external_tools ... ok
+test harness::tool::tests::registers_and_dispatches_a_validated_tool ... ok
+test harness::tool::tests::rejects_automatic_retries_without_idempotency ... ok
+test harness::tool::tests::rejects_duplicate_names ... ok
+test harness::tool::tests::rejects_invalid_arguments_before_dispatch ... ok
+test harness::tool::tests::rejects_parallel_tools_that_can_suspend ... ok
+test harness::tool::tests::reports_an_unknown_tool ... ok
+test script::contract::tests::request_limits_cannot_raise_the_host_ceiling ... ok
+test script::contract::tests::resolved_artifacts_expose_the_locked_digest ... ok
+test skill::runtime::tests::skill_compilation_and_lock_serialization_are_deterministic ... ok
+test tool::contract::tests::rejects_duplicate_tools_and_unknown_versions ... ok
+test harness::agent_loop::tests::fails_when_a_model_round_exceeds_its_deadline ... ok
+test tool::contract::tests::uses_stable_tagged_result_envelopes ... ok
+test tool::contract::tests::validates_and_round_trips_a_plugin_manifest ... ok
+test tool::contract::tests::rust_envelopes_match_the_published_json_schemas ... ok
+test harness::event::tests::run_deadline_produces_a_unique_timeout_failure ... ok
+test harness::agent_loop::tests::returns_tool_timeouts_to_the_model_and_continues ... ok
+test harness::single_turn::tests::fails_when_the_model_exceeds_its_deadline ... ok
+test harness::agent_loop::machine::tests::overlaps_parallel_safe_tools_but_preserves_model_result_order ... ok
+test harness::agent_loop::tests::legacy_agent_overlaps_parallel_safe_tools_and_preserves_result_order ... ok
+test harness::agent_loop::machine::tests::keeps_exclusive_tools_out_of_parallel_batches ... ok
+
+test result: ok. 72 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/operator_contract.rs (target/debug/deps/operator_contract-84f0f49ef6b43f00)
+
+running 4 tests
+test sequence_domains_are_distinct ... ok
+test rejects_unknown_versions_and_invalid_identity ... ok
+test rejects_schema_and_delivery_mismatch ... ok
+test stable_wire_roundtrip_and_exact_utf8_limit ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/agent_extension-f8d6f2db8fb60b0b)
+
+running 11 tests
+test output::tests::cancelled_and_failed_are_different_wire_events ... ok
+test output::tests::allocates_a_new_text_block_after_a_tool ... ok
+test output::tests::frame_rules_are_monotonic_heartbeat_free_and_idempotent ... ok
+test output::tests::server_hello_matches_spec_fixture_byte_for_byte ... ok
+test output::tests::client_reducer_replay_preserves_text_and_tool_order ... ok
+test output::tests::maps_text_and_reasoning_with_stable_blocks ... ok
+test output::tests::maps_all_terminal_reasons_and_keeps_cancelled_distinct ... ok
+test output::tests::unimplemented_resume_must_not_be_declared ... ok
+test output::tests::maps_tools_permission_usage_and_errors ... ok
+test output::tests::maps_tool_argument_execution_output_and_permission_resolution ... ok
+test output::tests::unknown_diagnostic_path_is_non_panicking ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/operator_fabric_contract.rs (target/debug/deps/operator_fabric_contract-8b096a08666527d4)
+
+running 11 tests
+test memory::fencing ... ok
+test memory::filters_and_receipts ... ok
+test memory::crashed_workers_eventually_dlq ... ok
+test memory::retry_dlq ... ok
+test memory::holes_and_order ... ok
+test memory::outbox_batch_visibility ... ok
+test memory::single_publish ... ok
+test memory::stable_offsets_across_partitions ... ok
+test memory::batch_atomic ... ok
+test memory::transaction ... ok
+test memory::bounds ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/sqlite_concurrency.rs (target/debug/deps/sqlite_concurrency-99d261ba9e0d9b84)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/terminal_tools.rs (target/debug/deps/terminal_tools-66a5f77866b44543)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests agent_core
+
+running 4 tests
+test crates/core/src/operator.rs - operator (line 4) - compile fail ... ok
+test crates/core/src/operator.rs - operator (line 16) - compile fail ... ok
+test crates/core/src/operator.rs - operator (line 12) - compile fail ... ok
+test crates/core/src/operator.rs - operator (line 8) - compile fail ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+   Doc-tests agent_extension
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+== node scripts/verify-frame-shapes.mjs ==
+解析出 16 个事件（/data/work/Mina/scripts/fixtures/frame-shapes.sse）
+最终 parts: text, tool, tool, custom, permission
+permission.request.id: 00000000-0000-0000-0000-000000000002
+结果: PASS（无异常；permission request.id 与服务端一致）
+
+本地闸门全部通过

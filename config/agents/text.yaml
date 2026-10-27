@@ -1,0 +1,39 @@
+schema_version: 1
+name: text-assistant
+operators:
+  context:
+    type: agent.context
+    version: 1
+    config:
+      system_prompt: "你是一个简洁、准确的助手。"
+      max_steps: 8
+  llm:
+    type: agent.model
+    version: 1
+    config:
+      model: primary
+      timeout_ms: 60000
+subscriptions:
+  - id: start-agent
+    subscriber: context
+    from: "$input"
+    events: [agent.start.v1]
+  - id: request-model
+    subscriber: llm
+    from: context
+    events: [model.requested.v1]
+  - id: context-failure
+    subscriber: llm
+    from: context
+    events: [context.failed.v1]
+lifecycle:
+  start:
+    event: agent.start.v1
+  terminal:
+    from: llm
+    completed: stop.completed.v1
+    failed: stop.failed.v1
+    cancelled: stop.cancelled.v1
+limits:
+  timeout_ms: 900000
+  max_deliveries: 10000

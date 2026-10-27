@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::workspace::{NativeWorkspaceFs, WorkspaceFs};
-use agent_core::harness::{ToolRegistrationError, ToolRegistry};
+use agent_core::contracts::{ToolRegistrationError, ToolRegistry};
 use agent_core::sandbox::ProcessSandbox;
 use thiserror::Error;
 
@@ -221,7 +221,7 @@ pub enum BuiltinToolCatalogError {
 
 #[cfg(test)]
 mod tests {
-    use agent_core::harness::{ToolPort, ToolRiskLevel};
+    use agent_core::contracts::{ToolPort, ToolRiskLevel};
     use tempfile::tempdir;
 
     use super::*;

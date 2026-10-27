@@ -143,7 +143,7 @@ mod tests {
     use super::*;
     use crate::{
         adf::{AdfDefinitionRequest, AdfPolicyRequest},
-        harness::RunId,
+        contracts::RunId,
         script::{SCRIPT_ABI_VERSION, ScriptIsolation, ScriptRuntimeDescriptor},
     };
 

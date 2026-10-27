@@ -1,0 +1,58 @@
+   Compiling agent-harness v0.1.0 (/data/work/Mina/crates/harness)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.62s
+     Running tests/context_operator.rs (target/debug/deps/context_operator-6dbadeaa43c940b5)
+
+running 7 tests
+test p2_timeout_does_not_remove_durable_request ... ok
+test p2_context_matches_legacy_input_fingerprint_skill_lock_and_memory ... ok
+test p2_large_input_is_referenced_and_engine_cannot_switch ... ok
+test p2_claimed_uncommitted_context_reopens_and_reclaims_expired_lease ... ok
+test p2_failure_is_a_committed_fact_not_a_retry ... ok
+test p2_durable_request_survives_waiter_cancel_and_sqlite_reopen ... ok
+test p2_receipt_outbox_reopen_and_duplicate_delivery_commit_once ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+   Compiling agent-harness v0.1.0 (/data/work/Mina/crates/harness)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.88s
+     Running unittests src/lib.rs (target/debug/deps/agent_harness-f7dbb73c895af9c2)
+
+running 1 test
+test run_runtime::tests::p2_context_bridge_concurrent_starts_and_reopen_reuse_the_flow_receipt ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.09s
+
+     Running tests/context_operator.rs (target/debug/deps/context_operator-6dbadeaa43c940b5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/operator_compat.rs (target/debug/deps/operator_compat-0bb9ac4284802afe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/operator_fabric_runtime.rs (target/debug/deps/operator_fabric_runtime-832f5aca0ab56197)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+   Compiling agent-core v0.1.0 (/data/work/Mina/crates/core)
+   Compiling agent-extension v0.1.0 (/data/work/Mina/crates/extension)
+   Compiling agent-harness v0.1.0 (/data/work/Mina/crates/harness)
+   Compiling mina-server v0.1.0 (/data/work/Mina/apps/server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.10s
+     Running unittests src/main.rs (target/debug/deps/mina_server-622d43d704925e6a)
+
+running 5 tests
+test admission::tests::p2_gateway_has_no_context_business_or_new_model_tool_execution ... ok
+test admission::tests::p2_preparation_errors_precede_sse_headers_with_legacy_status ... ok
+test admission::tests::p2_session_concurrency_during_context_preserves_key_hash_revision_and_busy ... ok
+test admission::tests::p2_http_disconnect_after_publish_still_starts_legacy ... ok
+test admission::tests::p2_stateless_and_session_reopen_finish_context_then_start_legacy_once ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.22s
+

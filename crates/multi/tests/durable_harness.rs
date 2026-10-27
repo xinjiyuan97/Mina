@@ -1,4 +1,4 @@
-use agent_core::harness::{
+use agent_core::contracts::{
     Agent, AgentEvent, AgentEventStream, AgentMetadata, FinishReason, RunRequest,
 };
 use agent_harness::{Harness, RunOptions};
