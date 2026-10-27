@@ -58,6 +58,8 @@ pub struct GraphRun {
     pub run_id: RunId,
     pub definition: AgentDefinition,
     pub input: Value,
+    /// Source node selected when this Run was admitted.
+    pub trigger: String,
     pub status: GraphStatus,
     pub output: Option<Value>,
     pub error: Option<String>,
@@ -790,6 +792,14 @@ impl ConfiguredAgent {
     pub async fn run(&self, input: impl Into<Value>) -> Result<GraphRun, FabricError> {
         self.engine.run("local", input.into()).await
     }
+    /// Fire a named manual trigger, creating an independent Run.
+    pub async fn trigger(
+        &self,
+        trigger: &str,
+        payload: impl Into<Value>,
+    ) -> Result<GraphRun, FabricError> {
+        self.engine.trigger("local", trigger, payload.into()).await
+    }
 }
 impl GraphEngine {
     pub(super) fn new(
@@ -814,6 +824,26 @@ impl GraphEngine {
     ) -> Result<GraphRun, FabricError> {
         self.start(tenant, RunId::new(), input).await
     }
+    pub async fn trigger(
+        self: &Arc<Self>,
+        tenant: &str,
+        trigger: &str,
+        payload: Value,
+    ) -> Result<GraphRun, FabricError> {
+        self.start_trigger(tenant, RunId::new(), trigger, payload)
+            .await
+    }
+    /// A stable RunId deduplicates retries of the same trigger occurrence.
+    pub async fn start_trigger(
+        self: &Arc<Self>,
+        tenant: &str,
+        run_id: RunId,
+        trigger: &str,
+        payload: Value,
+    ) -> Result<GraphRun, FabricError> {
+        self.admit_trigger(tenant, run_id, trigger, payload).await?;
+        self.recover(tenant, run_id).await
+    }
     pub async fn start(
         self: &Arc<Self>,
         tenant: &str,
@@ -830,28 +860,36 @@ impl GraphEngine {
         run_id: RunId,
         input: Value,
     ) -> Result<GraphRun, FabricError> {
+        self.admit_trigger(
+            tenant,
+            run_id,
+            &self.definition.lifecycle.start.trigger,
+            input,
+        )
+        .await
+    }
+    /// Persist a trigger occurrence and its initial event atomically, without execution.
+    pub async fn admit_trigger(
+        &self,
+        tenant: &str,
+        run_id: RunId,
+        trigger: &str,
+        input: Value,
+    ) -> Result<GraphRun, FabricError> {
         if tenant.trim().is_empty() || tenant.len() > 128 {
             return Err(invalid("tenant", "invalid tenant"));
         }
         let compiled = compile(self.definition.clone(), &self.registry, &self.resources)?;
-        for sub in compiled
+        compiled
             .definition
-            .subscriptions
-            .iter()
-            .filter(|s| s.from == "$input")
-        {
-            validate_value(
-                &compiled.descriptors[&sub.subscriber].inputs
-                    [&compiled.definition.lifecycle.start.event],
-                &input,
-                "input",
-            )?;
-        }
+            .validate_trigger(&self.registry, trigger, &input)?;
+        let source = &compiled.definition.triggers[trigger];
         let run = GraphRun {
             tenant: tenant.into(),
             run_id,
             definition: compiled.definition.clone(),
             input: input.clone(),
+            trigger: trigger.into(),
             status: GraphStatus::Running,
             output: None,
             error: None,
@@ -871,18 +909,14 @@ impl GraphEngine {
             .definition
             .subscriptions
             .iter()
-            .find(|s| s.from == "$input")
-            .map(|s| {
-                compiled.descriptors[&s.subscriber].inputs
-                    [&compiled.definition.lifecycle.start.event]
-                    .clone()
-            })
+            .find(|s| s.from == trigger)
+            .map(|s| compiled.descriptors[&s.subscriber].inputs[&source.event].clone())
             .expect("validated input");
         let event = make_event(
             tenant,
             run_id,
-            "$input",
-            GraphEvent::new(&compiled.definition.lifecycle.start.event, input),
+            trigger,
+            GraphEvent::new(&source.event, input),
             EventId::stable("static-agent-start", &root(tenant, run_id)),
             input_schema,
         );
@@ -897,7 +931,8 @@ impl GraphEngine {
         {
             Err(FabricError::Fenced) => {
                 let saved = self.get_run(tenant, run_id).await?;
-                if saved.input != run.input
+                if saved.trigger != run.trigger
+                    || saved.input != run.input
                     || saved.definition != run.definition
                     || saved.bindings != run.bindings
                     || saved.descriptors != run.descriptors
@@ -920,6 +955,9 @@ impl GraphEngine {
     ) -> Result<GraphRun, FabricError> {
         let saved = self.get_run(tenant, run).await?;
         let compiled = compile(saved.definition.clone(), &self.registry, &self.resources)?;
+        compiled
+            .definition
+            .validate_trigger(&self.registry, &saved.trigger, &saved.input)?;
         if compiled.bindings != saved.bindings || compiled.descriptors != saved.descriptors {
             return Err(invalid("recovery", "resource or operator contract changed"));
         }

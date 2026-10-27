@@ -4,6 +4,8 @@
 
 节点的实例名由图作者指定，例如 `llm`；`type` 标识实现，例如 `agent.model`。同一种实现可以创建多个实例，订阅的 `from` 和 `subscriber` 使用实例名。下文的事件名均包含协议版本后缀 `.v1`。
 
+图的入口另外声明在 `triggers` 中：当前支持 `type: manual` 的源节点，由引擎触发，不在 OperatorRegistry 注册，也不订阅 Run 内事件。详见 [Trigger 节点与手动触发](graph-triggers.md)。
+
 ## 节点一览
 
 | type | 能力 | 必需资源 | 必需配置 |

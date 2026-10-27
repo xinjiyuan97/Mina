@@ -405,11 +405,15 @@ async fn application_engine_admits_custom_json_graph_and_recovers_pinned_definit
         .output("custom.failed.v1",json!({"type":"object"}))
         .output("custom.cancelled.v1",json!({"type":"object"})), move |_,_| Ok(Arc::new(JsonNode(counted.clone())))).unwrap();
     let definition = AgentGraph::new("custom")
+        .trigger(
+            "start",
+            agent_core::agent::TriggerDefinition::manual("custom.start.v1"),
+        )
         .operator("node", OperatorDefinition::new("test.json", 1, json!({})))
-        .subscribe("start", "$input", "node", ["custom.start.v1"])
+        .subscribe("start", "start", "node", ["custom.start.v1"])
         .lifecycle(GraphLifecycle {
             start: GraphStart {
-                event: "custom.start.v1".into(),
+                trigger: "start".into(),
             },
             terminal: GraphTerminal {
                 from: "node".into(),
@@ -469,7 +473,7 @@ async fn application_engine_admits_custom_json_graph_and_recovers_pinned_definit
     );
     assert!(
         engine
-            .admit_graph(definition, json!({"value":43}), plan(), None)
+            .admit_graph(definition.clone(), json!({"value":43}), plan(), None)
             .await
             .is_err()
     );
@@ -504,5 +508,30 @@ async fn application_engine_admits_custom_json_graph_and_recovers_pinned_definit
     .unwrap();
     assert_eq!(again.events_after(run, 0, 128).await.unwrap(), events);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(
+        again
+            .trigger_graph(definition.clone(), "missing", json!({"value":44}))
+            .await
+            .is_err()
+    );
+    let mut triggered = again
+        .trigger_graph(definition, "start", json!({"value":44}))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !triggered.events.recv().await.unwrap().kind.is_terminal() {}
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        again
+            .get_run(triggered.run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .output,
+        "value=44"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     again.stop_workers().await;
 }

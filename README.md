@@ -8,6 +8,7 @@ Mina 是一个 Rust Agent 框架，使用静态事件订阅图组织单 Agent �
 
 | 需要做什么 | 文档 |
 | --- | --- |
+| 配置入口与手动触发 | [Trigger 节点与手动触发](docs/design/agent/graph-triggers.md) |
 | 编写 YAML/JSON 图，或用 Rust 构建图 | [静态 Agent 图编写指南](docs/design/agent/static-agent-graph.md) |
 | 实现并注册自定义节点 | [自定义 Graph 节点](docs/design/agent/custom-graph-nodes.md) |
 | 查节点能力、配置字段、输入输出事件 | [Graph 节点参考](docs/design/agent/graph-nodes.md) |
@@ -21,7 +22,7 @@ Mina 是一个 Rust Agent 框架，使用静态事件订阅图组织单 Agent �
 
 ```mermaid
 flowchart LR
-    Input[输入] --> Context[Context]
+    Trigger[Manual Trigger] --> Context[Context]
     Context --> Model[Model]
     Model -->|stop.completed| Done[完成]
     Model -->|stop.tool_calls| Gate[Gate]

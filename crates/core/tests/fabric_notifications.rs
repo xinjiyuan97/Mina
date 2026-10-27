@@ -60,15 +60,19 @@ async fn many_idle_runs_do_not_poll_and_ingress_wakes_them_promptly() {
         )
         .unwrap();
     let definition = AgentGraph::new("idle")
+        .trigger(
+            "start",
+            agent_core::agent::TriggerDefinition::manual("idle.start.v1"),
+        )
         .operator(
             "node",
             OperatorDefinition::new("test.waiting", 1, json!({})),
         )
-        .subscribe("start", "$input", "node", ["idle.start.v1"])
+        .subscribe("start", "start", "node", ["idle.start.v1"])
         .subscribe("wake", "$external", "node", ["idle.wake.v1"])
         .lifecycle(GraphLifecycle {
             start: GraphStart {
-                event: "idle.start.v1".into(),
+                trigger: "start".into(),
             },
             terminal: GraphTerminal {
                 from: "node".into(),

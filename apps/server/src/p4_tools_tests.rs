@@ -917,11 +917,15 @@ async fn server_runs_configured_graph_with_custom_registry() {
         )
         .unwrap();
     let definition = AgentGraph::new("server-configured")
+        .trigger(
+            "start",
+            agent_core::agent::TriggerDefinition::manual("custom.start.v1"),
+        )
         .operator("node", OperatorDefinition::new("test.server", 1, json!({})))
-        .subscribe("start", "$input", "node", ["custom.start.v1"])
+        .subscribe("start", "start", "node", ["custom.start.v1"])
         .lifecycle(GraphLifecycle {
             start: GraphStart {
-                event: "custom.start.v1".into(),
+                trigger: "start".into(),
             },
             terminal: GraphTerminal {
                 from: "node".into(),
