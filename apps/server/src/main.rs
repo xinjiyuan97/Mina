@@ -1,3 +1,4 @@
+use agent_core::agent::AgentLoop;
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -13,13 +14,13 @@ use agent_core::context::{
     HybridCompressor, NoopFailCompressor, SlidingWindowCompressor, SummaryGenerator,
     TokenEstimator,
 };
-use agent_core::event_runtime::{
+use agent_core::contracts::events::{
     CreateSubscription, Delivery, DeliveryRouter, DeliveryTarget, EventEnvelope, EventError,
     EventFilter, EventFuture, EventId, EventSource, EventStore, PublishEvent, StartPosition,
     SubscriptionId, SubscriptionMode, SubscriptionOwner, SubscriptionScope,
 };
-use agent_core::harness::{
-    Agent, AgentLoop, AgentMetadata, ApprovalDecision, ApprovalError, ApprovalFuture, ApprovalId,
+use agent_core::contracts::{
+    Agent, AgentMetadata, ApprovalDecision, ApprovalError, ApprovalFuture, ApprovalId,
     ApprovalPort, ApprovalRequest, ApprovalResolution, ArchiveSession, BeginSessionRun, BlobId,
     BlobStore, ContentPart, CreateSession, EffectRequest, FinalizeSessionRun, FinishReason,
     FlowEffect, FlowEffectRouter, FlowError, FlowStore, JobExecutionError, JobExecutionFuture,
@@ -84,7 +85,7 @@ use tokio::{
 };
 use tracing_subscriber::EnvFilter;
 
-use agent_core::agent::context_operator::PreparedRun;
+use agent_core::agent::host::preparation::PreparedRun;
 use agent_harness as run_runtime;
 mod admission;
 #[cfg(test)]
@@ -107,7 +108,7 @@ struct AppState {
     pipeline: Option<Arc<tools_pipeline::ServerAgentRuntime>>,
     pipeline_profile: tools_pipeline::EngineProfile,
     tools_pipeline: Option<Arc<tools_pipeline::ServerAgentRuntime>>,
-    admission: Arc<agent_core::agent::context_operator::AdmissionFacade>,
+    admission: Arc<agent_core::agent::host::preparation::AdmissionFacade>,
     runtime: RunRepository,
     config: Arc<HarnessConfig>,
     approvals: InMemoryApprovalBroker,
@@ -175,7 +176,7 @@ struct ServerFlowEffectRouter {
 }
 
 impl FlowEffectRouter for ServerFlowEffectRouter {
-    fn execute(&self, effect: FlowEffect) -> agent_core::harness::FlowFuture<'_, ()> {
+    fn execute(&self, effect: FlowEffect) -> agent_core::contracts::FlowFuture<'_, ()> {
         Box::pin(async move {
             match effect.request {
                 EffectRequest::PublishEvent { command } => self
@@ -345,12 +346,12 @@ fn event_flow_error(error: EventError) -> FlowError {
     }
 }
 
-fn job_flow_error(error: agent_core::harness::JobStoreError) -> FlowError {
+fn job_flow_error(error: agent_core::contracts::JobStoreError) -> FlowError {
     match error {
-        agent_core::harness::JobStoreError::Invalid(message) => FlowError::Invalid(message),
-        agent_core::harness::JobStoreError::NotFound => FlowError::NotFound,
-        agent_core::harness::JobStoreError::Conflict(message) => FlowError::Conflict(message),
-        agent_core::harness::JobStoreError::Backend(message) => FlowError::Backend(message),
+        agent_core::contracts::JobStoreError::Invalid(message) => FlowError::Invalid(message),
+        agent_core::contracts::JobStoreError::NotFound => FlowError::NotFound,
+        agent_core::contracts::JobStoreError::Conflict(message) => FlowError::Conflict(message),
+        agent_core::contracts::JobStoreError::Backend(message) => FlowError::Backend(message),
     }
 }
 
@@ -623,15 +624,15 @@ struct BlobInput {
     #[serde(default)]
     media_type: Option<String>,
     #[serde(default, deserialize_with = "deserialize_attachment_name")]
-    name: agent_core::context_operator::AttachmentNameInput,
+    name: agent_core::contracts::preparation::AttachmentNameInput,
     #[serde(default)]
     size_bytes: Option<u64>,
 }
 
 fn deserialize_attachment_name<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
-) -> Result<agent_core::context_operator::AttachmentNameInput, D::Error> {
-    use agent_core::context_operator::AttachmentNameInput;
+) -> Result<agent_core::contracts::preparation::AttachmentNameInput, D::Error> {
+    use agent_core::contracts::preparation::AttachmentNameInput;
     Ok(match Option::<String>::deserialize(deserializer)? {
         Some(name) => AttachmentNameInput::Named(name),
         None => AttachmentNameInput::Null,
@@ -843,10 +844,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_store: Arc<dyn EventStore> = event_adapter.clone();
     let flow_store: Arc<dyn FlowStore> = event_adapter.clone();
     let job_store: Arc<dyn JobStore> = event_adapter.clone();
-    let admission = Arc::new(agent_core::agent::context_operator::AdmissionFacade::new(
+    let admission = Arc::new(agent_core::agent::host::preparation::AdmissionFacade::new(
         event_adapter.clone(),
         Arc::clone(&blobs),
-        Arc::new(agent_core::agent::context_operator::AgentContextPreparer {
+        Arc::new(agent_core::agent::host::preparation::ContextPreparation {
             context,
             skills: Arc::clone(&skills),
         }),
@@ -911,13 +912,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     start_session_finalization_worker(Arc::clone(&sessions));
 
     let profile = tools_pipeline::configured_profile()?;
-    let tools_pipeline = Arc::new(tools_pipeline::ServerAgentRuntime::new(
-        agent_core::agent::AgentResources::new(event_adapter.clone())
-            .model("primary", "server-v1", operator_model)
-            .toolset("workspace", "server-v1", operator_tools)
-            .wait_service("durable", "server-v1", wait_bridge),
-        sqlite_store.clone(),
-    ));
+    let graph_resources = agent_core::agent::AgentResources::new(event_adapter.clone())
+        .model("primary", "server-v1", operator_model)
+        .toolset("workspace", "server-v1", operator_tools)
+        .wait_service("durable", "server-v1", wait_bridge);
+    let tools_runtime = if let Some(path) = env::var_os("MINA_AGENT_GRAPH") {
+        tools_pipeline::ServerAgentRuntime::with_graph(
+            graph_resources,
+            sqlite_store.clone(),
+            agent_core::agent::AgentDefinition::from_file(path)?,
+            agent_core::agent::OperatorRegistry::builtins(),
+        )?
+    } else {
+        tools_pipeline::ServerAgentRuntime::new(graph_resources, sqlite_store.clone())
+    };
+    let tools_pipeline = Arc::new(tools_runtime);
     let state = AppState {
         pipeline: Some(Arc::new(pipeline::build(
             &store_path,
@@ -1550,7 +1559,7 @@ struct PrepareRunRequest {
     run_id: RunId,
     input: String,
     attachments: Vec<ModelAttachment>,
-    attachment_names: Option<Vec<agent_core::context_operator::AttachmentNameInput>>,
+    attachment_names: Option<Vec<agent_core::contracts::preparation::AttachmentNameInput>>,
     explicit_skills: Vec<SkillChoice>,
     max_steps: u32,
     session_id: Option<SessionId>,
@@ -2516,7 +2525,7 @@ fn effective_run_max_steps(
 struct ResolvedBlobInputs {
     model: Vec<ModelAttachment>,
     content: Vec<ContentPart>,
-    names: Option<Vec<agent_core::context_operator::AttachmentNameInput>>,
+    names: Option<Vec<agent_core::contracts::preparation::AttachmentNameInput>>,
 }
 
 async fn resolve_blob_inputs(
@@ -2703,7 +2712,7 @@ fn attachment_request_hash(
     attachments: &[ModelAttachment],
     skills: &[SkillChoice],
     max_steps: u32,
-    names: Option<&[agent_core::context_operator::AttachmentNameInput]>,
+    names: Option<&[agent_core::contracts::preparation::AttachmentNameInput]>,
 ) -> String {
     let original = raw_request_hash(input, attachments, skills, max_steps);
     match names {
@@ -2899,11 +2908,11 @@ mod p0_contract_tests;
 #[cfg(test)]
 mod tests {
     use agent_core::context::InMemoryContextArtifactStore;
-    use agent_core::event_runtime::{
+    use agent_core::contracts::AgentEvent;
+    use agent_core::contracts::events::{
         ClaimDeliveries, ClaimTimers, CompleteDelivery, EventComponentDescriptor, PublishResult,
         RetryDelivery, ScheduleOnce, Subscription, Timer, TimerId,
     };
-    use agent_core::harness::AgentEvent;
     use agent_core::tool::ToolRiskLevel;
     use agent_extension::store::{InMemoryMemoryStore, InMemoryRunStore};
     use futures_util::stream as futures_stream;
@@ -3077,10 +3086,10 @@ api_key = "test-key"
             EventRuntimeConfig::default(),
         ));
         let skills = Arc::new(SkillOrchestrator::new(skill_store));
-        let admission = Arc::new(agent_core::agent::context_operator::AdmissionFacade::new(
+        let admission = Arc::new(agent_core::agent::host::preparation::AdmissionFacade::new(
             Arc::new(agent_extension::operator_fabric::MemoryFabric::default()),
             Arc::clone(&blobs),
-            Arc::new(agent_core::agent::context_operator::AgentContextPreparer {
+            Arc::new(agent_core::agent::host::preparation::ContextPreparation {
                 context,
                 skills: Arc::clone(&skills),
             }),
@@ -3230,7 +3239,7 @@ api_key = "test-key"
 
     #[tokio::test]
     async fn durable_job_completion_event_wakes_a_suspended_flow() {
-        use agent_core::harness::{
+        use agent_core::contracts::{
             CheckpointCodec, CheckpointEnvelope, FlowRunState, FlowRunStatus, SuspendFlowRun,
             WaitSpec,
         };
@@ -3264,7 +3273,7 @@ api_key = "test-key"
             JobRuntimeConfig::default(),
         );
         let run_id = RunId::new();
-        let job_id = agent_core::harness::JobId::new();
+        let job_id = agent_core::contracts::JobId::new();
         let checkpoint = CheckpointEnvelope {
             agent_kind: "test".into(),
             schema_version: 1,
@@ -3329,7 +3338,7 @@ api_key = "test-key"
             })
             .await
             .expect("flow should suspend");
-        jobs.submit(agent_core::harness::StartJob {
+        jobs.submit(agent_core::contracts::StartJob {
             job_id,
             run_id,
             kind: "builtin.delay".into(),
@@ -3513,9 +3522,9 @@ api_key = "test-key"
         )
         .expect("agent should compose");
         let run_id = RunId::new();
-        let outputs: Vec<_> = agent_core::harness::Agent::run(
+        let outputs: Vec<_> = agent_core::contracts::Agent::run(
             &agent,
-            agent_core::harness::RunRequest {
+            agent_core::contracts::RunRequest {
                 run_id,
                 input: "hello".into(),
                 attachments: vec![],
@@ -3523,7 +3532,7 @@ api_key = "test-key"
                 allowed_tools: Some(vec![]),
                 allow_run_adf: false,
                 max_steps: Some(2),
-                cancellation: agent_core::harness::RunCancellation::new(),
+                cancellation: agent_core::contracts::RunCancellation::new(),
             },
         )
         .collect()
@@ -3532,7 +3541,7 @@ api_key = "test-key"
             .iter()
             .filter_map(|event| match event {
                 AgentEvent::OutputDelta {
-                    channel: agent_core::harness::OutputChannel::AssistantText,
+                    channel: agent_core::contracts::OutputChannel::AssistantText,
                     delta,
                 } => Some(delta.as_str()),
                 _ => None,

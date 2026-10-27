@@ -7,10 +7,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    event_runtime::{
+    contracts::events::{
         CreateSubscription, EventEnvelope, EventId, PublishEvent, ScheduleOnce, SubscriptionId,
     },
-    harness::{AgentEvent, AgentMetadata, FinishReason, ModelMessage, RunCancellation, RunId},
+    contracts::{AgentEvent, AgentMetadata, FinishReason, ModelMessage, RunCancellation, RunId},
 };
 
 macro_rules! machine_uuid_id {
@@ -98,7 +98,7 @@ impl CheckpointEnvelope {
 pub struct MachineStartRequest {
     pub run_id: RunId,
     pub input: String,
-    pub attachments: Vec<crate::harness::ModelAttachment>,
+    pub attachments: Vec<crate::contracts::ModelAttachment>,
     pub prior_messages: Vec<ModelMessage>,
     pub allowed_tools: Option<Vec<String>>,
     pub allow_run_adf: bool,
@@ -169,7 +169,7 @@ impl EffectRequest {
     pub fn validate(&self) -> Result<(), FlowError> {
         match self {
             Self::PublishEvent { command } => {
-                crate::event_runtime::validate_publish(command).map_err(flow_from_event)
+                crate::contracts::events::validate_publish(command).map_err(flow_from_event)
             }
             Self::ScheduleTimer { command } => command.validate().map_err(flow_from_event),
             Self::StartJob { command } => command.validate(),
@@ -417,12 +417,12 @@ pub enum FlowError {
     Backend(String),
 }
 
-fn flow_from_event(error: crate::event_runtime::EventError) -> FlowError {
+fn flow_from_event(error: crate::contracts::events::EventError) -> FlowError {
     match error {
-        crate::event_runtime::EventError::Invalid(message) => FlowError::Invalid(message),
-        crate::event_runtime::EventError::NotFound => FlowError::NotFound,
-        crate::event_runtime::EventError::Conflict(message) => FlowError::Conflict(message),
-        crate::event_runtime::EventError::Backend(message) => FlowError::Backend(message),
+        crate::contracts::events::EventError::Invalid(message) => FlowError::Invalid(message),
+        crate::contracts::events::EventError::NotFound => FlowError::NotFound,
+        crate::contracts::events::EventError::Conflict(message) => FlowError::Conflict(message),
+        crate::contracts::events::EventError::Backend(message) => FlowError::Backend(message),
     }
 }
 

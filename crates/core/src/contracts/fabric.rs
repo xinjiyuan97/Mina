@@ -6,7 +6,7 @@ use std::{future::Future, pin::Pin};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{event_runtime::EventId, operator::OperatorEnvelope};
+use crate::{contracts::events::EventId, operator::OperatorEnvelope};
 
 pub const MAX_EVENT_BYTES: usize = 64 * 1024;
 pub const MAX_BATCH_BYTES: usize = 1024 * 1024;
@@ -139,7 +139,7 @@ pub enum FabricCommand {
     /// Maintenance operation: retire terminal, quiescent run resources after retention.
     RetireRun {
         tenant: String,
-        run_id: crate::harness::RunId,
+        run_id: crate::contracts::RunId,
         now_ms: i64,
         retention_ms: i64,
         dry_run: bool,
@@ -149,7 +149,7 @@ pub enum FabricCommand {
     CollectArtifacts {
         now_ms: i64,
         grace_ms: i64,
-        external_roots: Vec<crate::harness::BlobId>,
+        external_roots: Vec<crate::contracts::BlobId>,
         dry_run: bool,
     },
     /// Root inventory for external BlobStore maintenance under the host's maintenance barrier.
@@ -180,7 +180,7 @@ pub enum FabricCommand {
     InspectRetention {
         now_ms: i64,
         grace_ms: i64,
-        external_roots: Vec<crate::harness::BlobId>,
+        external_roots: Vec<crate::contracts::BlobId>,
     },
     PublishBounded {
         events: Vec<FabricEvent>,
@@ -273,7 +273,7 @@ pub enum FabricCommand {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FabricReply {
     Collected(CollectionReport),
-    ArtifactRoots(Vec<crate::harness::BlobId>),
+    ArtifactRoots(Vec<crate::contracts::BlobId>),
     /// None means no log exists (for compatibility with inline legacy history).
     Log(Option<LogPage>),
     Retention(RetentionInventory),
@@ -303,7 +303,7 @@ pub struct RetentionInventory {
     pub active_leases: usize,
     pub lease_reclaims: u64,
     pub protected_artifacts: usize,
-    pub orphan_candidates: Vec<crate::harness::BlobId>,
+    pub orphan_candidates: Vec<crate::contracts::BlobId>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,8 +323,28 @@ pub struct CollectionReport {
 }
 
 pub trait OperatorFabric: Send + Sync {
+    /// In-process change hint. Durable reads remain authoritative; remote writers
+    /// and adapters without notifications are discovered by the bounded fallback.
+    fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
     fn capabilities(&self) -> FabricCapabilities;
     fn execute(&self, command: FabricCommand) -> FabricFuture<'_>;
+}
+
+impl FabricCommand {
+    /// Whether a successful command commits checkpoint or log state.
+    pub fn writes_checkpoint(&self) -> bool {
+        matches!(
+            self,
+            Self::Transact { .. }
+                | Self::TransactMany { .. }
+                | Self::TransactLog { .. }
+                | Self::GuardedTransact { .. }
+                | Self::GuardedTransactMany { .. }
+                | Self::GuardedTransactLog { .. }
+        )
+    }
 }
 
 /// The high watermark and a bounded page after the requested offset.
@@ -332,4 +352,39 @@ pub trait OperatorFabric: Send + Sync {
 pub struct LogPage {
     pub through: u64,
     pub items: Vec<Value>,
+}
+
+/// Wake readers only after committed observable changes, never on reads/empty claims.
+pub fn observable_change(reply: &FabricReply) -> bool {
+    match reply {
+        FabricReply::Published(events) => !events.is_empty(),
+        FabricReply::Committed(_) | FabricReply::Retried { .. } => true,
+        FabricReply::Dispatched(count) => *count > 0,
+        FabricReply::Collected(report) => !report.dry_run,
+        _ => false,
+    }
+}
+
+/// Subscribe before reading, mark the current generation before each read pass,
+/// then wait. A change racing the read is retained by watch, not lost like Notify.
+pub struct FabricWatch(Option<tokio::sync::watch::Receiver<u64>>);
+impl FabricWatch {
+    pub fn new(fabric: &dyn OperatorFabric) -> Self {
+        Self(fabric.changes())
+    }
+    pub fn observe(&mut self) {
+        if let Some(rx) = &mut self.0 {
+            rx.borrow_and_update();
+        }
+    }
+    pub async fn wait(&mut self, fallback: std::time::Duration) {
+        if let Some(rx) = &mut self.0 {
+            if let Ok(Err(_)) = tokio::time::timeout(fallback, rx.changed()).await {
+                self.0 = None;
+                tokio::time::sleep(fallback).await;
+            }
+        } else {
+            tokio::time::sleep(fallback).await;
+        }
+    }
 }

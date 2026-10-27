@@ -1,6 +1,6 @@
 //! Indexed SQLite scheduling. Only eligible subscriptions and their next event are decoded.
 use super::{storage, validate_key};
-use agent_core::operator_fabric::*;
+use agent_core::contracts::fabric::*;
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::harness::{RunCancellation, RunId};
+use crate::contracts::{RunCancellation, RunId};
 
 pub const SCRIPT_ABI_VERSION: u32 = 1;
 

@@ -1,4 +1,4 @@
-use agent_core::{harness::BlobId, operator_fabric::*};
+use agent_core::{contracts::BlobId, contracts::fabric::*};
 use agent_extension::store::SqliteEventStore;
 
 #[tokio::main]

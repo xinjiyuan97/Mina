@@ -1,7 +1,7 @@
 //! Durable public event projection for static graphs. This host observes facts;
 //! model/tool scheduling remains entirely in the subscription graph.
 use super::*;
-use crate::{event_runtime::EventId, harness::*, operator_fabric::*};
+use crate::{contracts::events::EventId, contracts::fabric::*, contracts::*};
 use serde_json::json;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -9,6 +9,8 @@ struct Cursor {
     graph: u64,
     public: u64,
     terminal: bool,
+    #[serde(default)]
+    has_text: bool,
     #[serde(default)]
     toolsets: BTreeMap<String, (u64, String)>,
 }
@@ -47,6 +49,15 @@ impl PublicJournal {
         for kind in kinds {
             if cursor.terminal {
                 break;
+            }
+            if matches!(
+                &kind,
+                RunEventKind::OutputDelta {
+                    channel: OutputChannel::AssistantText,
+                    ..
+                }
+            ) {
+                cursor.has_text = true;
             }
             cursor.terminal = kind.is_terminal();
             cursor.public += 1;
@@ -104,6 +115,24 @@ impl PublicJournal {
             let mut kinds = vec![];
             if cursor.public == 0 {
                 kinds.push(RunEventKind::RunStarted);
+            }
+            // Generic graphs may return a final value without a streaming model.
+            if event.kind == "engine.terminal.v1"
+                && event.payload["status"] == "completed"
+                && !cursor.has_text
+            {
+                let value = &event.payload["output"];
+                if !value.is_null() {
+                    let text = value
+                        .as_str()
+                        .or_else(|| value["output"].as_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string());
+                    kinds.push(RunEventKind::OutputDelta {
+                        channel: OutputChannel::AssistantText,
+                        delta: text,
+                    });
+                }
             }
             for semantic in semantic_events(&event)? {
                 if let AgentEvent::ToolSetUpdated {
@@ -380,7 +409,9 @@ impl GraphHost {
         let host = self.clone();
         Box::pin(async_stream::stream! {
             let mut after = after;
+            let mut activity = FabricWatch::new(host.journal.fabric.as_ref());
             loop {
+                activity.observe();
                 match host.events_after(run, after, 128).await {
                     Ok(page) => {
                         for event in page {
@@ -397,7 +428,7 @@ impl GraphHost {
                     }
                     Err(error) => { yield Err(error); return; }
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                activity.wait(std::time::Duration::from_secs(1)).await;
             }
         })
     }

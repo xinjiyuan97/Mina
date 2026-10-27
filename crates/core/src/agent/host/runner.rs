@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use crate::harness::{
+use crate::contracts::{
     Agent, AgentMetadata, ModelAttachment, ModelMessage, OutputChannel, RunCancellation,
     RunEventKind, RunEventStream, RunId, RunRequest, RunResponse,
 };
@@ -189,7 +189,7 @@ where
         Ok(RunExecution {
             run_id,
             cancellation: cancellation.clone(),
-            events: crate::harness::run_event_stream(
+            events: crate::contracts::run_event_stream(
                 run_id,
                 events,
                 cancellation,
@@ -271,7 +271,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::harness::{AgentEvent, AgentEventStream, AgentMetadata, FinishReason, RunRequest};
+    use crate::contracts::{AgentEvent, AgentEventStream, AgentMetadata, FinishReason, RunRequest};
 
     use super::*;
 

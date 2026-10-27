@@ -14,8 +14,8 @@ use super::{
     ToolCallStrategy, add_usage, digest_only_arguments, digest_only_bytes, rejection_message,
     step_limit_tool_error_content, tool_error_content,
 };
-use crate::harness::tool::parse_tool_arguments;
-use crate::harness::{
+use crate::contracts::tool::parse_tool_arguments;
+use crate::contracts::{
     AgentEvent, ApprovalDecision, ApprovalId, ApprovalResolution, EffectRequest, FinishReason,
     MachineError, ModelAttachment, ModelEvent, ModelMessage, ModelRequest, ModelToolCall,
     OutputChannel, RunId, TokenUsage, TokenUsageSource, ToolApprovalPolicy, ToolArgumentVisibility,
@@ -1530,7 +1530,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::harness::{
+    use crate::contracts::{
         ModelError, ModelErrorKind, ToolBinding, ToolDefinition, ToolIdempotency,
     };
 
@@ -1618,7 +1618,7 @@ mod tests {
         let checkpoint = serde_json::to_string(&transition.state).expect("checkpoint");
         let restored: AgentLoopReducerState = serde_json::from_str(&checkpoint).expect("restore");
         let answer = restored.messages.last().expect("final assistant message");
-        assert_eq!(answer.role, crate::harness::ModelRole::Assistant);
+        assert_eq!(answer.role, crate::contracts::ModelRole::Assistant);
         assert_eq!(answer.content, "hello back");
         assert_eq!(answer.reasoning, "thinking");
         let next = AgentLoopReducer::start(AgentLoopStart {

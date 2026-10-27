@@ -166,3 +166,16 @@ RUST_LOG=agent_chat_demo=debug,agent_core=info cargo run -p mina-server --exampl
 ## 自定义图节点
 
 修改 [demo.yaml](../config/agents/demo.yaml) 可调整现有节点和订阅。增加自定义类型时，需要先在 Rust 宿主注册，再传给 GraphAgent；当前 demo 默认仅注册内置节点。完整步骤与可复制示例见 [自定义节点指南](design/agent/custom-graph-nodes.md)。
+
+## 共享上下文准备与 Skill
+
+可选配置：
+
+```toml
+[context]
+skill_directory = "skills"
+```
+
+启用后，demo 使用 Core 的 ContextPreparation 和 GraphAgent::with_context_preparation，与正式 Server 的持久化接入共用 Skill 选择、指令编译、工具授权和上下文预算实现。目录中的 Skill 使用 skill.toml + SKILL.md 格式。匹配的 Skill 可以收紧工具列表，不会扩大宿主已注册权限。
+
+demo 的历史来自当前内存会话，作为 prior_messages 进入预算流程；正式 Server 可以读取 SessionStore。demo 配置为最多 8 个 Skill、65536 token 上下文预算、4096 Skill token、16000 历史 token，输出预留沿用模型设置；Memory 检索关闭。没有 context 配置时保持原有直接图运行行为。Skill 准备失败不会调用模型。

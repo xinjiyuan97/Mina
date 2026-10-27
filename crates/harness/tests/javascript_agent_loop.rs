@@ -1,9 +1,10 @@
+use agent_core::agent::AgentLoop;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_core::{
-    harness::{
-        AgentLoop, FinishReason, ModelEvent, ModelEventStream, ModelPort, ModelRequest,
-        RunEventKind, RunId, ToolRegistry,
+    contracts::{
+        FinishReason, ModelEvent, ModelEventStream, ModelPort, ModelRequest, RunEventKind, RunId,
+        ToolRegistry,
     },
     script::ScriptLimits,
 };

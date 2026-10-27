@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use agent_core::harness::{
+use agent_core::contracts::{
     ClaimJobNotifications, ClaimJobs, CompleteJob, CompleteJobNotification, JobComponentDescriptor,
     JobFuture, JobId, JobNotificationStatus, JobOutcome, JobRecord, JobStatus, JobStore,
     JobStoreError, RetryJob, RetryJobNotification, StartJob, SubmitJobResult,
@@ -518,12 +518,12 @@ fn sql_error(operation: &str, error: rusqlite::Error) -> JobStoreError {
     JobStoreError::Backend(format!("{operation}: {error}"))
 }
 
-fn map_flow_error(error: agent_core::harness::FlowError) -> JobStoreError {
+fn map_flow_error(error: agent_core::contracts::FlowError) -> JobStoreError {
     match error {
-        agent_core::harness::FlowError::Invalid(message) => JobStoreError::Invalid(message),
-        agent_core::harness::FlowError::NotFound => JobStoreError::NotFound,
-        agent_core::harness::FlowError::Conflict(message) => JobStoreError::Conflict(message),
-        agent_core::harness::FlowError::Backend(message) => JobStoreError::Backend(message),
+        agent_core::contracts::FlowError::Invalid(message) => JobStoreError::Invalid(message),
+        agent_core::contracts::FlowError::NotFound => JobStoreError::NotFound,
+        agent_core::contracts::FlowError::Conflict(message) => JobStoreError::Conflict(message),
+        agent_core::contracts::FlowError::Backend(message) => JobStoreError::Backend(message),
     }
 }
 
@@ -537,7 +537,7 @@ async fn run_blocking<T: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use agent_core::harness::RunId;
+    use agent_core::contracts::RunId;
     use serde_json::json;
     use tempfile::tempdir;
 

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use agent_core::{
-    harness::{
+    contracts::{
         Tool, ToolArgumentVisibility, ToolCallFuture, ToolCallRequest, ToolConcurrency,
         ToolDefinition, ToolError, ToolErrorCategory, ToolExecutionPolicy, ToolOutput,
         ToolRetryPolicy, ToolRiskLevel,

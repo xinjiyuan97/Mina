@@ -1,6 +1,6 @@
 //! P2 Context execution and bounded admission barrier.
 
-use crate::agent::{PlannedRun, operator_fabric::*, unix_time_ms};
+use crate::agent::{PlannedRun, executor::*, unix_time_ms};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{
     context::{ContextBuildRequest, ContextEngine},
@@ -8,15 +8,14 @@ use crate::{
     skill::{ResolveSkillsRequest, SkillOrchestrator, compile_skills},
 };
 use crate::{
-    context_operator::*,
-    event_runtime::EventId,
-    harness::{BlobId, BlobStore, PutBlob, RunId},
+    contracts::events::EventId,
+    contracts::fabric::*,
+    contracts::preparation::*,
+    contracts::{BlobId, BlobStore, PutBlob, RunId},
     operator::*,
-    operator_fabric::*,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
-#[cfg(not(target_arch = "wasm32"))]
 use sha2::{Digest, Sha256};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Notify;
@@ -470,13 +469,13 @@ fn storage(error: impl std::fmt::Display) -> FabricError {
 
 /// Native host adapter: browser SkillStore futures are intentionally non-Send.
 #[cfg(not(target_arch = "wasm32"))]
-pub struct AgentContextPreparer {
+pub struct ContextPreparation {
     pub context: ContextEngine,
     pub skills: Arc<SkillOrchestrator>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl ContextPreparer for AgentContextPreparer {
+impl ContextPreparer for ContextPreparation {
     fn prepare(&self, request: ContextRequest) -> PrepareFuture<'_> {
         Box::pin(async move {
             let policy = &request.policy;
@@ -523,6 +522,7 @@ impl ContextPreparer for AgentContextPreparer {
                     session_id: request.session_id,
                     through_message_ordinal: request.through_message_ordinal,
                     current_input: request.input,
+                    prior_messages: request.prior_messages,
                     request_digest: request_digest.clone(),
                     agent_profile: policy.agent_profile.clone(),
                     agent_instruction: policy.agent_instruction.clone(),
@@ -559,7 +559,7 @@ pub fn prepared_plan(request: ContextRequest, prepared: PreparedContext) -> Plan
         "skill_refs": pack.skill_refs, "memory_refs": pack.memory_refs, "artifact_refs": pack.artifact_refs,
         "components": pack.component_descriptors,
         "token_accounting": { "provider_usage_preferred": true, "fallback": "token_estimator" },
-        "step_budget": { "max_steps": request.max_steps, "final_summary_step": true },
+        "step_budget": { "max_steps": request.max_steps, "final_summary_step": false },
         "tool_grants": { "static_tools": pack.effective_tools, "allow_run_adf": request.policy.allow_run_adf },
         "tool_runtime": { "script": request.policy.script_runtime, "adf_enabled": request.policy.allow_run_adf },
     });
@@ -591,4 +591,39 @@ pub type PrepareFuture<'scope> = std::pin::Pin<
 >;
 pub trait ContextPreparer: Send + Sync {
     fn prepare(&self, request: ContextRequest) -> PrepareFuture<'_>;
+}
+
+/// The direct Agent adapter and durable admission facade share the same preparer
+/// and plan conversion. History supplied by lightweight hosts is budgeted too.
+pub async fn prepare_agent_request(
+    preparer: &dyn ContextPreparer,
+    request: &crate::contracts::RunRequest,
+    policy: crate::contracts::preparation::ContextPolicy,
+    max_steps: u32,
+) -> Result<PlannedRun, ContextFailed> {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "input":request.input,"attachments":request.attachments,
+        "history":request.prior_messages,"policy":policy,"max_steps":max_steps,
+    }))
+    .map_err(|_| ContextFailed {
+        code: "context_build_failed".into(),
+        message: "Invalid context input".into(),
+    })?;
+    let context_request = ContextRequest {
+        engine_version: crate::operator::EngineVersion::OperatorV1,
+        execution_profile: Some("operator_v1_tools".into()),
+        run_id: request.run_id,
+        session_id: None,
+        through_message_ordinal: None,
+        request_hash: format!("sha256:{:x}", Sha256::digest(&bytes)),
+        input: request.input.clone(),
+        attachments: request.attachments.clone(),
+        prior_messages: request.prior_messages.clone(),
+        attachment_names: None,
+        explicit_skills: vec![],
+        max_steps,
+        policy,
+    };
+    let prepared = preparer.prepare(context_request.clone()).await?;
+    Ok(prepared_plan(context_request, prepared))
 }

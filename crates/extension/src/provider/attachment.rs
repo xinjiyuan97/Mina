@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use agent_core::harness::{BlobObject, BlobStore, ModelAttachment, ModelError, ModelErrorKind};
+use agent_core::contracts::{BlobObject, BlobStore, ModelAttachment, ModelError, ModelErrorKind};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 pub(super) async fn load_blob(
@@ -77,11 +77,11 @@ pub(super) fn data_url(media_type: &str, data: &[u8]) -> String {
 pub(super) async fn fixture(
     media_type: &str,
 ) -> (
-    agent_core::harness::ModelRequest,
+    agent_core::contracts::ModelRequest,
     Arc<dyn BlobStore>,
     tempfile::TempDir,
 ) {
-    use agent_core::harness::{
+    use agent_core::contracts::{
         BlobId, BlobMetadata, BlobStoreFuture, ModelMessage, ModelRequest, PutBlob, RunId,
     };
     struct Fixed(BlobObject);

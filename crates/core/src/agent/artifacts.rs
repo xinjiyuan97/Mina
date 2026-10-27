@@ -1,4 +1,4 @@
-use crate::{harness::*, operator_fabric::*};
+use crate::{contracts::fabric::*, contracts::*};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::json;

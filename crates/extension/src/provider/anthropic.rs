@@ -4,7 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use agent_core::{
     context::TokenEstimator,
-    harness::{
+    contracts::{
         BlobStore, FinishReason, ModelError, ModelErrorKind, ModelEvent, ModelEventStream,
         ModelPort, ModelRequest, ModelRole, TokenUsage, TokenUsageSource,
     },
@@ -488,7 +488,7 @@ fn map_http_error(status: StatusCode) -> ModelError {
 mod tests {
     use std::convert::Infallible;
 
-    use agent_core::harness::{ModelMessage, RunId};
+    use agent_core::contracts::{ModelMessage, RunId};
     use axum::{
         Json, Router,
         http::HeaderMap,
@@ -526,8 +526,8 @@ mod tests {
         for role in [ModelRole::System, ModelRole::Assistant, ModelRole::Tool] {
             let mut message = ModelMessage::user_with_attachments(
                 "",
-                vec![agent_core::harness::ModelAttachment {
-                    blob_id: agent_core::harness::BlobId::new(),
+                vec![agent_core::contracts::ModelAttachment {
+                    blob_id: agent_core::contracts::BlobId::new(),
                     media_type: "image/png".into(),
                     name: None,
                     size_bytes: None,
@@ -560,7 +560,7 @@ mod tests {
                 ModelMessage::assistant_tool_calls(
                     "",
                     "",
-                    vec![agent_core::harness::ModelToolCall {
+                    vec![agent_core::contracts::ModelToolCall {
                         id: "toolu_1".into(),
                         name: "lookup".into(),
                         arguments: "{\"q\":\"x\"}".into(),

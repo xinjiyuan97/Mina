@@ -4,7 +4,7 @@ use std::sync::Arc;
 mod retention;
 pub use retention::BlobCollectionReport;
 
-use agent_core::harness::{
+use agent_core::contracts::{
     BlobId, BlobMetadata, BlobObject, BlobStore, BlobStoreError, BlobStoreFuture, PutBlob,
 };
 

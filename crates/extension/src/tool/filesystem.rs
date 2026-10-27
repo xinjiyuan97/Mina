@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use agent_core::harness::{
+use agent_core::contracts::{
     Tool, ToolCallFuture, ToolCallRequest, ToolConcurrency, ToolDefinition, ToolError,
     ToolErrorCategory, ToolExecutionPolicy, ToolOutput, ToolRetryPolicy, ToolRiskLevel,
 };
@@ -517,7 +517,7 @@ fn cancelled() -> ToolError {
 mod tests {
     use std::path::Path;
 
-    use agent_core::harness::{RunCancellation, RunId, ToolCallRequest};
+    use agent_core::contracts::{RunCancellation, RunId, ToolCallRequest};
     use serde_json::json;
     use tempfile::tempdir;
 

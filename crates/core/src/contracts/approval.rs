@@ -5,7 +5,7 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::harness::{RunId, ToolRiskLevel};
+use crate::contracts::{RunId, ToolRiskLevel};
 
 /// Numeric host filter for Tool review, analogous to a logging threshold.
 /// Tool severities are Low=10, Medium=50 and High=90. A threshold of 100

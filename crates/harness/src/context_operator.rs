@@ -1,2 +1,2 @@
 //! Compatibility import; single-agent implementation lives in Core.
-pub use agent_core::agent::context_operator::*;
+pub use agent_core::agent::host::preparation::*;

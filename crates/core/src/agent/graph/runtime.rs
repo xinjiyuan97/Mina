@@ -1,9 +1,9 @@
 use super::*;
 use crate::{
-    agent::{OperatorBus, bus::TransactionalOperator, operator_fabric::FabricRuntimeConfig},
-    event_runtime::EventId,
+    agent::{OperatorBus, bus::TransactionalOperator, executor::FabricRuntimeConfig},
+    contracts::events::EventId,
+    contracts::fabric::*,
     operator::*,
-    operator_fabric::*,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -46,7 +46,7 @@ fn accumulate_usage(previous: Option<TokenUsage>, next: Option<TokenUsage>) -> O
             source: if a.source == b.source {
                 a.source
             } else {
-                crate::harness::TokenUsageSource::Mixed
+                crate::contracts::TokenUsageSource::Mixed
             },
         }),
         (a, b) => a.or(b),
@@ -547,6 +547,7 @@ impl Handler {
         let execution =
             tokio::time::timeout(std::time::Duration::from_millis(remaining), execution);
         tokio::pin!(execution);
+        let mut activity = FabricWatch::new(fabric);
         let output = loop {
             tokio::select! {
                 result = &mut execution => break match result {
@@ -555,7 +556,7 @@ impl Handler {
                     Err(_) => { self.cancellation.cancel(); finish(fabric, &self.tenant, self.run_id, GraphStatus::Failed, Some("run_timeout")).await?; None },
                 },
                 _ = self.cancellation.cancelled(), if !terminal_observer => break None,
-                _ = tokio::time::sleep(std::time::Duration::from_millis(50)), if !snapshot.is_terminal() => {
+                _ = activity.wait(std::time::Duration::from_secs(1)), if !snapshot.is_terminal() => {
                     if read(fabric, &self.tenant, self.run_id).await?.1.is_terminal() {
                         self.cancellation.cancel();
                         break None;
@@ -1004,10 +1005,20 @@ impl GraphEngine {
         let engine = self.clone();
         let tenant = tenant.to_string();
         let task = tokio::spawn(async move {
+            let mut activity = FabricWatch::new(engine.resources.fabric.as_ref());
             loop {
+                activity.observe();
+                let mut fallback = std::time::Duration::from_secs(1);
                 if matches!(engine.get_run(&tenant, run).await, Err(FabricError::Invalid(reason)) if reason == "retention_expired")
                 {
                     break;
+                }
+                if let Ok(state) = engine.get_run(&tenant, run).await
+                    && !state.is_terminal()
+                {
+                    fallback = std::time::Duration::from_millis(
+                        state.deadline_ms.saturating_sub(now()).clamp(1, 1000) as u64,
+                    );
                 }
                 if let Ok(state) = engine.get_run(&tenant, run).await
                     && !state.is_terminal()
@@ -1062,7 +1073,7 @@ impl GraphEngine {
                         }
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                activity.wait(fallback).await;
             }
             for resource in engine.resources.toolsets.values() {
                 resource.port.close_run(run);
@@ -1157,13 +1168,15 @@ impl GraphEngine {
     {
         let engine = self.clone();
         let tenant = tenant.into();
-        Box::pin(async_stream::stream! {let mut cursor=after;loop {
+        Box::pin(async_stream::stream! {let mut cursor=after;
+        let mut activity = FabricWatch::new(engine.resources.fabric.as_ref());
+        loop { activity.observe();
             match engine.events_after(&tenant,run,cursor,128).await {
                 Ok(events) if !events.is_empty()=>{for event in events{cursor+=1;yield Ok(event);}continue;},
                 Err(error)=>{yield Err(error);return;},_=>{}
             }
             match engine.get_run(&tenant,run).await {Ok(state) if state.is_terminal() && cursor>=state.event_count=>return,Err(error)=>{yield Err(error);return;},_=>{}}
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            activity.wait(std::time::Duration::from_secs(1)).await;
         }})
     }
 }

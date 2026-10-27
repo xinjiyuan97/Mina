@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use agent_core::harness::{
+use agent_core::contracts::{
     Tool, ToolCallFuture, ToolCallRequest, ToolDefinition, ToolError, ToolOutput, ToolRiskLevel,
 };
 use serde::Deserialize;

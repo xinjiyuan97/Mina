@@ -7,7 +7,7 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::harness::RunId;
+use crate::contracts::RunId;
 
 macro_rules! uuid_id {
     ($name:ident) => {

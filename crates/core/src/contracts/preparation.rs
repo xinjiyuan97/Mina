@@ -2,7 +2,7 @@
 
 use crate::{
     context::{ContextArtifactRef, ContextBudget, ContextPack},
-    harness::{BlobId, ModelAttachment, RunId, SessionId},
+    contracts::{BlobId, ModelAttachment, RunId, SessionId},
     skill::{SkillId, SkillLock},
 };
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,8 @@ pub struct ContextRequest {
     pub request_hash: String,
     pub input: String,
     pub attachments: Vec<ModelAttachment>,
+    #[serde(default)]
+    pub prior_messages: Vec<crate::contracts::ModelMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment_names: Option<Vec<AttachmentNameInput>>,
     pub explicit_skills: Vec<(SkillId, String)>,

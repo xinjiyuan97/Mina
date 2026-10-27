@@ -41,14 +41,31 @@ pub(super) fn configured_profile() -> Result<EngineProfile, Box<dyn std::error::
 }
 pub(super) struct ServerAgentRuntime {
     suspending: bool,
+    definition: Option<agent_core::agent::AgentDefinition>,
     pub engine: Arc<agent_core::agent::AgentEngine>,
 }
 impl ServerAgentRuntime {
     pub fn new(resources: AgentResources, runs: Arc<dyn RunStore>) -> Self {
         Self {
+            definition: None,
             suspending: resources.has_wait_service("durable"),
             engine: Arc::new(agent_core::agent::AgentEngine::new(resources, runs)),
         }
+    }
+    pub fn with_graph(
+        resources: AgentResources,
+        runs: Arc<dyn RunStore>,
+        definition: agent_core::agent::AgentDefinition,
+        registry: agent_core::agent::OperatorRegistry,
+    ) -> Result<Self, agent_core::contracts::fabric::FabricError> {
+        definition.validate(&registry, &resources)?;
+        Ok(Self {
+            suspending: resources.has_wait_service("durable"),
+            definition: Some(definition),
+            engine: Arc::new(agent_core::agent::AgentEngine::with_registry(
+                resources, runs, registry,
+            )),
+        })
     }
     pub async fn start(
         self: &Arc<Self>,
@@ -63,6 +80,13 @@ impl ServerAgentRuntime {
         plan: PlannedRun,
         failure: Option<&str>,
     ) -> Result<StartedRun, RunRuntimeError> {
+        if let Some(definition) = &self.definition {
+            let payload = serde_json::json!({"input":plan.input,"attachments":plan.attachments,"prior_messages":plan.prior_messages});
+            return self
+                .engine
+                .start_graph_outcome(definition.clone(), payload, plan, failure)
+                .await;
+        }
         let mut config = agent_core::agent::GraphAgentConfig::new(
             &state.config.default_model().model,
             &state.config.agent().system_prompt,
@@ -71,7 +95,7 @@ impl ServerAgentRuntime {
         config.max_output_tokens = state.config.default_model().max_output_tokens;
         config.review_level = state.config.approval().policy().review_level();
         config.parallel_tools = state.config.agent().tool_call_strategy
-            == agent_core::harness::ToolCallStrategy::ParallelSafe;
+            == agent_core::contracts::ToolCallStrategy::ParallelSafe;
         config.allow_run_adf = plan.allow_run_adf;
         config.allow_suspend = self.suspending
             && plan

@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
-use agent_core::harness::{
+use agent_core::contracts::{
     Tool, ToolCallFuture, ToolCallRequest, ToolDefinition, ToolError, ToolOutput, ToolRiskLevel,
 };
 use agent_core::sandbox::{
@@ -400,18 +400,22 @@ fn invalid_arguments() -> ToolError {
 
 fn map_sandbox_error(error: SandboxError) -> ToolError {
     let category = match error.kind() {
-        SandboxErrorKind::InvalidRequest => agent_core::harness::ToolErrorCategory::InvalidRequest,
-        SandboxErrorKind::PolicyDenied => agent_core::harness::ToolErrorCategory::PermissionDenied,
-        SandboxErrorKind::ResourceExhausted => {
-            agent_core::harness::ToolErrorCategory::ResourceExhausted
+        SandboxErrorKind::InvalidRequest => {
+            agent_core::contracts::ToolErrorCategory::InvalidRequest
         }
-        SandboxErrorKind::Timeout => agent_core::harness::ToolErrorCategory::Timeout,
-        SandboxErrorKind::Cancelled => agent_core::harness::ToolErrorCategory::Cancelled,
+        SandboxErrorKind::PolicyDenied => {
+            agent_core::contracts::ToolErrorCategory::PermissionDenied
+        }
+        SandboxErrorKind::ResourceExhausted => {
+            agent_core::contracts::ToolErrorCategory::ResourceExhausted
+        }
+        SandboxErrorKind::Timeout => agent_core::contracts::ToolErrorCategory::Timeout,
+        SandboxErrorKind::Cancelled => agent_core::contracts::ToolErrorCategory::Cancelled,
         SandboxErrorKind::SpawnFailed | SandboxErrorKind::Unavailable => {
-            agent_core::harness::ToolErrorCategory::Unavailable
+            agent_core::contracts::ToolErrorCategory::Unavailable
         }
         SandboxErrorKind::Io | SandboxErrorKind::Internal => {
-            agent_core::harness::ToolErrorCategory::Internal
+            agent_core::contracts::ToolErrorCategory::Internal
         }
     };
     ToolError::new(error.code(), error.safe_message(), error.retryable()).with_category(category)

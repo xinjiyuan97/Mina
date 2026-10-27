@@ -1,9 +1,9 @@
 //! Durable application lifecycle over the static subscription graph.
-use super::{
+use crate::agent::{
     AgentDefinition, AgentResources, GraphAgentConfig, GraphHost, OperatorRegistry, PlannedRun,
     RunRuntimeError, StartedRun,
 };
-use crate::{harness::*, operator_fabric::*};
+use crate::{contracts::fabric::*, contracts::*};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -17,6 +17,10 @@ pub type AgentRunConfig = GraphAgentConfig;
 struct Admission {
     definition: AgentDefinition,
     input: Value,
+    #[serde(default)]
+    raw_input: bool,
+    #[serde(default)]
+    run_input: Option<String>,
     context_fingerprint: Option<String>,
     allowed_tools: Option<Vec<String>>,
     allow_run_adf: bool,
@@ -44,10 +48,18 @@ fn key(run: RunId) -> String {
 }
 impl AgentEngine {
     pub fn new(resources: AgentResources, runs: Arc<dyn RunStore>) -> Self {
+        Self::with_registry(resources, runs, OperatorRegistry::builtins())
+    }
+    /// Host registry is retained for new runs and reconstruction after restart.
+    pub fn with_registry(
+        resources: AgentResources,
+        runs: Arc<dyn RunStore>,
+        registry: OperatorRegistry,
+    ) -> Self {
         Self {
             resources,
             runs,
-            registry: OperatorRegistry::builtins(),
+            registry,
             starts: Mutex::new(()),
             active: Mutex::new(HashMap::new()),
         }
@@ -112,11 +124,99 @@ impl AgentEngine {
         plan: PlannedRun,
         failure: Option<&str>,
     ) -> Result<GraphHost, RunRuntimeError> {
-        if plan.input.trim().is_empty() && plan.attachments.is_empty() {
+        self.admit_inner(config, None, None, plan, failure).await
+    }
+    /// Admit an arbitrary graph with a protocol-specific JSON start payload.
+    /// `plan.input` is the human-readable RunStore label, not the graph payload.
+    pub async fn admit_graph(
+        &self,
+        definition: AgentDefinition,
+        payload: Value,
+        plan: PlannedRun,
+        failure: Option<&str>,
+    ) -> Result<GraphHost, RunRuntimeError> {
+        self.admit_inner(
+            &AgentRunConfig::new("custom", ""),
+            Some(definition),
+            Some(payload),
+            plan,
+            failure,
+        )
+        .await
+    }
+    pub async fn start_graph(
+        self: &Arc<Self>,
+        definition: AgentDefinition,
+        payload: Value,
+        plan: PlannedRun,
+    ) -> Result<StartedRun, RunRuntimeError> {
+        self.start_graph_outcome(definition, payload, plan, None)
+            .await
+    }
+    pub async fn start_graph_outcome(
+        self: &Arc<Self>,
+        definition: AgentDefinition,
+        payload: Value,
+        plan: PlannedRun,
+        failure: Option<&str>,
+    ) -> Result<StartedRun, RunRuntimeError> {
+        let _guard = self.starts.lock().await;
+        let run = plan.run_id;
+        let host = self.admit_graph(definition, payload, plan, failure).await?;
+        self.drive(run, host).await
+    }
+    pub async fn run_graph(
+        self: &Arc<Self>,
+        definition: AgentDefinition,
+        payload: Value,
+    ) -> Result<StartedRun, RunRuntimeError> {
+        let input = payload
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| payload.to_string());
+        self.start_graph(
+            definition,
+            payload,
+            PlannedRun {
+                run_id: RunId::new(),
+                input,
+                attachments: vec![],
+                prior_messages: vec![],
+                allowed_tools: None,
+                allow_run_adf: false,
+                max_steps: None,
+                context_fingerprint: None,
+                execution_manifest: None,
+            },
+        )
+        .await
+    }
+    async fn admit_inner(
+        &self,
+        config: &AgentRunConfig,
+        definition: Option<AgentDefinition>,
+        payload: Option<Value>,
+        plan: PlannedRun,
+        failure: Option<&str>,
+    ) -> Result<GraphHost, RunRuntimeError> {
+        if payload.is_none() && plan.input.trim().is_empty() && plan.attachments.is_empty() {
             return Err(super::HarnessError::InvalidInput.into());
         }
+        let options = super::RunOptions {
+            allowed_tools: plan.allowed_tools.clone(),
+            allow_run_adf: plan.allow_run_adf,
+            max_steps: plan.max_steps,
+        };
+        let definition = definition
+            .map(|mut d| {
+                d.constrain_run(&options)?;
+                Ok::<_, FabricError>(d)
+            })
+            .transpose()
+            .map_err(persistence)?;
         let run = plan.run_id;
-        let input = json!({"input":plan.input,"attachments":plan.attachments,"prior_messages":plan.prior_messages});
+        let raw_input = payload.is_some();
+        let input = payload.unwrap_or_else(|| json!({"input":plan.input,"attachments":plan.attachments,"prior_messages":plan.prior_messages}));
         let mut manifest = plan.execution_manifest.unwrap_or_else(|| json!({}));
         manifest["engine_version"] = json!("operator_v1");
         if manifest["profile"].is_null() {
@@ -128,6 +228,14 @@ impl AgentEngine {
         let saved = match self.load(run).await {
             Ok(saved) => {
                 if saved.input != input
+                    || saved.raw_input != raw_input
+                    || saved
+                        .run_input
+                        .as_ref()
+                        .is_some_and(|label| label != &plan.input)
+                    || definition
+                        .as_ref()
+                        .is_some_and(|graph| graph != &saved.definition)
                     || saved.context_fingerprint != plan.context_fingerprint
                     || saved.allowed_tools != plan.allowed_tools
                     || saved.allow_run_adf != plan.allow_run_adf
@@ -143,29 +251,31 @@ impl AgentEngine {
             }
             Err(FabricError::NotFound) => {
                 let mut config = config.clone();
-                if let Some(max) = plan.max_steps {
+                if definition.is_none()
+                    && let Some(max) = plan.max_steps
+                {
                     if max == 0 || max > config.max_steps || max > super::MAX_RUN_STEPS {
                         return Err(super::HarnessError::InvalidMaxSteps { requested: max }.into());
                     }
                     config.max_steps = max;
                 }
                 config.allow_run_adf &= plan.allow_run_adf;
-                let mut definition = config.definition().map_err(persistence)?;
-                for operator in definition.operators.values_mut() {
-                    if matches!(
-                        operator.kind.as_str(),
-                        "agent.context" | "agent.tool_policy" | "agent.tools"
-                    ) && let Some(allowed) = &plan.allowed_tools
-                    {
-                        operator.config["allowed_tools"] = json!(allowed);
-                    }
-                }
+                let mut definition = match definition {
+                    Some(definition) => definition,
+                    None => config.definition().map_err(persistence)?,
+                };
+                definition.constrain_run(&options).map_err(persistence)?;
                 definition
                     .validate(&self.registry, &self.resources)
+                    .map_err(persistence)?;
+                definition
+                    .validate_start(&self.registry, &input)
                     .map_err(persistence)?;
                 let saved = Admission {
                     definition,
                     input,
+                    raw_input,
+                    run_input: Some(plan.input.clone()),
                     context_fingerprint: plan.context_fingerprint,
                     allowed_tools: plan.allowed_tools,
                     allow_run_adf: plan.allow_run_adf,
@@ -191,6 +301,9 @@ impl AgentEngine {
                     Err(FabricError::Fenced) => {
                         let existing = self.load(run).await.map_err(persistence)?;
                         if existing.input != saved.input
+                            || existing.definition != saved.definition
+                            || existing.raw_input != saved.raw_input
+                            || existing.run_input != saved.run_input
                             || existing.context_fingerprint != saved.context_fingerprint
                             || existing.allowed_tools != saved.allowed_tools
                             || existing.allow_run_adf != saved.allow_run_adf
@@ -301,8 +414,10 @@ impl AgentEngine {
         let worker_host = host.clone();
         let task = tokio::spawn(async move {
             let mut cursor = 0;
+            let mut activity = FabricWatch::new(engine.resources.fabric.as_ref());
             let mut controls_at = tokio::time::Instant::now();
             loop {
+                activity.observe();
                 let result = async {
                     if tokio::time::Instant::now() >= controls_at {
                         worker_host.expire_approvals(run).await?;
@@ -330,7 +445,7 @@ impl AgentEngine {
                     }
                     Err(error) => tracing::warn!(%run, %error, "graph projection/control deferred"),
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                activity.wait(Duration::from_secs(1)).await;
             }
         });
         active.insert(run, Active { host, sender, task });
@@ -344,14 +459,22 @@ impl AgentEngine {
         let saved = self.load(run).await.map_err(persistence)?;
         let plan = PlannedRun {
             run_id: run,
-            input: saved.input["input"]
-                .as_str()
-                .ok_or_else(|| persistence("invalid admission input"))?
-                .into(),
-            attachments: serde_json::from_value(saved.input["attachments"].clone())
-                .map_err(persistence)?,
-            prior_messages: serde_json::from_value(saved.input["prior_messages"].clone())
-                .map_err(persistence)?,
+            input: saved
+                .run_input
+                .clone()
+                .or_else(|| saved.input["input"].as_str().map(str::to_owned))
+                .ok_or_else(|| persistence("invalid admission input"))?,
+            attachments: if saved.raw_input {
+                vec![]
+            } else {
+                serde_json::from_value(saved.input["attachments"].clone()).map_err(persistence)?
+            },
+            prior_messages: if saved.raw_input {
+                vec![]
+            } else {
+                serde_json::from_value(saved.input["prior_messages"].clone())
+                    .map_err(persistence)?
+            },
             allowed_tools: saved.allowed_tools,
             allow_run_adf: saved.allow_run_adf,
             max_steps: saved.max_steps,
@@ -360,8 +483,10 @@ impl AgentEngine {
         };
         // admit reads the pinned definition; this placeholder is never used to rebuild it.
         let host = self
-            .admit(
+            .admit_inner(
                 &AgentRunConfig::new("recovery", ""),
+                None,
+                saved.raw_input.then_some(saved.input),
                 plan,
                 saved.failure.as_deref(),
             )
@@ -409,7 +534,9 @@ impl AgentEngine {
         let engine = self.clone();
         Box::pin(async_stream::stream! {
             let mut after = after;
+            let mut activity = FabricWatch::new(engine.resources.fabric.as_ref());
             loop {
+                activity.observe();
                 match engine.events_after(run, after, 128).await {
                     Ok(page) if !page.is_empty() => {
                         after = page.last().expect("page").seq;
@@ -423,7 +550,7 @@ impl AgentEngine {
                     }
                     Err(error) => { yield Err(error); return; }
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                activity.wait(Duration::from_secs(1)).await;
             }
         })
     }

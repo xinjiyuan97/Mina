@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::{
-    event_runtime::{EventId, EventSource, PublishEvent},
-    harness::{
+    contracts::events::{EventId, EventSource, PublishEvent},
+    contracts::{
         ClaimJobNotifications, ClaimJobs, CompleteJob, CompleteJobNotification, FlowError,
         JobOutcome, JobRecord, JobRouter, JobStore, JobStoreError, RetryJob, RetryJobNotification,
         StartJob, SubmitJobResult,

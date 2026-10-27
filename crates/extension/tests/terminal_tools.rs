@@ -3,7 +3,7 @@
 use std::{sync::Arc, time::Duration};
 
 use agent_core::{
-    harness::{RunCancellation, RunId, Tool, ToolCallRequest, ToolPort, ToolRiskLevel},
+    contracts::{RunCancellation, RunId, Tool, ToolCallRequest, ToolPort, ToolRiskLevel},
     sandbox::{
         ProcessSandbox, ProcessSandboxSessionRequest, ProcessSandboxWriteRequest, SandboxErrorKind,
     },

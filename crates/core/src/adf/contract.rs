@@ -6,7 +6,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    harness::{RunCancellation, RunId, SessionId},
+    contracts::{RunCancellation, RunId, SessionId},
     script::{ScriptCapability, ScriptRuntimeDescriptor},
     skill::ComponentDescriptor,
     tool::{ToolConcurrency, ToolDefinition, ToolExecutionPolicy, ToolRiskLevel},

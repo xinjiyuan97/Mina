@@ -1,8 +1,8 @@
 //! HTTP mapping for the P2 admission barrier; no Context/Skills business execution.
 
 use super::*;
-use agent_core::agent::context_operator::{AdmissionError, prepared_plan};
-use agent_core::context_operator::{ContextOutcome, ContextPolicy, ContextRequest};
+use agent_core::agent::host::preparation::{AdmissionError, prepared_plan};
+use agent_core::contracts::preparation::{ContextOutcome, ContextPolicy, ContextRequest};
 
 pub(super) async fn owned(
     work: impl std::future::Future<Output = Response> + Send + 'static,
@@ -94,7 +94,7 @@ async fn replay_attachments_match(
     inputs: &[BlobInput],
     saved: &ContextRequest,
 ) -> bool {
-    use agent_core::context_operator::AttachmentNameInput;
+    use agent_core::contracts::preparation::AttachmentNameInput;
     if inputs.len() != saved.attachments.len()
         || saved
             .attachment_names
@@ -166,6 +166,7 @@ pub(super) async fn prepare(
     let profile = state.pipeline_profile;
     let config = &orchestration.config;
     let request = ContextRequest {
+        prior_messages: vec![],
         engine_version: profile.engine(),
         execution_profile: (!profile.engine().is_legacy()).then(|| profile.as_str().into()),
         request_hash: attachment_request_hash(
@@ -257,7 +258,7 @@ fn map_error(error: AdmissionError) -> Response {
             "context preparation is still pending",
             true,
         ),
-        AdmissionError::Fabric(agent_core::operator_fabric::FabricError::Capacity) => api_error(
+        AdmissionError::Fabric(agent_core::contracts::fabric::FabricError::Capacity) => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "admission_backlog_full",
             "retry admission later",
@@ -279,7 +280,7 @@ pub(super) fn start_recovery_worker(state: AppState) {
         loop {
             interval.tick().await;
             if ticks.is_multiple_of(60) {
-                use agent_core::operator_fabric::{FabricCommand, FabricReply};
+                use agent_core::contracts::fabric::{FabricCommand, FabricReply};
                 if let Ok(FabricReply::Retention(report)) = state
                     .admission
                     .fabric()
@@ -400,7 +401,7 @@ async fn recover_request(
 
 #[cfg(test)]
 pub(super) fn test_blobs() -> Arc<dyn BlobStore> {
-    use agent_core::harness::{BlobMetadata, BlobObject, BlobStoreFuture};
+    use agent_core::contracts::{BlobMetadata, BlobObject, BlobStoreFuture};
     struct ScopedBlobs {
         store: FilesystemBlobStore,
         _directory: tempfile::TempDir,
@@ -423,10 +424,10 @@ pub(super) fn test_blobs() -> Arc<dyn BlobStore> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::agent::context_operator::{AdmissionFacade, ContextPreparer, PrepareFuture};
+    use agent_core::agent::host::preparation::{AdmissionFacade, ContextPreparer, PrepareFuture};
     use agent_core::{
         context::{ContextBudgetReport, ContextPack},
-        context_operator::PreparedContext,
+        contracts::preparation::PreparedContext,
         skill::SkillLock,
     };
     use tokio::sync::{Notify, mpsc};
@@ -788,6 +789,7 @@ mod tests {
                 state
                     .admission
                     .publish(ContextRequest {
+                        prior_messages: vec![],
                         attachment_names: None,
                         engine_version: agent_core::operator::EngineVersion::OperatorV1,
                         execution_profile: Some(crate::tools_pipeline::TOOLS_PROFILE.into()),

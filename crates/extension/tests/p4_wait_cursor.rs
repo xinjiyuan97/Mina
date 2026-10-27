@@ -1,6 +1,6 @@
 #![cfg(feature = "sqlite")]
 
-use agent_core::{event_runtime::*, harness::RunId};
+use agent_core::{contracts::RunId, contracts::events::*};
 use agent_extension::store::SqliteEventStore;
 use serde_json::json;
 

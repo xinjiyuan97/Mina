@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::harness::{CompleteFlowEffect, FlowEffectRouter, FlowError, FlowStore, RetryFlowEffect};
+use crate::contracts::{
+    CompleteFlowEffect, FlowEffectRouter, FlowError, FlowStore, RetryFlowEffect,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlowEffectRuntimeConfig {

@@ -5,7 +5,7 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::harness::{
+use crate::contracts::{
     ApprovalId, ApprovalResolution, BlobId, ObservedRunEvent, OutputChannel, RunEventKind, RunId,
     RunSnapshot, ToolRiskLevel,
 };
@@ -574,7 +574,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::harness::{ApprovalDecision, FinishReason, RunEvent, ToolErrorCategory};
+    use crate::contracts::{ApprovalDecision, FinishReason, RunEvent, ToolErrorCategory};
 
     #[test]
     fn projects_ordered_reasoning_tools_approvals_and_text() {

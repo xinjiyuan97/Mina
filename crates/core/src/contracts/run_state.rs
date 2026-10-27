@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::harness::{
+use crate::contracts::{
     ApprovalId, ApprovalResolution, FinishReason, OutputChannel, RunEvent, RunEventKind, RunId,
     TokenUsage, ToolErrorCategory, ToolRiskLevel,
 };
@@ -319,7 +319,7 @@ impl RunSnapshot {
                 }
                 approval.resolution = Some(resolution.clone());
                 self.tool_mut(call_id)?.status =
-                    if resolution.decision == crate::harness::ApprovalDecision::Deny {
+                    if resolution.decision == crate::contracts::ApprovalDecision::Deny {
                         RunToolStatus::Rejected
                     } else {
                         RunToolStatus::Ready
@@ -815,7 +815,7 @@ mod tests {
                 .resolution
                 .as_ref()
                 .map(|resolution| resolution.decision),
-            Some(crate::harness::ApprovalDecision::AllowOnce)
+            Some(crate::contracts::ApprovalDecision::AllowOnce)
         );
         assert_eq!(snapshot.tools.len(), 1);
         assert_eq!(snapshot.tools[0].status, RunToolStatus::Completed);

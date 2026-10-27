@@ -4,7 +4,7 @@
 //! behind a Worker host so the same `agent-core` decisions remain usable by
 //! native server and desktop runtimes.
 
-use agent_core::harness::{
+use agent_core::contracts::{
     AGENT_LOOP_CHECKPOINT_SCHEMA_VERSION, AGENT_LOOP_REDUCER_PROTOCOL_VERSION, AgentLoopInput,
     AgentLoopOutcome, AgentLoopReducer, AgentLoopReducerState, AgentLoopStartDispatch,
     AgentLoopTransition, ModelRole, TITLE_REDUCER_PROTOCOL_VERSION, TitleGenerationReducer,

@@ -6,7 +6,7 @@ use super::{
 };
 use agent_core::{
     context::TokenEstimator,
-    harness::{BlobStore, ModelEventStream, ModelPort, ModelRequest},
+    contracts::{BlobStore, ModelEventStream, ModelPort, ModelRequest},
 };
 
 /// Runtime-selected provider adapter behind the provider-neutral `ModelPort`.

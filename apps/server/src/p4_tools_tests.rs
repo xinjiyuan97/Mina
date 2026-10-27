@@ -1,8 +1,8 @@
 use super::*;
 use agent_core::{
     context::{ContextBudgetReport, ContextPack},
-    context_operator::{ContextRequest, PreparedContext},
-    harness::*,
+    contracts::preparation::{ContextRequest, PreparedContext},
+    contracts::*,
     skill::SkillLock,
 };
 use agent_harness::context_operator::{AdmissionFacade, ContextPreparer, PrepareFuture};
@@ -223,7 +223,7 @@ struct FailedContext;
 impl ContextPreparer for FailedContext {
     fn prepare(&self, _: ContextRequest) -> PrepareFuture<'_> {
         Box::pin(async {
-            Err(agent_core::context_operator::ContextFailed {
+            Err(agent_core::contracts::preparation::ContextFailed {
                 code: "context_build_failed".into(),
                 message: "fake context failure".into(),
             })
@@ -344,7 +344,7 @@ impl ToolPort for Tools {
             if !suspend {
                 return Ok(ToolOutput::text("tool done"));
             }
-            use agent_core::event_runtime::*;
+            use agent_core::contracts::events::*;
             Ok(ToolOutput::suspend(
                 vec![WaitSpec {
                     wait_key: "external".into(),
@@ -777,7 +777,7 @@ async fn tools_http_sse_approval_and_wait_live_equal_sqlite_replay_and_last_even
                     }
                     if event["type"] == "run_waiting" {
                         assert!(suspend);
-                        use agent_core::event_runtime::*;
+                        use agent_core::contracts::events::*;
                         let now = agent_harness::unix_time_ms();
                         state
                             .events
@@ -878,4 +878,104 @@ async fn tools_http_sse_approval_and_wait_live_equal_sqlite_replay_and_last_even
         context_worker.abort();
         let _ = context_worker.await;
     }
+}
+
+struct ConfiguredGraphNode;
+impl agent_core::agent::GraphOperator for ConfiguredGraphNode {
+    fn handle(
+        &self,
+        context: agent_core::agent::GraphContext,
+    ) -> agent_core::agent::graph::GraphFuture<'_> {
+        Box::pin(async move {
+            Ok(agent_core::agent::GraphOutput::new(
+                Value::Null,
+                vec![agent_core::agent::GraphEvent::new(
+                    "custom.done.v1",
+                    json!({"output":format!("configured: {}", context.event.payload["input"].as_str().unwrap())}),
+                )],
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn server_runs_configured_graph_with_custom_registry() {
+    use agent_core::agent::*;
+    let state = tests::test_state();
+    let mut registry = OperatorRegistry::default();
+    registry
+        .register(
+            OperatorDescriptor::new("test.server", 1)
+                .input(
+                    "custom.start.v1",
+                    json!({"type":"object","required":["input","attachments","prior_messages"]}),
+                )
+                .output("custom.done.v1", json!({"type":"object"}))
+                .output("custom.failed.v1", json!({"type":"object"}))
+                .output("custom.cancelled.v1", json!({"type":"object"})),
+            |_, _| Ok(Arc::new(ConfiguredGraphNode)),
+        )
+        .unwrap();
+    let definition = AgentGraph::new("server-configured")
+        .operator("node", OperatorDefinition::new("test.server", 1, json!({})))
+        .subscribe("start", "$input", "node", ["custom.start.v1"])
+        .lifecycle(GraphLifecycle {
+            start: GraphStart {
+                event: "custom.start.v1".into(),
+            },
+            terminal: GraphTerminal {
+                from: "node".into(),
+                completed: "custom.done.v1".into(),
+                failed: "custom.failed.v1".into(),
+                cancelled: "custom.cancelled.v1".into(),
+            },
+        })
+        .limits(GraphLimits::new(5000, 100))
+        .finish()
+        .unwrap();
+    let runtime = Arc::new(
+        crate::tools_pipeline::ServerAgentRuntime::with_graph(
+            AgentResources::new(Arc::new(
+                agent_core::agent::memory_fabric::MemoryFabric::default(),
+            )),
+            Arc::new(agent_extension::store::InMemoryRunStore::default()),
+            definition,
+            registry,
+        )
+        .unwrap(),
+    );
+    let run_id = RunId::new();
+    let mut started = runtime
+        .start(
+            &state,
+            PlannedRun {
+                run_id,
+                input: "hello".into(),
+                attachments: vec![],
+                prior_messages: vec![],
+                allowed_tools: None,
+                allow_run_adf: false,
+                max_steps: None,
+                context_fingerprint: None,
+                execution_manifest: None,
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !started.events.recv().await.unwrap().kind.is_terminal() {}
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime
+            .engine
+            .get_run(run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .output,
+        "configured: hello"
+    );
+    runtime.stop_workers().await;
 }

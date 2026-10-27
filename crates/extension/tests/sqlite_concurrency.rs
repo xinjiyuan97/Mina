@@ -3,7 +3,7 @@
 use std::{sync::Arc, time::Duration};
 
 use agent_core::{
-    harness::{
+    contracts::{
         FinishReason, ObservedRunEvent, OutputChannel, RunEvent, RunEventKind, RunId, RunSnapshot,
         RunStore,
     },

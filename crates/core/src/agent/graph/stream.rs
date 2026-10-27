@@ -1,6 +1,6 @@
 //! Convenience Agent adapter over the durable static graph host.
 use super::*;
-use crate::harness::*;
+use crate::contracts::*;
 use futures_util::StreamExt;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -11,6 +11,10 @@ pub struct GraphAgent {
     registry: OperatorRegistry,
     resources: AgentResources,
     approvals: Arc<dyn ApprovalPort>,
+    preparation: Option<(
+        Arc<dyn crate::agent::host::preparation::ContextPreparer>,
+        crate::contracts::preparation::ContextPolicy,
+    )>,
 }
 impl GraphAgent {
     pub fn new(
@@ -24,10 +28,19 @@ impl GraphAgent {
             registry,
             resources,
             approvals: Arc::new(RejectAllApprovals),
+            preparation: None,
         })
     }
     pub fn with_approval_port(mut self, approvals: Arc<dyn ApprovalPort>) -> Self {
         self.approvals = approvals;
+        self
+    }
+    pub fn with_context_preparation(
+        mut self,
+        preparer: Arc<dyn crate::agent::host::preparation::ContextPreparer>,
+        policy: crate::contracts::preparation::ContextPolicy,
+    ) -> Self {
+        self.preparation = Some((preparer, policy));
         self
     }
     pub fn definition(&self) -> &AgentDefinition {
@@ -120,7 +133,8 @@ impl Agent for GraphAgent {
             .with_capability("event_stream")
             .with_capability("static_graph")
     }
-    fn run(&self, request: RunRequest) -> AgentEventStream {
+    fn run(&self, mut request: RunRequest) -> AgentEventStream {
+        let preparation = self.preparation.clone();
         let mut definition = self.definition.clone();
         let registry = self.registry.clone();
         let resources = self.resources.clone();
@@ -128,18 +142,24 @@ impl Agent for GraphAgent {
         let ingress = GraphIngress::new(resources.fabric.clone());
         Box::pin(async_stream::stream! {
             if request.cancellation.is_cancelled() { yield AgentEvent::Cancelled; return; }
-            for op in definition.operators.values_mut() {
-                if op.kind == "agent.context" && let Some(max) = request.max_steps {
-                    let ceiling = op.config["max_steps"].as_u64().unwrap_or(1);
-                    op.config["max_steps"] = json!(ceiling.min(max as u64).max(1));
+            if let Some((preparer, mut policy)) = preparation {
+                if let Some(allowed) = &request.allowed_tools { policy.available_tools.retain(|name| allowed.contains(name)); }
+                policy.allow_run_adf &= request.allow_run_adf;
+                let max = request.max_steps.unwrap_or_else(|| definition.operators.values().filter(|op| op.kind == "agent.context").filter_map(|op|op.config["max_steps"].as_u64()).min().unwrap_or(1) as u32);
+                let prepared = tokio::select! {
+                    _ = request.cancellation.cancelled() => { yield AgentEvent::Cancelled; return; }
+                    result = crate::agent::host::preparation::prepare_agent_request(preparer.as_ref(), &request, policy, max) => result,
+                };
+                match prepared {
+                    Ok(plan) => { request.prior_messages = plan.prior_messages; request.allowed_tools = plan.allowed_tools; request.allow_run_adf = plan.allow_run_adf; request.max_steps = plan.max_steps; }
+                    Err(error) => { yield AgentEvent::failed(error.code, "Context preparation failed", false); return; }
                 }
-                if matches!(op.kind.as_str(), "agent.context" | "agent.tools" | "agent.tool_policy") {
-                    op.config["allow_run_adf"] = json!(request.allow_run_adf && op.config["allow_run_adf"].as_bool().unwrap_or(false));
-                }
-                if matches!(op.kind.as_str(), "agent.context" | "agent.tools" | "agent.tool_policy") && let Some(allowed) = &request.allowed_tools {
-                    let configured: Option<Vec<String>> = op.config.get("allowed_tools").cloned().and_then(|v| serde_json::from_value(v).ok());
-                    op.config["allowed_tools"] = json!(allowed.iter().filter(|name| configured.as_ref().is_none_or(|v| v.contains(name))).collect::<Vec<_>>());
-                }
+            }
+            if let Err(error) = definition.constrain_run(&crate::agent::RunOptions {
+                allowed_tools: request.allowed_tools.clone(), allow_run_adf: request.allow_run_adf,
+                max_steps: request.max_steps,
+            }) {
+                yield AgentEvent::failed("graph_invalid", error.to_string(), false); return;
             }
             let host = match GraphHost::new("local", definition, registry, resources) {
                 Ok(host) => host,
@@ -154,7 +174,7 @@ impl Agent for GraphAgent {
             let mut events = host.engine.subscribe("local", run_id, 0);
             let mut public = host.subscribe(run_id, 0);
             let mut graph_ended = false;
-            type Decision = Pin<Box<dyn Future<Output = (crate::event_runtime::EventId, GraphEvent)> + Send>>;
+            type Decision = Pin<Box<dyn Future<Output = (crate::contracts::events::EventId, GraphEvent)> + Send>>;
             let mut decisions = futures_util::stream::FuturesUnordered::<Decision>::new();
             loop {
                 tokio::select! {
@@ -201,7 +221,7 @@ impl Agent for GraphAgent {
                                     Ok(result) => GraphEvent::new("approval.decided.v1", json!({"approval_id":approval.approval_id,"actor":"host","binding_digest":binding,"resolution":result.unwrap_or_else(|_| ApprovalResolution::deny(Some("Approval provider failed".into())))})),
                                     Err(_) => GraphEvent::new("approval.expire.v1", json!({"approval_id":approval.approval_id})),
                                 };
-                                (crate::event_runtime::EventId::stable("graph-host-approval", &approval.approval_id.to_string()), event)
+                                (crate::contracts::events::EventId::stable("graph-host-approval", &approval.approval_id.to_string()), event)
                             }));
                         }
 

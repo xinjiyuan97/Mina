@@ -1,6 +1,6 @@
 //! Low-level API for custom single-agent operators and durable event subscriptions.
-use super::operator_fabric::{FabricHandler, FabricRuntime, FabricRuntimeConfig, FabricTickReport};
-use crate::operator_fabric::*;
+use super::executor::{FabricHandler, FabricRuntime, FabricRuntimeConfig, FabricTickReport};
+use crate::contracts::fabric::*;
 use std::{collections::BTreeMap, sync::Arc};
 
 pub struct OperatorBus {

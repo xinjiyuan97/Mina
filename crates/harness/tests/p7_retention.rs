@@ -1,7 +1,7 @@
 use agent_core::{
     agent::{artifacts::FabricBlobStore, memory_fabric::MemoryFabric},
-    harness::*,
-    operator_fabric::*,
+    contracts::fabric::*,
+    contracts::*,
 };
 use std::sync::Arc;
 async fn put(blobs: &dyn BlobStore, value: serde_json::Value, created_at_ms: i64) -> BlobId {

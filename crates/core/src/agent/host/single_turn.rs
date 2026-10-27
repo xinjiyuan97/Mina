@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_stream::stream;
 use futures_util::StreamExt;
 
-use crate::harness::{
+use crate::contracts::{
     Agent, AgentEvent, AgentEventStream, AgentMetadata, ModelEvent, ModelMessage, ModelPort,
     ModelRequest, RunRequest,
 };
@@ -114,7 +114,7 @@ where
                     ModelEvent::ReasoningDelta { delta } => {
                         if !delta.is_empty() {
                             yield AgentEvent::OutputDelta {
-                                channel: crate::harness::OutputChannel::AssistantReasoning,
+                                channel: crate::contracts::OutputChannel::AssistantReasoning,
                                 delta,
                             };
                         }
@@ -184,9 +184,10 @@ enum ModelPoll {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Harness;
     use futures_util::stream;
 
-    use crate::harness::{FinishReason, Harness, ModelEventStream, ModelRole, TokenUsage};
+    use crate::contracts::{FinishReason, ModelEventStream, ModelRole, TokenUsage};
 
     struct FakeProvider;
 
@@ -211,7 +212,7 @@ mod tests {
                         input_tokens: 2,
                         output_tokens: 1,
                         total_tokens: 3,
-                        source: crate::harness::TokenUsageSource::ProviderReported,
+                        source: crate::contracts::TokenUsageSource::ProviderReported,
                     },
                 },
                 ModelEvent::Completed {
@@ -245,7 +246,7 @@ mod tests {
             .expect("single task should complete");
 
         assert_eq!(response.output, "done");
-        assert_eq!(response.finish_reason, crate::harness::FinishReason::Stop);
+        assert_eq!(response.finish_reason, crate::contracts::FinishReason::Stop);
         assert_eq!(response.usage.expect("usage should exist").total_tokens, 3);
     }
 
@@ -266,8 +267,8 @@ mod tests {
 
         assert!(events.iter().any(|event| matches!(
             &event.kind,
-            crate::harness::RunEventKind::OutputDelta {
-                channel: crate::harness::OutputChannel::AssistantReasoning,
+            crate::contracts::RunEventKind::OutputDelta {
+                channel: crate::contracts::OutputChannel::AssistantReasoning,
                 delta,
             } if delta == "think"
         )));
@@ -288,7 +289,7 @@ mod tests {
 
         assert!(matches!(
             events.last().map(|event| &event.kind),
-            Some(crate::harness::RunEventKind::RunFailed { code, .. }) if code == "model_timeout"
+            Some(crate::contracts::RunEventKind::RunFailed { code, .. }) if code == "model_timeout"
         ));
     }
 }

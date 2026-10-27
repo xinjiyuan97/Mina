@@ -7,7 +7,7 @@ use agent_core::{
         ContextComponentDescriptor, ContextError, ContextFuture, SummaryGenerator, SummaryRequest,
         SummaryResult,
     },
-    harness::{FinishReason, ModelEvent, ModelMessage, ModelPort, ModelRequest},
+    contracts::{FinishReason, ModelEvent, ModelMessage, ModelPort, ModelRequest},
 };
 use futures_util::StreamExt;
 use serde_json::json;
@@ -143,7 +143,7 @@ where
 mod tests {
     use agent_core::{
         context::{ContextItem, ContextPriority, ContextSourceRef},
-        harness::{ModelEventStream, ModelRequest, ModelRole, RunId},
+        contracts::{ModelEventStream, ModelRequest, ModelRole, RunId},
     };
     use futures_util::stream;
 

@@ -1,11 +1,11 @@
 use std::{sync::Arc, time::SystemTime};
 
 use agent_core::{
-    event_runtime::{
+    contracts::events::{
         Delivery, DeliveryRouter, DeliveryTarget, EventEnvelope, EventError, EventFuture,
         EventStore,
     },
-    harness::{
+    contracts::{
         AgentEvent, AgentMachine, CompleteFlowRun, EffectRequest, FinishReason, FlowEffect,
         FlowEffectRouter, FlowError, FlowRunState, FlowRunStatus, FlowStore, JobExecutionFuture,
         JobRecord, JobRouter, JobStore, MachineOutput, MachineResumeRequest, MachineStartRequest,
@@ -64,7 +64,7 @@ struct TestFlowEffectRouter {
 }
 
 impl FlowEffectRouter for TestFlowEffectRouter {
-    fn execute(&self, effect: FlowEffect) -> agent_core::harness::FlowFuture<'_, ()> {
+    fn execute(&self, effect: FlowEffect) -> agent_core::contracts::FlowFuture<'_, ()> {
         Box::pin(async move {
             match effect.request {
                 EffectRequest::PublishEvent { command } => self
@@ -144,7 +144,9 @@ fn machine(source: &str, policy: JavaScriptFlowPolicy) -> JavaScriptAgentMachine
         .expect("JavaScript machine should construct")
 }
 
-async fn collect(mut stream: agent_core::harness::MachineStream) -> (Vec<AgentEvent>, StepOutcome) {
+async fn collect(
+    mut stream: agent_core::contracts::MachineStream,
+) -> (Vec<AgentEvent>, StepOutcome) {
     let mut events = Vec::new();
     let mut outcome = None;
     while let Some(output) = stream.next().await {

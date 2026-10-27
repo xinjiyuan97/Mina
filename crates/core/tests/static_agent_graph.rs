@@ -6,7 +6,7 @@ use agent_core::{
         graph::{GraphFuture, ResourceKind},
         memory_fabric::MemoryFabric,
     },
-    harness::*,
+    contracts::*,
 };
 use serde_json::{Value, json};
 use std::sync::{
@@ -1031,7 +1031,9 @@ async fn approval_event(agent: &agent_core::agent::ConfiguredAgent, run: RunId) 
 }
 #[tokio::test]
 async fn durable_approval_survives_reopen_and_rejects_changed_binding_and_duplicate_delivery() {
-    use agent_core::{agent::GraphIngress, event_runtime::EventId, operator_fabric::FabricError};
+    use agent_core::{
+        agent::GraphIngress, contracts::events::EventId, contracts::fabric::FabricError,
+    };
     use agent_extension::store::SqliteEventStore;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("approval.db");
@@ -1039,7 +1041,7 @@ async fn durable_approval_survives_reopen_and_rejects_changed_binding_and_duplic
     let calls = Arc::new(AtomicUsize::new(0));
     let definition =
         AgentDefinition::from_yaml(include_str!("../../../config/agents/tools.yaml")).unwrap();
-    let resources = |fabric: Arc<dyn agent_core::operator_fabric::OperatorFabric>| {
+    let resources = |fabric: Arc<dyn agent_core::contracts::fabric::OperatorFabric>| {
         AgentResources::new(fabric)
             .model("primary", "v1", Arc::new(RoundModel(models.clone())))
             .toolset("workspace", "v1", Arc::new(ReviewedEcho(calls.clone())))
@@ -1170,7 +1172,7 @@ impl ModelPort for ErrorAwareModel {
 }
 #[tokio::test]
 async fn denied_and_expired_approvals_return_results_without_executing_tools() {
-    use agent_core::{agent::GraphIngress, event_runtime::EventId};
+    use agent_core::{agent::GraphIngress, contracts::events::EventId};
     for expire in [false, true] {
         let fabric = Arc::new(MemoryFabric::default());
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1277,7 +1279,7 @@ impl ToolPort for WaitingEcho {
             .collect()
     }
     fn call(&self, request: ToolCallRequest) -> ToolCallFuture {
-        use agent_core::event_runtime::*;
+        use agent_core::contracts::events::*;
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             Ok(ToolOutput::suspend(
@@ -1336,7 +1338,7 @@ fn wait_definition() -> AgentDefinition {
 
 #[tokio::test]
 async fn graph_wait_recovers_and_rejects_forged_delivery_without_reexecuting_tool() {
-    use agent_core::{agent::graph::GraphWaitBridge, event_runtime::*};
+    use agent_core::{agent::graph::GraphWaitBridge, contracts::events::*};
     use agent_extension::store::SqliteEventStore;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wait.db");
@@ -1544,7 +1546,7 @@ async fn graph_parallel_tools_overlap_only_when_enabled_and_gate_preserves_order
 }
 #[tokio::test]
 async fn cancelling_graph_cleans_persisted_external_subscriptions() {
-    use agent_core::{agent::graph::GraphWaitBridge, event_runtime::*};
+    use agent_core::{agent::graph::GraphWaitBridge, contracts::events::*};
     use agent_extension::store::SqliteEventStore;
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
@@ -1662,7 +1664,7 @@ async fn durable_host_replays_identical_events_after_sqlite_reopen_and_projects_
     let path = dir.path().join("host.db");
     let calls = Arc::new(AtomicUsize::new(0));
     let run = RunId::new();
-    let resources = |fabric: Arc<dyn agent_core::operator_fabric::OperatorFabric>| {
+    let resources = |fabric: Arc<dyn agent_core::contracts::fabric::OperatorFabric>| {
         AgentResources::new(fabric).model("primary", "v1", Arc::new(Text(calls.clone())))
     };
     let fabric = Arc::new(SqliteEventStore::open(&path, "host").await.unwrap());
@@ -1722,7 +1724,7 @@ async fn durable_host_replays_identical_events_after_sqlite_reopen_and_projects_
     .unwrap();
     assert_eq!(
         other.events_after(run, 0, 128).await.unwrap_err(),
-        agent_core::operator_fabric::FabricError::NotFound
+        agent_core::contracts::fabric::FabricError::NotFound
     );
     let runs = SqliteRunStore::open(&path).await.unwrap();
     runs.create_run(RunSnapshot::new(run, "hello", 1))
@@ -1745,7 +1747,7 @@ async fn durable_host_keeps_partial_output_when_subscriber_disconnects_and_reope
     use futures_util::StreamExt;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("partial.db");
-    let make = |fabric: Arc<dyn agent_core::operator_fabric::OperatorFabric>| {
+    let make = |fabric: Arc<dyn agent_core::contracts::fabric::OperatorFabric>| {
         GraphHost::new(
             "local",
             text_definition(),
@@ -1791,7 +1793,7 @@ async fn durable_host_keeps_partial_output_when_subscriber_disconnects_and_reope
 async fn durable_host_recovers_unprojected_approval_and_terminal_facts() {
     use agent_core::{
         agent::{GraphHost, GraphIngress},
-        event_runtime::EventId,
+        contracts::events::EventId,
     };
     use agent_extension::store::SqliteEventStore;
     use futures_util::StreamExt;
@@ -1799,7 +1801,7 @@ async fn durable_host_recovers_unprojected_approval_and_terminal_facts() {
     let path = dir.path().join("host-approval.db");
     let models = Arc::new(AtomicUsize::new(0));
     let tools = Arc::new(AtomicUsize::new(0));
-    let build = |fabric: Arc<dyn agent_core::operator_fabric::OperatorFabric>| {
+    let build = |fabric: Arc<dyn agent_core::contracts::fabric::OperatorFabric>| {
         GraphHost::new(
             "local",
             AgentDefinition::from_yaml(include_str!("../../../config/agents/tools.yaml")).unwrap(),
@@ -1930,18 +1932,18 @@ async fn public_terminal_preserves_safe_provider_failure_and_retryability() {
 }
 
 struct CleanupInterrupted {
-    inner: Arc<dyn agent_core::operator_fabric::OperatorFabric>,
+    inner: Arc<dyn agent_core::contracts::fabric::OperatorFabric>,
     failing: std::sync::atomic::AtomicBool,
 }
-impl agent_core::operator_fabric::OperatorFabric for CleanupInterrupted {
-    fn capabilities(&self) -> agent_core::operator_fabric::FabricCapabilities {
+impl agent_core::contracts::fabric::OperatorFabric for CleanupInterrupted {
+    fn capabilities(&self) -> agent_core::contracts::fabric::FabricCapabilities {
         self.inner.capabilities()
     }
     fn execute(
         &self,
-        command: agent_core::operator_fabric::FabricCommand,
-    ) -> agent_core::operator_fabric::FabricFuture<'_> {
-        use agent_core::operator_fabric::*;
+        command: agent_core::contracts::fabric::FabricCommand,
+    ) -> agent_core::contracts::fabric::FabricFuture<'_> {
+        use agent_core::contracts::fabric::*;
         Box::pin(async move {
             if self.failing.load(Ordering::SeqCst)
                 && matches!(&command, FabricCommand::Transact { checkpoint, .. } if checkpoint.key.ends_with(":cleaned"))
@@ -1956,7 +1958,7 @@ impl agent_core::operator_fabric::OperatorFabric for CleanupInterrupted {
 }
 #[tokio::test]
 async fn terminal_recovery_finishes_interrupted_external_cleanup_without_reexecution() {
-    use agent_core::{agent::GraphWaitBridge, event_runtime::*};
+    use agent_core::{agent::GraphWaitBridge, contracts::events::*};
     use agent_extension::store::SqliteEventStore;
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
@@ -2035,20 +2037,20 @@ async fn terminal_recovery_finishes_interrupted_external_cleanup_without_reexecu
 }
 
 struct PausedRegistration {
-    inner: Arc<dyn agent_core::operator_fabric::OperatorFabric>,
+    inner: Arc<dyn agent_core::contracts::fabric::OperatorFabric>,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
     paused: std::sync::atomic::AtomicBool,
 }
-impl agent_core::operator_fabric::OperatorFabric for PausedRegistration {
-    fn capabilities(&self) -> agent_core::operator_fabric::FabricCapabilities {
+impl agent_core::contracts::fabric::OperatorFabric for PausedRegistration {
+    fn capabilities(&self) -> agent_core::contracts::fabric::FabricCapabilities {
         self.inner.capabilities()
     }
     fn execute(
         &self,
-        command: agent_core::operator_fabric::FabricCommand,
-    ) -> agent_core::operator_fabric::FabricFuture<'_> {
-        use agent_core::operator_fabric::*;
+        command: agent_core::contracts::fabric::FabricCommand,
+    ) -> agent_core::contracts::fabric::FabricFuture<'_> {
+        use agent_core::contracts::fabric::*;
         Box::pin(async move {
             if matches!(&command, FabricCommand::Transact { checkpoint, .. } if checkpoint.key.starts_with("graph-wait-subscription:"))
                 && self.paused.swap(false, Ordering::SeqCst)
@@ -2064,7 +2066,7 @@ impl agent_core::operator_fabric::OperatorFabric for PausedRegistration {
 async fn public_waiting_is_emitted_only_after_external_subscription_is_ready() {
     use agent_core::{
         agent::{GraphHost, GraphWaitBridge},
-        event_runtime::*,
+        contracts::events::*,
     };
     use agent_extension::store::SqliteEventStore;
     let dir = tempfile::tempdir().unwrap();

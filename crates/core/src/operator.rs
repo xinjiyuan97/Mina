@@ -50,8 +50,8 @@ pub fn validate_execution_manifest(manifest: &Value) -> Result<(), &'static str>
 }
 
 use crate::{
-    event_runtime::EventId,
-    harness::{RunId, SessionId},
+    contracts::events::EventId,
+    contracts::{RunId, SessionId},
 };
 
 macro_rules! counter {

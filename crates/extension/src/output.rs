@@ -2,8 +2,8 @@
 
 use std::collections::HashSet;
 
-use agent_core::harness::RunId;
-use agent_core::harness::{
+use agent_core::contracts::RunId;
+use agent_core::contracts::{
     ApprovalDecision, FinishReason, OutputChannel, RunEvent, RunEventKind, TokenUsage,
 };
 use serde::{Deserialize, Serialize};
@@ -593,7 +593,7 @@ fn approval_decision(decision: ApprovalDecision) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::harness::{
+    use agent_core::contracts::{
         AgentEvent, ApprovalId, ApprovalResolution, RunEventKind, ToolErrorCategory, ToolRiskLevel,
     };
     use serde_json::json;

@@ -1,4 +1,4 @@
-use agent_core::{harness::ApprovalId, tool_authorization::approval_payload_schema};
+use agent_core::{contracts::ApprovalId, tool_authorization::approval_payload_schema};
 use serde_json::json;
 
 #[test]

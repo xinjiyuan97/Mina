@@ -22,3 +22,9 @@ if rg -q "$mina_removed_runtime" crates/*/src apps/*/src; then
   printf '%s\n' 'a removed fixed single-agent runtime was reintroduced' >&2
   exit 1
 fi
+
+mina_removed_core_paths='agent_core::(harness|context_operator|event_runtime|operator_fabric)::|agent_core::agent::(context_operator|operator_fabric|run_runtime|runtime)::'
+if rg -q "$mina_removed_core_paths" crates/*/src apps/*/src; then
+  printf '%s\n' 'an obsolete Core public module path was reintroduced' >&2
+  exit 1
+fi

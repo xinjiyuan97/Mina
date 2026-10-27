@@ -282,7 +282,7 @@ mod tests {
             run_id: RunId::new(),
             instance: "gate".into(),
             event: PublishedGraphEvent {
-                id: crate::event_runtime::EventId::stable("test", kind),
+                id: crate::contracts::events::EventId::stable("test", kind),
                 from: "test".into(),
                 kind: kind.into(),
                 payload,

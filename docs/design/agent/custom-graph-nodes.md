@@ -29,7 +29,7 @@ use agent_core::agent::{
     OperatorDescriptor, OperatorRegistry,
     graph::GraphFuture,
 };
-use agent_core::operator_fabric::FabricError;
+use agent_core::contracts::fabric::FabricError;
 use serde_json::json;
 
 struct RequestObserver;
@@ -137,6 +137,8 @@ fn registry_with_custom_nodes() -> Result<OperatorRegistry, FabricError> {
 
 ## Skill 与当前边界
 
-Skill 契约、选择和编译在 [Core skill](../../../crates/core/src/skill/mod.rs)，文件加载在 [Extension SkillStore](../../../crates/extension/src/store/skill.rs)。正式 Server 通过 Core 的 AgentContextPreparer 在进入图前解析 Skill 并准备上下文。
+Skill 契约、选择和编译在 [Core skill](../../../crates/core/src/skill/mod.rs)，文件加载在 [Extension SkillStore](../../../crates/extension/src/store/skill.rs)。正式 Server 通过 Core 的 ContextPreparation 在进入图前解析 Skill 并准备上下文。
 
-demo 尚未接入 SkillOrchestrator，读取 SKILL.md 文件不等于自动选择和加载 Skill。当前 Registry 没有内置 Skill 或 Compactor 节点；如需把这些逻辑放入图中，需要实现并注册相应节点及协议。
+demo 可通过 `[context].skill_directory` 启用同一套上下文准备；未启用时，读取 SKILL.md 文件不等于自动选择和加载 Skill。当前 Registry 没有内置 Skill 或 Compactor 节点；如需把这些逻辑放入图中，需要实现并注册相应节点及协议。
+
+需要持久化高层运行、恢复和事件重放时，可把相同 Registry 交给 AgentEngine::with_registry，再通过 run_graph/start_graph 提交定义。见 [高层任意图入口](operator-only-api.md#任意图的高层运行入口)。

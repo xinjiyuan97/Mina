@@ -1,7 +1,7 @@
 use super::*;
 use crate::tools_pipeline::ServerAgentRuntime;
 use agent_core::agent::AgentResources;
-use agent_core::operator_fabric::OperatorFabric;
+use agent_core::contracts::fabric::OperatorFabric;
 use agent_harness::PlannedRun;
 
 pub(super) async fn resolve_operator_approval(
@@ -10,7 +10,7 @@ pub(super) async fn resolve_operator_approval(
     approval_id: ApprovalId,
     resolution: ApprovalResolution,
 ) -> Option<Response> {
-    use agent_core::{operator_fabric::FabricError, tool_authorization::AuthorizationError};
+    use agent_core::{contracts::fabric::FabricError, tool_authorization::AuthorizationError};
     let snapshot = match state.runtime.get_run(run_id).await {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => return None,
@@ -91,7 +91,7 @@ pub(super) async fn resolve_operator_approval(
 
 pub(super) async fn fail_context(
     state: &AppState,
-    request: &agent_core::context_operator::ContextRequest,
+    request: &agent_core::contracts::preparation::ContextRequest,
     code: &str,
 ) -> Result<(), RunRuntimeError> {
     let pipeline = if request.execution_profile.as_deref() == Some("operator_v1_text") {
@@ -181,7 +181,7 @@ pub(super) async fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::harness::{
+    use agent_core::contracts::{
         FinishReason, ModelEvent, ModelEventStream, ModelPort, ModelRequest, TokenUsage,
         TokenUsageSource,
     };

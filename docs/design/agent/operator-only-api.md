@@ -67,3 +67,56 @@ let started = engine.run(&config, "任务").await?;
 - `crates/core/tests/graph_retention.rs`：终态回收、租约和共享引用保护。
 - server 测试：HTTP、Session 幂等、SSE 重放、多模态和恢复。
 - Fabric、存储适配器和 Harness 多 Agent 测试：事务与跨 Agent 边界。
+
+## 任意图的高层运行入口
+
+`AgentEngine::new(resources, run_store)` 使用内置 Registry；自定义节点使用 `AgentEngine::with_registry(resources, run_store, registry)`。Registry 在恢复时也用于重建节点，重启后的宿主必须注册匹配版本。
+
+```rust,ignore
+let definition = AgentDefinition::from_file("config/agents/demo.yaml")?;
+let engine = Arc::new(AgentEngine::with_registry(resources, run_store, registry));
+let started = engine.run_graph(definition, serde_json::json!({
+    "input": "查看当前目录", "attachments": [], "prior_messages": []
+})).await?;
+```
+
+`run_graph` 接收任意 JSON 启动载荷；输入 schema 由图的启动订阅决定，不强制要求聊天对象。`start_graph(definition, payload, plan)` 接受已有 PlannedRun，`plan.input` 是 RunStore 展示文本，payload 才是传给图的原始输入。`admit_graph(definition, payload, plan, failure)` 只持久化接入，`start_graph_outcome` 同时支持上下文失败结果和后台驱动。
+
+图定义、原始输入与准备结果在接入时锁定；相同 Run ID 重复提交不同定义或输入会被拒绝。`recover` 从保存的定义和原始 JSON 恢复，不依赖当前配置重新生成图。未产生模型流片段的自定义图也会将最终输出投影到公开事件和 RunStore。审批、取消、分页重放和恢复与默认图共用同一路径。
+
+默认图的 `run/start/admit` 仍可使用 GraphAgentConfig。两个入口都通过 `AgentDefinition::constrain_run` 收紧内置 Context/ToolPolicy/Tools 的工具白名单、ADF 和模型轮次上限，不扩大图已有权限；自定义节点自己的授权规则仍由实现负责。
+
+正式 Server 的 tools profile 可以通过 `MINA_AGENT_GRAPH=/path/to/graph.yaml` 加载图，资源名为 primary、workspace、durable。HTTP 入口向图发送 `{input, attachments, prior_messages}`；若需要其他业务输入协议，使用 Core 的 run_graph/start_graph 接口。自定义节点先在宿主 Registry 注册，再传给 ServerAgentRuntime::with_graph。修改文件只影响新 Run，已保存的 Run 使用锁定定义。
+
+## 统一上下文准备
+
+宿主准备和图内消息循环职责不同：
+
+- `agent::host::preparation::ContextPreparation`：解析 Skill、检索 Memory、读取 Session 或宿主传入的历史，执行上下文预算，生成 PreparedContext。
+- `AdmissionFacade`：将上述准备过程放在持久化接入屏障中，正式 Server 使用此路径。
+- `GraphAgent::with_context_preparation(preparer, policy)`：轻量宿主直接复用同一 ContextPreparer 和 prepared_plan 转换，demo 使用此路径。
+- 图节点 `agent.context`：接收已准备消息，在图执行期间追加工具结果并控制模型轮次，不重复发现 Skill 或检索 Memory。
+
+ContextRequest 的 prior_messages 用于内存会话等轻量宿主，与 SessionStore 历史二选一；两者都进入 ContextEngine 的预算流程。直接传入的历史应是已完成对话消息，含未结算 tool call 的历史会被拒绝。准备失败会阻止模型执行；直接 Agent 流将返回安全错误，取消也会中断准备等待。
+
+## 公开模块路径
+
+| 规范入口 | 内容 |
+| --- | --- |
+| `agent_core::contracts` | Agent、Model、Tool、Session、RunStore 等通用契约 |
+| `contracts::fabric` | 持久化算子存储协议及通知契约 |
+| `contracts::events` | 外部事件、订阅和定时器协议 |
+| `contracts::preparation` | ContextRequest、ContextPolicy 和准备结果协议 |
+| `agent::graph` | 图校验、节点、执行状态和 GraphHost |
+| `agent::host` | AgentEngine、上下文准备、运行记录及 AgentLoop / SingleTurnAgent 等便利执行接口 |
+| `agent::executor` / `agent::bus` | 低层算子投递执行与发布订阅 API |
+
+常用 Agent 类型继续从 `agent` 重导出，旧 `core::harness`、根级 context_operator/event_runtime/operator_fabric 路径已移除。Core 内测试也使用真实的 host runner，不再维护仅供测试的另一份 Harness 实现。独立 `agent-harness` crate 仍承载多 Agent 和宿主集成，不等于旧 Core 模块。
+
+## 通知唤醒与存储兜底
+
+OperatorFabric 可通过 `changes()` 提供进程内 watch 通知。MemoryFabric 和 SqliteEventStore 在可观察变更提交成功后通知；只读查询、空投递扫描和失败事务不唤醒消费者。SQLite clone 共享通知，独立打开连接或其他进程的写入通过定时兜底发现。
+
+图驱动、调用期间的终态检测、公开事件投影和续读采用“订阅通知 → 标记代次 → 读取持久状态 → 等待变化”的顺序，避免读取与等待之间丢失唤醒。常规兜底为一秒，图驱动还按 Run 截止时间缩短等待；通知不是持久化事实，恢复仍以日志和 checkpoint 为准。外部 EventRuntime/JobRuntime 的调度属于其宿主，不因内部图通知而自动跨进程推送。
+
+`fabric_notifications` 回归覆盖读后等待竞态、16 个空闲 Run 的存储访问上限、通知触发的及时唤醒、SQLite 成功/失败事务通知以及独立连接的兜底读取。

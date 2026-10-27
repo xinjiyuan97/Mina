@@ -13,7 +13,7 @@ use agent_core::context::{
     ContextComponentDescriptor, ContextError, ContextFuture, InvalidateContextArtifacts,
     PutContextArtifact, ReusableArtifactQuery,
 };
-use agent_core::harness::{
+use agent_core::contracts::{
     ArchiveSession, BeginRunResult, BeginSessionRun, ContentPart, ConversationRole, CreateSession,
     FinalizeSessionRun, MAX_SESSION_PAGE_SIZE, MessageId, ObservedRunEvent, RunEvent, RunId,
     RunSnapshot, RunStatus, RunStore, RunStoreError, RunStoreFuture, SessionId, SessionMessage,
@@ -1950,7 +1950,7 @@ async fn run_blocking<T: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use agent_core::harness::{
+    use agent_core::contracts::{
         ApprovalId, ApprovalResolution, FinishReason, OutputChannel, RunEventKind, RunStateError,
         SessionToolCallState, ToolRiskLevel,
     };

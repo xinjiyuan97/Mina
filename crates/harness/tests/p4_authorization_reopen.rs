@@ -1,5 +1,6 @@
 use agent_core::{
-    event_runtime::EventId, harness::*, operator::*, operator_fabric::*, tool_authorization::*,
+    contracts::events::EventId, contracts::fabric::*, contracts::*, operator::*,
+    tool_authorization::*,
 };
 use agent_extension::store::SqliteEventStore;
 use serde_json::json;

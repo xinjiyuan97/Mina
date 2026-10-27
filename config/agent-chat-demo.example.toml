@@ -29,3 +29,7 @@ timeout_ms = 180000
 type = "openai-compatible"
 base_url = "https://api.openai.com/v1/"
 api_key = { env = "OPENAI_API_KEY" }
+
+# Optional: reuse the same Skill/context preparation service as the formal server.
+# [context]
+# skill_directory = "skills"

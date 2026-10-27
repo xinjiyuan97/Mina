@@ -1,5 +1,5 @@
 //! Static graph format shared by file and code construction.
-use crate::operator_fabric::FabricError;
+use crate::contracts::fabric::FabricError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::Path};

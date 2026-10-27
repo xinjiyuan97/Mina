@@ -1,6 +1,6 @@
 //! Host-neutral run records. Execution belongs exclusively to AgentEngine.
 use super::HarnessError;
-use crate::harness::*;
+use crate::contracts::*;
 use serde_json::Value;
 use std::sync::Arc;
 use thiserror::Error;

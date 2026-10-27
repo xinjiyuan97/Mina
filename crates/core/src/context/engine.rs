@@ -5,7 +5,7 @@ use super::{
     ContextBudgetReport, ContextCompressor, ContextError, ContextItem, ContextPack,
     ContextPriority, ContextSourceRef, PutContextArtifact, ReusableArtifactQuery,
 };
-use crate::harness::{
+use crate::contracts::{
     ContentPart, ConversationRole, ModelAttachment, ModelMessage, ModelRole, SessionId,
     SessionStore,
 };
@@ -122,7 +122,7 @@ impl ContextEngine {
                 let content = message
                     .content
                     .iter()
-                    .filter_map(crate::harness::ContentPart::as_text)
+                    .filter_map(crate::contracts::ContentPart::as_text)
                     .collect::<Vec<_>>()
                     .join("\n");
                 let attachments = message
@@ -167,6 +167,38 @@ impl ContextEngine {
                     ),
                 });
             }
+        }
+
+        if request.session_id.is_some() && !request.prior_messages.is_empty() {
+            return Err(ContextError::Invalid(
+                "use either session history or supplied history".into(),
+            ));
+        }
+        for (index, message) in request.prior_messages.into_iter().enumerate() {
+            if !message.tool_calls.is_empty() || message.role == ModelRole::Tool {
+                return Err(ContextError::Invalid(
+                    "supplied history must contain completed conversation messages".into(),
+                ));
+            }
+            if message.role != ModelRole::User && !message.attachments.is_empty() {
+                return Err(ContextError::Invalid(
+                    "binary input is only supported on user messages".into(),
+                ));
+            }
+            let digest = digest_text(&format!("{:?}", message));
+            candidates.push(ContextItem {
+                item_id: format!("host-history:{index}"),
+                role: message.role,
+                content: message.content,
+                attachments: message.attachments,
+                priority: ContextPriority::Normal,
+                source: source(
+                    "session_message",
+                    "host-history",
+                    &index.to_string(),
+                    &digest,
+                ),
+            });
         }
 
         candidates.push(ContextItem {
@@ -294,10 +326,11 @@ impl ContextEngine {
 
 #[derive(Debug, Clone)]
 pub struct ContextBuildRequest {
-    pub run_id: crate::harness::RunId,
+    pub run_id: crate::contracts::RunId,
     pub session_id: Option<SessionId>,
     pub through_message_ordinal: Option<u64>,
     pub current_input: String,
+    pub prior_messages: Vec<ModelMessage>,
     pub request_digest: String,
     pub agent_profile: String,
     pub agent_instruction: String,

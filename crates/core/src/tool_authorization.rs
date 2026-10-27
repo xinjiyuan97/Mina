@@ -1,4 +1,4 @@
-use crate::harness::{
+use crate::contracts::{
     ApprovalDecision, ApprovalId, ApprovalResolution, RunId, ToolArgumentVisibility,
     ToolBindingKind, ToolInvocation, ToolSetSnapshot, ToolValidationRequest, digest_only_arguments,
 };

@@ -3,8 +3,8 @@ use agent_core::{
         AgentDefinition, AgentResources, GraphHost, OperatorRegistry, graph::run_checkpoint_key,
         memory_fabric::MemoryFabric,
     },
-    harness::*,
-    operator_fabric::*,
+    contracts::fabric::*,
+    contracts::*,
 };
 use futures_util::StreamExt;
 use serde_json::json;

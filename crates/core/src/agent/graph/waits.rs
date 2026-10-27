@@ -1,7 +1,7 @@
 //! Durable external wait registration and delivery for static graphs.
 //! The registration journal precedes external effects, allowing recovery and cleanup.
 use super::*;
-use crate::{event_runtime::*, harness::*, operator_fabric::*};
+use crate::{contracts::events::*, contracts::fabric::*, contracts::*};
 use serde_json::json;
 
 #[derive(Clone)]

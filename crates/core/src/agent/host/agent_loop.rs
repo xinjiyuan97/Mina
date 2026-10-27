@@ -1,30 +1,7 @@
-use crate::harness::tool::{digest_only_arguments, digest_only_bytes};
-#[cfg(test)]
-use crate::harness::*;
-use crate::harness::{
-    Agent, AgentEventStream, AgentMetadata, ApprovalPort, ApprovalResolution, ModelPort,
-    RejectAllApprovals, RunRequest, TokenUsage, TokenUsageSource, ToolApprovalPolicy,
-    ToolErrorCategory, ToolPort,
-};
+use crate::contracts::*;
 #[cfg(test)]
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
-
-mod reducer;
-pub use crate::agent::graph::resumed_tool_content;
-
-pub use reducer::{
-    AGENT_LOOP_REDUCER_PROTOCOL_VERSION, AgentLoopDispatch, AgentLoopEffect, AgentLoopEffectKind,
-    AgentLoopInput, AgentLoopOutcome, AgentLoopReducer, AgentLoopReducerConfig,
-    AgentLoopReducerState, AgentLoopStart, AgentLoopStartDispatch, AgentLoopTransition,
-    ModelInvocationPurpose, PortableToolError, ToolInvocation, ToolInvocationResult,
-    ToolValidation, ToolValidationRequest,
-};
-
-/// Portable reducer checkpoint schema retained for browser and stored-state readers.
-/// Operator records additionally carry their own versioned execution manifests.
-pub const AGENT_LOOP_CHECKPOINT_SCHEMA_VERSION: u32 = 4;
 
 /// A bounded model/tool loop for one independent run.
 ///
@@ -42,17 +19,6 @@ pub struct AgentLoop<P, T> {
     model_timeout: Duration,
     tool_timeout: Duration,
     tool_call_strategy: ToolCallStrategy,
-}
-
-/// Host-selected scheduling for one model response containing multiple tool
-/// calls. ParallelSafe only overlaps tools that explicitly opt in and cannot
-/// suspend; every other call remains ordered and exclusive.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ToolCallStrategy {
-    #[default]
-    Sequential,
-    ParallelSafe,
 }
 
 const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -153,22 +119,22 @@ impl<P: ModelPort, T: ToolPort> Agent for AgentLoop<P, T> {
                 .with_approval_port(self.approvals.clone())
                 .run(request),
             Err(error) => Box::pin(futures_util::stream::once(async move {
-                crate::harness::AgentEvent::failed("graph_invalid", error.to_string(), false)
+                crate::contracts::AgentEvent::failed("graph_invalid", error.to_string(), false)
             })),
         }
     }
 }
 #[cfg(test)]
 mod tests {
+    use crate::agent::{Harness, RunOptions};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use futures_util::stream;
     use serde_json::json;
 
     use super::*;
-    use crate::harness::{
-        Harness, ModelEventStream, RunEventKind, RunOptions, ToolCallFuture, ToolDefinition,
-        ToolError, ToolOutput,
+    use crate::contracts::{
+        ModelEventStream, RunEventKind, ToolCallFuture, ToolDefinition, ToolError, ToolOutput,
     };
 
     struct FakeProvider {
@@ -211,7 +177,7 @@ mod tests {
 
             assert_eq!(request.messages.len(), 4);
             assert_eq!(request.messages[2].tool_calls[0].id, "call_1");
-            assert_eq!(request.messages[3].role, crate::harness::ModelRole::Tool);
+            assert_eq!(request.messages[3].role, crate::contracts::ModelRole::Tool);
             assert_eq!(request.messages[3].tool_call_id.as_deref(), Some("call_1"));
             Box::pin(stream::iter(vec![
                 ModelEvent::Accepted {
@@ -381,7 +347,7 @@ mod tests {
     }
 
     impl ApprovalPort for FixedApproval {
-        fn request(&self, request: ApprovalRequest) -> crate::harness::ApprovalFuture {
+        fn request(&self, request: ApprovalRequest) -> crate::contracts::ApprovalFuture {
             assert_eq!(request.tool_name, "exec_command");
             assert_eq!(request.risk_level, ToolRiskLevel::High);
             assert_eq!(request.arguments, json!({}));
@@ -508,7 +474,7 @@ mod tests {
 
         let execution = harness
             .start_with_options(
-                crate::harness::RunId::new(),
+                crate::contracts::RunId::new(),
                 "Use one more tool",
                 Vec::new(),
                 RunOptions {
@@ -850,61 +816,4 @@ mod tests {
             Some(RunEventKind::RunCompleted { .. })
         ));
     }
-}
-fn add_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage {
-    let source = if left.input_tokens == 0 && left.output_tokens == 0 && left.total_tokens == 0 {
-        right.source
-    } else if left.source == right.source {
-        left.source
-    } else {
-        TokenUsageSource::Mixed
-    };
-    TokenUsage {
-        input_tokens: left.input_tokens.saturating_add(right.input_tokens),
-        output_tokens: left.output_tokens.saturating_add(right.output_tokens),
-        total_tokens: left.total_tokens.saturating_add(right.total_tokens),
-        source,
-    }
-}
-
-fn step_limit_tool_error_content(code: &str, message: &str) -> String {
-    serde_json::json!({
-        "ok": false,
-        "error": {
-            "code": code,
-            "message": message,
-            "category": ToolErrorCategory::ResourceExhausted,
-            "retryable": false,
-            "retry_after_ms": null,
-        },
-        "instruction": "Do not request more tools. Give the user a final answer using the information already available and clearly state any incomplete work."
-    })
-    .to_string()
-}
-
-fn tool_error_content(
-    code: &str,
-    message: &str,
-    category: ToolErrorCategory,
-    retryable: bool,
-    retry_after_ms: Option<u64>,
-) -> String {
-    serde_json::json!({
-        "ok": false,
-        "error": {
-            "code": code,
-            "message": message,
-            "category": category,
-            "retryable": retryable,
-            "retry_after_ms": retry_after_ms,
-        }
-    })
-    .to_string()
-}
-
-fn rejection_message(resolution: &ApprovalResolution) -> String {
-    resolution.reason.as_deref().map_or_else(
-        || "the user rejected this tool call".into(),
-        |reason| format!("the user rejected this tool call: {reason}"),
-    )
 }

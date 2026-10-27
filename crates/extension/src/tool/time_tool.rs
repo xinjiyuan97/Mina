@@ -1,4 +1,4 @@
-use agent_core::harness::{
+use agent_core::contracts::{
     Tool, ToolCallFuture, ToolCallRequest, ToolConcurrency, ToolDefinition, ToolError,
     ToolExecutionPolicy, ToolOutput, ToolRetryPolicy,
 };

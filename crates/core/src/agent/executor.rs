@@ -1,6 +1,6 @@
 //! Transport-only coordination; handlers return data, never Agent decisions here.
 
-use crate::operator_fabric::*;
+use crate::contracts::fabric::*;
 use serde_json::Value;
 use std::{future::Future, pin::Pin};
 

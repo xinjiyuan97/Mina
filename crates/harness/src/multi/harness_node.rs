@@ -4,7 +4,7 @@ use crate::multi::{
     SqliteBusHandle, lifecycle_event,
 };
 use crate::{Harness, RunOptions};
-use agent_core::harness::{Agent, OutputChannel, RunEventKind, RunId};
+use agent_core::contracts::{Agent, OutputChannel, RunEventKind, RunId};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -252,7 +252,7 @@ impl<A: Agent + 'static> AgentNode for HarnessAgentNode<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::harness::{
+    use agent_core::contracts::{
         AgentEvent, AgentEventStream, AgentMetadata, FinishReason, RunRequest,
     };
     struct Echo;

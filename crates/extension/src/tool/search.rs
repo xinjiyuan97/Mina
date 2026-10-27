@@ -1,6 +1,6 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use agent_core::harness::{
+use agent_core::contracts::{
     RunCancellation, Tool, ToolCallFuture, ToolCallRequest, ToolConcurrency, ToolDefinition,
     ToolError, ToolExecutionPolicy, ToolOutput, ToolRetryPolicy, ToolRiskLevel,
 };
@@ -297,7 +297,7 @@ fn invalid_arguments() -> ToolError {
 
 #[cfg(test)]
 mod tests {
-    use agent_core::harness::{RunCancellation, RunId};
+    use agent_core::contracts::{RunCancellation, RunId};
     use serde_json::json;
     use tempfile::tempdir;
 

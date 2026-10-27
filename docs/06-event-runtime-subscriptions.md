@@ -582,7 +582,7 @@ outbox
 
 ## 13. 与当前 Mina 的集成
 
-当前 [event.rs](../crates/core/src/harness/event.rs) 继续维护 run 内连续 `seq` 和唯一终态；当前 [agent_loop.rs](../crates/core/src/harness/agent_loop.rs) 继续处理短模型/工具循环。新增桥接层后：
+当前 [event.rs](../crates/core/src/contracts/event.rs) 继续维护 run 内连续 `seq` 和唯一终态；当前 [agent_loop.rs](../crates/core/src/contracts/agent_loop.rs) 继续处理短模型/工具循环。新增桥接层后：
 
 ```text
 Event delivery

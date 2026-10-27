@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     agent::graph::{GraphRun, event_log_key, public_journal_key, run_checkpoint_key as run_key},
-    harness::{BlobId, RunId},
+    contracts::{BlobId, RunId},
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashSet};
@@ -151,7 +151,10 @@ impl FabricState {
         }
         let wait_index = format!(
             "graph-waits:{}",
-            crate::event_runtime::EventId::stable("graph-waits", &json!([tenant, run]).to_string())
+            crate::contracts::events::EventId::stable(
+                "graph-waits",
+                &json!([tenant, run]).to_string()
+            )
         );
         if let Some(index) = self.checkpoints.get(&wait_index) {
             let registrations = index

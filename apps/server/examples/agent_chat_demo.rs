@@ -4,7 +4,7 @@ use agent_core::{
         AgentDefinition, AgentResources, GraphAgent, Harness, OperatorRegistry, RunOptions,
         memory_fabric::MemoryFabric,
     },
-    harness::{
+    contracts::{
         BlobId, BlobStore, ModelAttachment, ModelMessage, PutBlob, RunCancellation, RunId,
         ToolRegistry,
     },
@@ -43,12 +43,12 @@ type DemoHarness = Harness<GraphAgent>;
 
 // Log metadata only: never serialize model requests, response text, or credentials.
 struct DebugProvider(ConfiguredModelProvider);
-impl agent_core::harness::ModelPort for DebugProvider {
+impl agent_core::contracts::ModelPort for DebugProvider {
     fn stream(
         &self,
-        request: agent_core::harness::ModelRequest,
-    ) -> agent_core::harness::ModelEventStream {
-        use agent_core::harness::ModelEvent;
+        request: agent_core::contracts::ModelRequest,
+    ) -> agent_core::contracts::ModelEventStream {
+        use agent_core::contracts::ModelEvent;
         let run_id = request.run_id;
         let mut upstream = self.0.stream(request);
         Box::pin(async_stream::stream! {
@@ -95,6 +95,8 @@ struct Config {
     image_generation: Option<ImageGenerationConfig>,
     #[serde(default)]
     workspace: Option<WorkspaceConfig>,
+    #[serde(default)]
+    context: Option<ContextConfig>,
     #[serde(default = "prompt")]
     system_prompt: String,
 }
@@ -104,6 +106,11 @@ struct WorkspaceConfig {
     root: std::path::PathBuf,
     #[serde(default)]
     terminal: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextConfig {
+    skill_directory: std::path::PathBuf,
 }
 fn prompt() -> String {
     "You are Mina, a helpful assistant.".into()
@@ -516,15 +523,58 @@ fn build_app(
             }
         }
     }
+    let preparation = config.context.map(|context| {
+        use agent_core::{context::*, skill::SkillOrchestrator};
+        use agent_extension::store::{FilesystemSkillStore, InMemoryMemoryStore, InMemoryRunStore};
+        let policy = agent_core::contracts::preparation::ContextPolicy {
+            default_skills: vec![],
+            max_skills: 8,
+            memory_enabled: false,
+            memory_scope: "demo".into(),
+            max_memories: 0,
+            agent_profile: "demo".into(),
+            agent_instruction: config.system_prompt.clone(),
+            model_profile: config.model.model.clone(),
+            available_tools: agent_core::contracts::ToolPort::definitions(&tools)
+                .into_iter()
+                .map(|t| t.name)
+                .collect(),
+            budget: ContextBudget {
+                model_context_tokens: 65536,
+                reserved_output_tokens: u64::from(config.model.max_output_tokens.unwrap_or(4096)),
+                reserved_tool_schema_tokens: 4096,
+                max_skill_tokens: 4096,
+                max_memory_tokens: 0,
+                max_history_tokens: 16000,
+            },
+            policy_version: 1,
+            allow_run_adf: false,
+            script_runtime: json!({}),
+        };
+        let preparer = agent_core::agent::host::preparation::ContextPreparation {
+            context: ContextEngine::new(
+                Arc::new(InMemoryRunStore::default()),
+                Arc::new(InMemoryMemoryStore::default()),
+                Arc::new(SlidingWindowCompressor::new(Arc::new(
+                    HeuristicTokenEstimator,
+                ))),
+                Arc::new(InMemoryContextArtifactStore::default()),
+            ),
+            skills: Arc::new(SkillOrchestrator::new(Arc::new(FilesystemSkillStore::new(
+                context.skill_directory,
+                "demo-skills",
+            )))),
+        };
+        (Arc::new(preparer), policy)
+    });
     let resources = AgentResources::new(Arc::new(MemoryFabric::default()))
         .model("primary", "demo-v1", Arc::new(DebugProvider(provider)))
         .toolset("workspace", "demo-v1", Arc::new(tools));
-    let harness = Harness::new(GraphAgent::new(
-        definition,
-        OperatorRegistry::builtins(),
-        resources,
-    )?)
-    .with_run_timeout(Duration::from_secs(300));
+    let mut agent = GraphAgent::new(definition, OperatorRegistry::builtins(), resources)?;
+    if let Some((preparer, policy)) = preparation {
+        agent = agent.with_context_preparation(preparer, policy);
+    }
+    let harness = Harness::new(agent).with_run_timeout(Duration::from_secs(300));
     Ok(App {
         harness,
         blobs,
@@ -622,6 +672,7 @@ mod tests {
         let root = dir.path().join("workspace");
         std::fs::write(dir.path().join("outside.txt"), "private-outside").expect("outside");
         let config = Config {
+            context: None,
             workspace: Some(WorkspaceConfig {
                 root: root.clone(),
                 terminal: true,
@@ -672,6 +723,112 @@ mod tests {
         upstream_task.abort();
     }
 
+    #[tokio::test]
+    async fn demo_uses_shared_skill_preparation_and_budgets_supplied_history() {
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let observed = seen.clone();
+        let upstream = Router::new().route("/v1/chat/completions", post(move |Json(body):Json<Value>| {
+            let observed=observed.clone(); async move {
+                observed.lock().expect("seen").push(body);
+                let chunk=json!({"choices":[{"index":0,"delta":{"content":"prepared-answer"},"finish_reason":"stop"}]});
+                ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n"))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}/v1/", listener.local_addr().expect("addr"));
+        let upstream_task =
+            tokio::spawn(async move { axum::serve(listener, upstream).await.expect("upstream") });
+        let dir = tempfile::tempdir().expect("temp");
+        let skill_root = dir.path().join("skills");
+        let package = skill_root.join("greeting");
+        std::fs::create_dir_all(&package).expect("dir");
+        std::fs::write(
+            package.join("skill.toml"),
+            r#"skill_id = "greeting"
+version = "1.0.0"
+description = "Greeting instructions"
+required_tools = ["read"]
+optional_tools = []
+required_capabilities = ["tool_calling"]
+[compatibility]
+contract_version = 1
+minimum_harness_version = "0.1.0"
+[activation]
+type = "routable"
+hints = ["hello"]
+"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            package.join("SKILL.md"),
+            "Use the shared-preparation-marker when greeting.",
+        )
+        .expect("skill");
+        let config = Config {
+            context: Some(ContextConfig {
+                skill_directory: skill_root,
+            }),
+            workspace: Some(WorkspaceConfig {
+                root: dir.path().join("workspace"),
+                terminal: false,
+            }),
+            graph: None,
+            image_generation: None,
+            listen: "127.0.0.1:0".parse().expect("addr"),
+            system_prompt: prompt(),
+            model: serde_json::from_value(
+                json!({"model":"mock","provider":{"type":"openai-compatible","base_url":base}}),
+            )
+            .expect("model"),
+        };
+        let app = build_app(
+            config,
+            Arc::new(FilesystemBlobStore::new(dir.path().join("blobs"))),
+        )
+        .expect("app");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(app)).await.expect("demo") });
+        for turn in ["prepared-1", "prepared-2"] {
+            let result = reqwest::Client::new()
+                .post(format!("http://{address}/chat"))
+                .json(&request(turn))
+                .send()
+                .await
+                .expect("chat")
+                .text()
+                .await
+                .expect("sse");
+            assert!(result.contains("prepared-answer"), "{result}");
+        }
+        let seen = seen.lock().expect("seen");
+        assert_eq!(seen.len(), 2);
+        for body in seen.iter() {
+            assert!(
+                body["messages"]
+                    .to_string()
+                    .contains("shared-preparation-marker")
+            );
+            let tools = body["tools"].as_array().expect("tools");
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0]["function"]["name"], "read");
+        }
+        assert!(
+            seen[1]["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .any(|m| m["role"] == "assistant" && m["content"] == "prepared-answer")
+        );
+        server.abort();
+        upstream_task.abort();
+    }
+
     const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=";
 
     fn image_config(base: &str) -> ImageGenerationConfig {
@@ -713,6 +870,7 @@ mod tests {
         let upstream_task =
             tokio::spawn(async move { axum::serve(listener, upstream).await.expect("upstream") });
         let config = Config {
+            context: None,
             workspace: None,
             graph: None,
             image_generation: Some(image_config(&base)),
@@ -783,7 +941,7 @@ mod tests {
 
     #[tokio::test]
     async fn image_tool_bounds_errors_and_cancels_without_retry() {
-        use agent_core::harness::{Tool, ToolCallRequest};
+        use agent_core::contracts::{Tool, ToolCallRequest};
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = calls.clone();
         let upstream = Router::new().route(
@@ -936,7 +1094,7 @@ mod tests {
         let mock_task = tokio::spawn(async move {
             axum::serve(listener, mock).await.expect("mock");
         });
-        let config = Config { workspace: None, image_generation: None, graph: None, listen: "127.0.0.1:0".parse().expect("address"), system_prompt: prompt(), model: serde_json::from_value(json!({"model":"mock","provider":{"type":"openai-compatible","base_url":format!("http://{address}/v1/")}})).expect("model") };
+        let config = Config { context: None, workspace: None, image_generation: None, graph: None, listen: "127.0.0.1:0".parse().expect("address"), system_prompt: prompt(), model: serde_json::from_value(json!({"model":"mock","provider":{"type":"openai-compatible","base_url":format!("http://{address}/v1/")}})).expect("model") };
         let temp = tempfile::tempdir().expect("temp");
         let app = build_app(config, Arc::new(FilesystemBlobStore::new(temp.path()))).expect("app");
         let held = chat(
@@ -1144,7 +1302,7 @@ mod tests {
         let upstream_task = tokio::spawn(async move {
             axum::serve(listener, upstream).await.expect("upstream");
         });
-        let config = Config { workspace: None, image_generation: None, graph: None, listen: "127.0.0.1:0".parse().expect("address"), system_prompt: prompt(), model: serde_json::from_value(json!({"model":"mock","provider":{"type":"openai-compatible","base_url":format!("http://{addr}/v1/")}})).expect("model") };
+        let config = Config { context: None, workspace: None, image_generation: None, graph: None, listen: "127.0.0.1:0".parse().expect("address"), system_prompt: prompt(), model: serde_json::from_value(json!({"model":"mock","provider":{"type":"openai-compatible","base_url":format!("http://{addr}/v1/")}})).expect("model") };
         let temp = tempfile::tempdir().expect("temp");
         let app = build_app(config, Arc::new(FilesystemBlobStore::new(temp.path()))).expect("app");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

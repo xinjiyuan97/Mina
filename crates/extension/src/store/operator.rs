@@ -1,10 +1,13 @@
 mod indexed;
 use super::SqliteEventStore;
 use crate::operator_fabric::{FabricState, storage};
-use agent_core::operator_fabric::*;
+use agent_core::contracts::fabric::*;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 impl OperatorFabric for SqliteEventStore {
+    fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.fabric_changed.subscribe())
+    }
     fn capabilities(&self) -> FabricCapabilities {
         FabricCapabilities {
             durable: true,
@@ -13,11 +16,19 @@ impl OperatorFabric for SqliteEventStore {
     }
 
     fn execute(&self, command: FabricCommand) -> FabricFuture<'_> {
+        let writes_checkpoint = command.writes_checkpoint();
         let connection = self.connection.clone();
+        let changed = self.fabric_changed.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 let mut connection = connection.lock().map_err(storage)?;
-                transact(&mut connection, command)
+                let result = transact(&mut connection, command);
+                if let Ok(reply) = &result
+                    && (writes_checkpoint || observable_change(reply))
+                {
+                    changed.send_modify(|generation| *generation = generation.wrapping_add(1));
+                }
+                result
             })
             .await
             .map_err(storage)?
@@ -445,8 +456,8 @@ mod p5_tests {
         let source: FabricEvent = serde_json::from_value(json!({
             "topic":"full", "payload_schema":true, "envelope": {
                 "schema_version":1,"engine_version":"operator_v1","projection_version":1,
-                "event_id":agent_core::event_runtime::EventId::stable("p5","full"),
-                "event_type":"test.fact","tenant_id":"local","run_id":agent_core::harness::RunId::new(),
+                "event_id":agent_core::contracts::events::EventId::stable("p5","full"),
+                "event_type":"test.fact","tenant_id":"local","run_id":agent_core::contracts::RunId::new(),
                 "session_id":null,"effect_id":"effect","invocation_id":"invocation","attempt":1,
                 "issued_revision":0,"lease_epoch":1,"correlation_id":"test","causation_id":null,
                 "operator":{"name":"test","version":1},"operator_seq":1,

@@ -1,11 +1,12 @@
+use agent_core::agent::AgentLoop;
 use agent_core::{
     agent::{
         AgentEngine, AgentResources, AgentRunConfig, OperatorBus,
+        executor::{FabricHandler, FabricRuntimeConfig, HandlerFuture, HandlerOutput},
         memory_fabric::MemoryFabric,
-        operator_fabric::{FabricHandler, FabricRuntimeConfig, HandlerFuture, HandlerOutput},
     },
-    harness::*,
-    operator_fabric::*,
+    contracts::fabric::*,
+    contracts::*,
 };
 use agent_extension::store::InMemoryRunStore;
 use serde_json::json;
@@ -55,7 +56,7 @@ async fn low_level_subscription_publish_and_operator_delivery_are_independent() 
     let event: FabricEvent = serde_json::from_value(json!({
         "topic":"custom", "payload_schema":true, "envelope": {
             "schema_version":1,"engine_version":"operator_v1","projection_version":1,
-            "event_id":agent_core::event_runtime::EventId::new(),"event_type":"test.input",
+            "event_id":agent_core::contracts::events::EventId::new(),"event_type":"test.input",
             "tenant_id":"local","run_id":RunId::new(),"session_id":null,"effect_id":"e",
             "invocation_id":"i","attempt":1,"issued_revision":0,"lease_epoch":1,
             "correlation_id":"c","causation_id":null,"operator":{"name":"host","version":1},
@@ -372,4 +373,136 @@ async fn recovery_repairs_admission_committed_before_graph_creation() {
     assert_eq!(engine.get_run(run).await.unwrap().unwrap().output, "hello");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     engine.stop_workers().await;
+}
+
+struct JsonNode(Arc<AtomicUsize>);
+impl agent_core::agent::GraphOperator for JsonNode {
+    fn handle(
+        &self,
+        context: agent_core::agent::GraphContext,
+    ) -> agent_core::agent::graph::GraphFuture<'_> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            Ok(agent_core::agent::GraphOutput::new(
+                serde_json::Value::Null,
+                vec![agent_core::agent::GraphEvent::new(
+                    "custom.done.v1",
+                    json!({"output":format!("value={}",context.event.payload["value"])}),
+                )],
+            ))
+        })
+    }
+}
+#[tokio::test]
+async fn application_engine_admits_custom_json_graph_and_recovers_pinned_definition() {
+    use agent_core::agent::*;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = OperatorRegistry::default();
+    let counted = calls.clone();
+    registry.register(OperatorDescriptor::new("test.json", 1)
+        .input("custom.start.v1", json!({"type":"object","required":["value"],"properties":{"value":{"type":"integer"}}}))
+        .output("custom.done.v1",json!({"type":"object"}))
+        .output("custom.failed.v1",json!({"type":"object"}))
+        .output("custom.cancelled.v1",json!({"type":"object"})), move |_,_| Ok(Arc::new(JsonNode(counted.clone())))).unwrap();
+    let definition = AgentGraph::new("custom")
+        .operator("node", OperatorDefinition::new("test.json", 1, json!({})))
+        .subscribe("start", "$input", "node", ["custom.start.v1"])
+        .lifecycle(GraphLifecycle {
+            start: GraphStart {
+                event: "custom.start.v1".into(),
+            },
+            terminal: GraphTerminal {
+                from: "node".into(),
+                completed: "custom.done.v1".into(),
+                failed: "custom.failed.v1".into(),
+                cancelled: "custom.cancelled.v1".into(),
+            },
+        })
+        .limits(GraphLimits::new(10000, 100))
+        .finish()
+        .unwrap();
+    let resources = AgentResources::new(Arc::new(MemoryFabric::default()));
+    let runs = Arc::new(InMemoryRunStore::default());
+    let engine = Arc::new(AgentEngine::with_registry(
+        resources.clone(),
+        runs.clone(),
+        registry.clone(),
+    ));
+    let run = RunId::new();
+    let plan = || PlannedRun {
+        run_id: run,
+        input: "custom JSON request".into(),
+        attachments: vec![],
+        prior_messages: vec![],
+        allowed_tools: None,
+        allow_run_adf: false,
+        max_steps: None,
+        context_fingerprint: None,
+        execution_manifest: None,
+    };
+    assert!(
+        engine
+            .admit_graph(definition.clone(), json!({"value":"invalid"}), plan(), None)
+            .await
+            .is_err()
+    );
+    assert!(engine.get_run(run).await.unwrap().is_none());
+    let mut malformed = definition.clone();
+    malformed.operators.clear();
+    assert!(
+        malformed
+            .validate_start(&registry, &json!({"value":42}))
+            .is_err()
+    );
+    engine
+        .admit_graph(definition.clone(), json!({"value":42}), plan(), None)
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let mut changed = definition.clone();
+    changed.name = "changed".into();
+    assert!(
+        engine
+            .admit_graph(changed, json!({"value":42}), plan(), None)
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .admit_graph(definition, json!({"value":43}), plan(), None)
+            .await
+            .is_err()
+    );
+    drop(engine);
+    let reopened = Arc::new(AgentEngine::with_registry(
+        resources.clone(),
+        runs.clone(),
+        registry.clone(),
+    ));
+    let mut started = reopened.recover(run).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !started.events.recv().await.unwrap().kind.is_terminal() {}
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        reopened.get_run(run).await.unwrap().unwrap().input,
+        "custom JSON request"
+    );
+    assert_eq!(
+        reopened.get_run(run).await.unwrap().unwrap().output,
+        "value=42"
+    );
+    let events = reopened.events_after(run, 0, 128).await.unwrap();
+    reopened.stop_workers().await;
+    let again = Arc::new(AgentEngine::with_registry(resources, runs, registry));
+    let mut replay = again.recover(run).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !replay.events.recv().await.unwrap().kind.is_terminal() {}
+    })
+    .await
+    .unwrap();
+    assert_eq!(again.events_after(run, 0, 128).await.unwrap(), events);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    again.stop_workers().await;
 }

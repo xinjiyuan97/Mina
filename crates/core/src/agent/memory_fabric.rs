@@ -3,8 +3,8 @@
 use std::sync::{Arc, Mutex};
 
 use crate::{
+    contracts::fabric::*,
     operator::{DeliveryClass, EngineVersion, PayloadContract},
-    operator_fabric::*,
 };
 use serde::{Deserialize, Serialize};
 mod retention;
@@ -12,9 +12,13 @@ mod retention;
 #[derive(Default)]
 pub struct MemoryFabric {
     state: Mutex<FabricState>,
+    changed: tokio::sync::watch::Sender<u64>,
 }
 
 impl OperatorFabric for MemoryFabric {
+    fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.changed.subscribe())
+    }
     fn capabilities(&self) -> FabricCapabilities {
         FabricCapabilities {
             atomic_batch: true,
@@ -26,11 +30,12 @@ impl OperatorFabric for MemoryFabric {
     }
 
     fn execute(&self, command: FabricCommand) -> FabricFuture<'_> {
+        let writes_checkpoint = command.writes_checkpoint();
         Box::pin(async move {
             let mut state = self.state.lock().map_err(storage)?;
             // These commands either only read or validate completely before a
             // single infallible mutation. They need no rollback snapshot.
-            if matches!(
+            let result = if matches!(
                 &command,
                 FabricCommand::ReadCheckpoint(_)
                     | FabricCommand::ReadLog { .. }
@@ -47,9 +52,17 @@ impl OperatorFabric for MemoryFabric {
                     | FabricCommand::CollectArtifacts { .. }
                     | FabricCommand::ArtifactRoots
             ) {
-                return state.apply(command);
+                state.apply(command)
+            } else {
+                state.apply_atomic(command)
+            };
+            if let Ok(reply) = &result
+                && (writes_checkpoint || observable_change(reply))
+            {
+                self.changed
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
             }
-            state.apply_atomic(command)
+            result
         })
     }
 }
@@ -117,7 +130,7 @@ struct StoredEvent {
     retired: bool,
     event: FabricEvent,
     visible: bool,
-    outbox_batch: Option<crate::event_runtime::EventId>,
+    outbox_batch: Option<crate::contracts::events::EventId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,7 +191,7 @@ fn validate_events(events: &[FabricEvent], allow_empty: bool) -> Result<(), Fabr
             return Err(invalid("batch byte limit"));
         }
         let legacy_context = event.envelope.engine_version == EngineVersion::LegacyMachine
-            && event.topic == crate::context_operator::CONTEXT_TOPIC
+            && event.topic == crate::contracts::preparation::CONTEXT_TOPIC
             && matches!(
                 event.envelope.event_type.as_str(),
                 "run.requested" | "context.requested" | "context.completed" | "context.failed"
@@ -575,7 +588,7 @@ impl FabricState {
                 for (key, checkpoint) in &self.checkpoints {
                     let Some(id) = key
                         .strip_prefix("pipeline-artifact:")
-                        .and_then(|id| id.parse::<crate::harness::BlobId>().ok())
+                        .and_then(|id| id.parse::<crate::contracts::BlobId>().ok())
                     else {
                         continue;
                     };
@@ -1095,8 +1108,8 @@ mod tests {
     use serde_json::json;
 
     fn stored_event(visible: bool, kind: &str) -> Arc<StoredEvent> {
-        let run = crate::harness::RunId::new();
-        let id = crate::event_runtime::EventId::new();
+        let run = crate::contracts::RunId::new();
+        let id = crate::contracts::events::EventId::new();
         let mut event: FabricEvent = serde_json::from_value(json!({"topic":"topic","payload_schema":true,"envelope":{
             "schema_version":1,"engine_version":"operator_v1","projection_version":1,"event_id":id,"event_type":"test.v1","tenant_id":"local","run_id":run,"session_id":null,"effect_id":"e","invocation_id":"i","attempt":1,"issued_revision":1,"lease_epoch":1,"correlation_id":"c","causation_id":null,"operator":{"name":"test","version":1},"operator_seq":0,"delivery_class":"durable","occurred_at_ms":1,"payload":{"text":"large payload"}
         }})).unwrap();

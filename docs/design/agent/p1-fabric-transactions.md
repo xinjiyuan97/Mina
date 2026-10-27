@@ -5,7 +5,7 @@
 
 ## 接口与所有权
 
-- `agent_core::operator_fabric`：可替换的 `OperatorFabric` 命令/响应端口，显式能力描述；不依赖 extension/harness。
+- `agent_core::contracts::fabric`：可替换的 `OperatorFabric` 命令/响应端口，显式能力描述；不依赖 extension/harness。
 - `Publish` / `PublishBatch`：稳定 event ID、P0 envelope 校验、可信调用方提供的 payload schema。
 - `Subscribe` / `Replay` / `Offset`：持久 consumer/subscription 身份、不可变 topic/type/tenant filter、从头回放及分页。
 - `Claim`：批量获取订阅头部 delivery；lease 包含 consumer/subscription/offset/worker/epoch/到期时间/投递 attempt。投递 attempt 不改变 envelope 的业务 attempt；delivery epoch 不替换 envelope 的领域 lease epoch。

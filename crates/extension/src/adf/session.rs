@@ -10,7 +10,7 @@ use agent_core::{
         AdfErrorKind, AdfExecutionRequest, AdfExecutor, AdfId, AdfOwner, AdfPolicy,
         AdfPolicyRequest, AdfStoreError, LockAdfDefinition, lock_definition,
     },
-    harness::{
+    contracts::{
         RunId, ToolArgumentVisibility, ToolBinding, ToolBindingKind, ToolCallFuture,
         ToolCallRequest, ToolDefinition, ToolError, ToolErrorCategory, ToolOutput, ToolPort,
         ToolRiskLevel, ToolSetSnapshot,

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::harness::{
+use crate::contracts::{
     AgentLoopEffect, AgentLoopEffectKind, FinishReason, MessageId, ModelEvent,
     ModelInvocationPurpose, ModelMessage, ModelRequest, RunId, SessionId,
 };

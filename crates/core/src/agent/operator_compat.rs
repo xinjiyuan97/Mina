@@ -1,8 +1,8 @@
 //! Offline P0 comparison views, not executable adapters or projection receipts.
 
 use crate::{
-    event_runtime::{EventEnvelope, PublishEvent},
-    harness::{AgentLoopEffect, AgentLoopEffectKind, RunEvent},
+    contracts::events::{EventEnvelope, PublishEvent},
+    contracts::{AgentLoopEffect, AgentLoopEffectKind, RunEvent},
     operator::{LogSequence, PublicRunSequence},
 };
 

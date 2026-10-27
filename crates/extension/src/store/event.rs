@@ -6,14 +6,14 @@ use std::{
     time::Duration,
 };
 
-use agent_core::event_runtime::{
+use agent_core::contracts::events::{
     ClaimDeliveries, ClaimTimers, CompleteDelivery, CreateSubscription, Delivery, DeliveryId,
     DeliveryStatus, EventComponentDescriptor, EventEnvelope, EventError, EventFuture, EventId,
     EventStore, PublishEvent, PublishResult, RetryDelivery, ScheduleOnce, StartPosition,
     Subscription, SubscriptionId, SubscriptionMode, SubscriptionScope, SubscriptionStatus, Timer,
     TimerId, TimerStatus, validate_publish,
 };
-use agent_core::harness::{
+use agent_core::contracts::{
     ActivationId, ClaimedActivation, CompleteFlowEffect, CompleteFlowRun, ContinueFlowRun,
     EffectRequest, FlowEffect, FlowEffectId, FlowEffectStatus, FlowError, FlowFuture,
     FlowInboxItem, FlowRunState, FlowRunStatus, FlowStore, RenewFlowLease, RetryFlowEffect, RunId,
@@ -25,6 +25,7 @@ const MAX_CLAIM_BATCH: usize = 1_000;
 
 #[derive(Debug, Clone)]
 pub struct SqliteEventStore {
+    pub(super) fabric_changed: tokio::sync::watch::Sender<u64>,
     pub(super) connection: Arc<Mutex<Connection>>,
     pub(super) identity: String,
 }
@@ -51,6 +52,7 @@ impl SqliteEventStore {
         .await?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            fabric_changed: tokio::sync::watch::channel(0).0,
             identity: identity.into(),
         })
     }
@@ -1167,7 +1169,7 @@ fn parse_flow_effect_id(
 
 fn validate_flow_wait(
     run_id: RunId,
-    wait: &agent_core::harness::WaitSpec,
+    wait: &agent_core::contracts::WaitSpec,
 ) -> Result<(), FlowError> {
     match (
         &wait.subscription.owner,
@@ -1175,9 +1177,9 @@ fn validate_flow_wait(
         &wait.subscription.delivery,
     ) {
         (
-            agent_core::event_runtime::SubscriptionOwner::Run { run_id: owner },
+            agent_core::contracts::events::SubscriptionOwner::Run { run_id: owner },
             SubscriptionScope::Run { run_id: scope },
-            agent_core::event_runtime::DeliveryTarget::WakeRun {
+            agent_core::contracts::events::DeliveryTarget::WakeRun {
                 run_id: target,
                 wait_key,
             },
@@ -2243,8 +2245,8 @@ fn from_i64(value: i64, label: &str) -> Result<u64, EventError> {
     u64::try_from(value).map_err(|_| EventError::backend(format!("stored {label} is invalid")))
 }
 
-const fn source_key(source: agent_core::event_runtime::EventSource) -> &'static str {
-    use agent_core::event_runtime::EventSource;
+const fn source_key(source: agent_core::contracts::events::EventSource) -> &'static str {
+    use agent_core::contracts::events::EventSource;
     match source {
         EventSource::System => "system",
         EventSource::Gateway => "gateway",
@@ -2299,10 +2301,10 @@ const fn timer_status_key(status: TimerStatus) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use agent_core::event_runtime::{
+    use agent_core::contracts::events::{
         DeliveryTarget, EventFilter, EventSource, PayloadPredicate, SubscriptionOwner,
     };
-    use agent_core::harness::{
+    use agent_core::contracts::{
         CheckpointCodec, CheckpointEnvelope, CompleteFlowRun, FlowRunState, FlowRunStatus,
         FlowStore, RenewFlowLease, SuspendFlowRun, WaitSpec, WakeFlowRun,
     };

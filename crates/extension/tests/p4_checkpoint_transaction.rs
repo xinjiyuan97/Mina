@@ -1,4 +1,4 @@
-use agent_core::{event_runtime::EventId, harness::RunId, operator::*, operator_fabric::*};
+use agent_core::{contracts::RunId, contracts::events::EventId, contracts::fabric::*, operator::*};
 use agent_extension::operator_fabric::MemoryFabric;
 use serde_json::json;
 

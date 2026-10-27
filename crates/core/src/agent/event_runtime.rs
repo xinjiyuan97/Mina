@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::event_runtime::{
+use crate::contracts::events::{
     ClaimDeliveries, ClaimTimers, CompleteDelivery, DeliveryRouter, EventComponentDescriptor,
     EventEnvelope, EventError, EventId, EventStore, PublishEvent, PublishResult, RetryDelivery,
     ScheduleOnce, Subscription, Timer,
@@ -69,7 +69,7 @@ impl EventRuntime {
 
     pub async fn subscribe(
         &self,
-        command: crate::event_runtime::CreateSubscription,
+        command: crate::contracts::events::CreateSubscription,
     ) -> Result<Subscription, EventError> {
         self.store.subscribe(command).await
     }

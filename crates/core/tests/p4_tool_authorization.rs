@@ -1,4 +1,4 @@
-use agent_core::{harness::*, tool_authorization::*};
+use agent_core::{contracts::*, tool_authorization::*};
 use serde_json::json;
 
 fn snapshot(revision: u64, kind: ToolBindingKind) -> ToolSetSnapshot {

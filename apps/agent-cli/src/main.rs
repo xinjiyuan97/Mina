@@ -8,7 +8,7 @@ use std::{
 
 use agent_core::{
     adf::RunScopedJavaScriptPolicy,
-    harness::{ApprovalError, ApprovalFuture, ApprovalPort, ApprovalRequest, ApprovalResolution},
+    contracts::{ApprovalError, ApprovalFuture, ApprovalPort, ApprovalRequest, ApprovalResolution},
     observability::ObservationHook,
     sandbox::ProcessSandbox,
     script::{ScriptLimits, ScriptRuntime},
@@ -156,7 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     graph_config.review_level = config.approval().policy().review_level();
     graph_config.allow_run_adf = config.adf().enabled;
     graph_config.parallel_tools =
-        config.agent().tool_call_strategy == agent_core::harness::ToolCallStrategy::ParallelSafe;
+        config.agent().tool_call_strategy == agent_core::contracts::ToolCallStrategy::ParallelSafe;
     let resources = agent_core::agent::AgentResources::new(Arc::new(
         agent_core::agent::memory_fabric::MemoryFabric::default(),
     ))

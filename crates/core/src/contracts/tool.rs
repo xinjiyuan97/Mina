@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::harness::{EffectRequest, RunCancellation, RunId, WaitSpec};
+use crate::contracts::{EffectRequest, RunCancellation, RunId, WaitSpec};
 
 /// One validated invocation crossing the Agent -> tool boundary.
 #[derive(Debug, Clone)]

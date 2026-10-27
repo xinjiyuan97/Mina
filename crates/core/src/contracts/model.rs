@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::harness::{BlobId, RunId, ToolDefinition};
+use crate::contracts::{BlobId, RunId, ToolDefinition};
 
 /// Provider-neutral role used at the Agent -> model boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

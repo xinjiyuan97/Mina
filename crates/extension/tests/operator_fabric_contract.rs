@@ -1,10 +1,10 @@
-use agent_core::{event_runtime::EventId, operator_fabric::*};
+use agent_core::{contracts::events::EventId, contracts::fabric::*};
 use agent_extension::operator_fabric::MemoryFabric;
 use serde_json::json;
 
 #[tokio::test]
 async fn p5_artifact_reader_preserves_legacy_and_rejects_future_before_decode() {
-    use agent_core::harness::{BlobStore, PutBlob};
+    use agent_core::contracts::{BlobStore, PutBlob};
     let store = std::sync::Arc::new(MemoryFabric::default());
     let blobs = agent_core::agent::artifacts::FabricBlobStore(store.clone());
     let metadata = blobs
@@ -74,7 +74,7 @@ async fn p5_artifact_reader_preserves_legacy_and_rejects_future_before_decode() 
 
 #[tokio::test]
 async fn p5_artifact_size_is_rejected_before_any_chunk_is_saved() {
-    use agent_core::harness::{BlobStore, PutBlob};
+    use agent_core::contracts::{BlobStore, PutBlob};
     let store = std::sync::Arc::new(MemoryFabric::default());
     let blobs = agent_core::agent::artifacts::FabricBlobStore(store.clone());
     assert!(
@@ -359,10 +359,10 @@ async fn p5_seeded_kill_points_reopen_without_duplicate_facts() {
 #[tokio::test]
 async fn p5_retention_inventory_protects_active_outbox_and_checkpoint_references() {
     let store = MemoryFabric::default();
-    let orphan = agent_core::harness::BlobId::new();
-    let active = agent_core::harness::BlobId::new();
-    let pending = agent_core::harness::BlobId::new();
-    let dead = agent_core::harness::BlobId::new();
+    let orphan = agent_core::contracts::BlobId::new();
+    let active = agent_core::contracts::BlobId::new();
+    let pending = agent_core::contracts::BlobId::new();
+    let dead = agent_core::contracts::BlobId::new();
     for blob in [orphan, active, pending, dead] {
         store
             .execute(FabricCommand::Transact {
@@ -464,7 +464,7 @@ async fn p5_retention_inventory_protects_active_outbox_and_checkpoint_references
 
 #[tokio::test]
 async fn p6_retention_protects_attachment_and_session_blob_roots() {
-    use agent_core::harness::{BlobId, ContentPart, ModelAttachment};
+    use agent_core::contracts::{BlobId, ContentPart, ModelAttachment};
     let store = MemoryFabric::default();
     let active = BlobId::new();
     let session = BlobId::new();

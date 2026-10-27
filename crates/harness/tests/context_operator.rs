@@ -1,6 +1,6 @@
-use agent_core::agent::context_operator::*;
+use agent_core::agent::host::preparation::*;
 use agent_core::{
-    context::*, context_operator::*, harness::RunId, operator_fabric::*, skill::SkillLock,
+    context::*, contracts::RunId, contracts::fabric::*, contracts::preparation::*, skill::SkillLock,
 };
 use agent_extension::store::{FilesystemBlobStore, SqliteEventStore};
 use std::{
@@ -82,6 +82,7 @@ impl ContextPreparer for Preparer {
 
 fn request() -> ContextRequest {
     ContextRequest {
+        prior_messages: vec![],
         attachment_names: None,
         engine_version: Default::default(),
         execution_profile: None,
@@ -120,7 +121,7 @@ fn request() -> ContextRequest {
 
 #[tokio::test]
 async fn p6_pending_context_reopen_preserves_order_and_conflicts() {
-    use agent_core::harness::{BlobId, ModelAttachment};
+    use agent_core::contracts::{BlobId, ModelAttachment};
     let directory = tempfile::tempdir().expect("temp");
     let path = directory.path().join("context.db");
     let blobs = Arc::new(FilesystemBlobStore::new(directory.path().join("blobs")));
@@ -181,7 +182,7 @@ async fn p6_pending_context_reopen_preserves_order_and_conflicts() {
 
 #[tokio::test]
 async fn p6_session_history_and_attachment_name_fingerprint() {
-    use agent_core::harness::*;
+    use agent_core::contracts::*;
     use agent_core::skill::SkillOrchestrator;
     use agent_extension::store::{FilesystemSkillStore, InMemoryMemoryStore, SqliteRunStore};
     let directory = tempfile::tempdir().expect("temp");
@@ -257,7 +258,7 @@ async fn p6_session_history_and_attachment_name_fingerprint() {
         ))),
         Arc::new(InMemoryContextArtifactStore::default()),
     );
-    let preparer = AgentContextPreparer {
+    let preparer = ContextPreparation {
         context,
         skills: Arc::new(SkillOrchestrator::new(Arc::new(FilesystemSkillStore::new(
             directory.path().join("skills"),
@@ -387,7 +388,7 @@ async fn p2_timeout_does_not_remove_durable_request() {
 
 #[tokio::test]
 async fn p2_receipt_outbox_reopen_and_duplicate_delivery_commit_once() {
-    use agent_core::agent::operator_fabric::FabricHandler;
+    use agent_core::agent::executor::FabricHandler;
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("events.sqlite");
     let blobs = Arc::new(FilesystemBlobStore::new(directory.path().join("blobs")));
@@ -486,7 +487,7 @@ async fn p2_receipt_outbox_reopen_and_duplicate_delivery_commit_once() {
 
 #[tokio::test]
 async fn p2_context_matches_legacy_input_fingerprint_skill_lock_and_memory() {
-    use agent_core::{harness::*, memory::*, skill::*};
+    use agent_core::{contracts::*, memory::*, skill::*};
     use agent_extension::store::{FilesystemSkillStore, InMemoryMemoryStore, InMemoryRunStore};
     use sha2::{Digest, Sha256};
     let directory = tempfile::tempdir().expect("directory");
@@ -567,6 +568,7 @@ async fn p2_context_matches_legacy_input_fingerprint_skill_lock_and_memory() {
     let request_digest = format!("sha256:{:x}", digest.finalize());
     let legacy = context
         .build(ContextBuildRequest {
+            prior_messages: vec![],
             run_id: request.run_id,
             session_id: request.session_id,
             through_message_ordinal: request.through_message_ordinal,
@@ -589,7 +591,7 @@ async fn p2_context_matches_legacy_input_fingerprint_skill_lock_and_memory() {
         .await
         .expect("legacy pack");
     assert!(!legacy.memory_refs.is_empty());
-    let preparer = Arc::new(AgentContextPreparer { context, skills });
+    let preparer = Arc::new(ContextPreparation { context, skills });
     let fabric = Arc::new(
         SqliteEventStore::open(directory.path().join("events.sqlite"), "test")
             .await
@@ -695,7 +697,7 @@ async fn p2_large_input_is_referenced_and_engine_cannot_switch() {
     else {
         panic!("event");
     };
-    event.envelope.event_id = agent_core::event_runtime::EventId::new();
+    event.envelope.event_id = agent_core::contracts::events::EventId::new();
     event.envelope.engine_version = agent_core::operator::EngineVersion::OperatorV1;
     event.envelope.operator_seq.0 = 4;
     assert!(matches!(
@@ -716,8 +718,8 @@ async fn p6_claimed_uncommitted_context_reopens_and_reclaims_expired_lease() {
     request.execution_profile = Some("operator_v1_tools".into());
     request.attachments = ["first.png", "second.png"]
         .into_iter()
-        .map(|name| agent_core::harness::ModelAttachment {
-            blob_id: agent_core::harness::BlobId::new(),
+        .map(|name| agent_core::contracts::ModelAttachment {
+            blob_id: agent_core::contracts::BlobId::new(),
             media_type: "image/png".into(),
             name: Some(name.into()),
             size_bytes: None,
@@ -727,7 +729,7 @@ async fn p6_claimed_uncommitted_context_reopens_and_reclaims_expired_lease() {
 }
 
 async fn claimed_context_reopen(request: ContextRequest) {
-    use agent_core::agent::operator_fabric::FabricHandler;
+    use agent_core::agent::executor::FabricHandler;
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("events.sqlite");
     let blobs = Arc::new(FilesystemBlobStore::new(directory.path().join("blobs")));

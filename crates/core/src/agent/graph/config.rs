@@ -69,3 +69,78 @@ impl GraphAgentConfig {
         graph.finish()
     }
 }
+
+impl AgentDefinition {
+    /// Apply host run restrictions without widening a graph's configured capabilities.
+    /// Custom operators retain their own protocol-specific policy configuration.
+    pub fn constrain_run(&mut self, options: &crate::agent::RunOptions) -> Result<(), FabricError> {
+        if options
+            .max_steps
+            .is_some_and(|n| n == 0 || n > crate::agent::MAX_RUN_STEPS)
+        {
+            return Err(invalid("max_steps", "must be between 1 and 100"));
+        }
+        for op in self.operators.values_mut() {
+            if op.kind == "agent.context"
+                && let Some(max) = options.max_steps
+            {
+                let ceiling = op.config["max_steps"]
+                    .as_u64()
+                    .ok_or_else(|| invalid("max_steps", "context budget required"))?;
+                op.config["max_steps"] = json!(ceiling.min(u64::from(max)));
+            }
+            if matches!(
+                op.kind.as_str(),
+                "agent.context" | "agent.tool_policy" | "agent.tools"
+            ) {
+                op.config["allow_run_adf"] = json!(
+                    options.allow_run_adf && op.config["allow_run_adf"].as_bool().unwrap_or(false)
+                );
+                if let Some(allowed) = &options.allowed_tools {
+                    let configured: Option<Vec<String>> = op
+                        .config
+                        .get("allowed_tools")
+                        .map(|v| serde_json::from_value(v.clone()))
+                        .transpose()
+                        .map_err(|e| invalid("allowed_tools", e))?;
+                    op.config["allowed_tools"] = json!(
+                        allowed
+                            .iter()
+                            .filter(|name| configured.as_ref().is_none_or(|v| v.contains(name)))
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl AgentDefinition {
+    /// Validate a protocol-specific start payload before durable admission.
+    pub fn validate_start(
+        &self,
+        registry: &OperatorRegistry,
+        payload: &Value,
+    ) -> Result<(), FabricError> {
+        for subscription in &self.subscriptions {
+            if subscription.from == "$input"
+                && subscription.events.contains(&self.lifecycle.start.event)
+            {
+                let op = self
+                    .operators
+                    .get(&subscription.subscriber)
+                    .ok_or_else(|| invalid("start", "subscriber does not exist"))?;
+                let descriptor = registry
+                    .describe(&op.kind, op.version)
+                    .ok_or_else(|| invalid("operator", "unregistered type"))?;
+                let schema = descriptor
+                    .inputs
+                    .get(&self.lifecycle.start.event)
+                    .ok_or_else(|| invalid("start", "undeclared input"))?;
+                validate_value(schema, payload, "start.payload")?;
+            }
+        }
+        Ok(())
+    }
+}

@@ -5,13 +5,10 @@
 
 pub mod adf;
 pub mod context;
-pub mod context_operator;
-pub mod event_runtime;
-pub mod harness;
+pub mod contracts;
 pub mod memory;
 pub mod observability;
 pub mod operator;
-pub mod operator_fabric;
 pub mod sandbox;
 pub mod script;
 pub mod skill;

@@ -7,11 +7,11 @@
 
 | 层 | 文件 | 职责 |
 | --- | --- | --- |
-| core | `crates/core/src/context_operator.rs` | 四种稳定事件名称、payload schema、ContextRequest/Policy、PreparedContext、SkillLock 与结果/错误引用 |
-| core | `crates/core/src/operator_fabric.rs` | 增加只读 ReadEvent / ScanEvents，无领域执行接口 |
+| core | `crates/core/src/contracts/preparation.rs` | 四种稳定事件名称、payload schema、ContextRequest/Policy、PreparedContext、SkillLock 与结果/错误引用 |
+| core | `crates/core/src/contracts/fabric.rs` | 增加只读 ReadEvent / ScanEvents，无领域执行接口 |
 | extension | `crates/extension/src/operator_fabric.rs` | 点查/扫描、受限 legacy Context 发布、同 Run engine 不可切换 |
 | extension | `crates/extension/src/store/operator.rs` | 新查询走原 SQLite adapter 的只读事务；没有新增数据库或 broker |
-| harness | `crates/harness/src/context_operator.rs` | AdmissionFacade、ContextOperator、可注入 ContextPreparer、AgentContextPreparer、临时 legacy_plan |
+| harness | `crates/harness/src/context_operator.rs` | AdmissionFacade、ContextOperator、可注入 ContextPreparer、ContextPreparation、临时 legacy_plan |
 | harness | `crates/harness/src/run_runtime.rs` | 幂等启动桥、识别有 durable Context 请求的待准备 Run |
 | server | `apps/server/src/admission.rs` | DTO/错误映射、请求任务所有权、临时桥恢复接线、HTTP/Session 测试 |
 | server | `apps/server/src/main.rs` | 注入 SQLite/Blob/Context ports，删除原请求准备业务实现；保留路由与公共 DTO |

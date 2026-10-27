@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::harness::{
+use crate::contracts::{
     ActivationId, ApprovalId, ApprovalResolution, FinishReason, RunCancellation, RunId, TokenUsage,
     ToolErrorCategory, ToolRiskLevel,
 };

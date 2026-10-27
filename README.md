@@ -39,7 +39,7 @@ flowchart LR
 Core 提供两层接入方式：
 
 - 底层：`OperatorBus` 提供算子与事件订阅、事件发送和投递推进；`GraphEngine` 执行图与提交状态。
-- 高层：`GraphAgent` 提供对话流；`GraphHost` 提供公开事件日志与投影；`AgentEngine` 提供后台运行、审批、取消、分页事件读取和恢复。
+- 高层：`GraphAgent` 提供对话流和可选共享上下文准备；`GraphHost` 提供公开事件日志与投影；`AgentEngine` 提供后台运行、审批、取消、分页事件读取和恢复。
 
 持久化能力由注入的存储决定。MemoryFabric 只在进程内保存状态；跨进程恢复需要持久化 Fabric 和匹配的资源 revision。恢复不会盲目重放中断的模型调用或非幂等外部副作用。
 
@@ -83,6 +83,8 @@ MINA_CONFIG=config/mina.toml pnpm dev
 
 Web 会将 `/api/*` 和 `/healthz` 代理到 Server。也可以分别运行 `pnpm dev:web` 和 `pnpm dev:server`。完整工作台与上述独立 demo 使用不同的 HTTP 接口和配置文件；demo 的生图配置不会自动注册到正式 Server。
 
+Server 可用 `MINA_AGENT_GRAPH` 为 tools profile 指定静态图文件；自定义节点可通过 `AgentEngine::with_registry` 接入高层持久化运行接口。
+
 Server 默认使用 `data/runs.sqlite3`，可通过 `MINA_RUN_STORE_PATH` 修改。`MINA_ENGINE_PROFILE` 支持 `operator_v1_tools`（默认）和 `operator_v1_text`，两者使用同一静态图运行时。旧运行数据不自动转换为新图。
 
 ## 目录与边界
@@ -116,3 +118,5 @@ bash scripts/check-rust-boundaries.sh
 图测试覆盖文件/代码构建、事件协议、token 用量、审批、等待、恢复和回收。图片生成使用本地 mock 检查调用与 HTTP 文件读取，真实服务需要单独配置并验证。
 
 更多专题：[架构边界](docs/01-architecture-boundaries.md)、[进程沙箱](docs/10-process-sandbox-and-tool-backends.md)、[Workspace 文件系统](docs/15-workspace-filesystem.md)。历史设计文档中的旧流水线描述不作为当前 API 使用指南。
+
+Core 规范模块入口为 `contracts`（通用契约）、`agent::graph`（图引擎）、`agent::host`（上下文准备与应用运行）、`agent::bus` / `agent::executor`（低层订阅与投递）。完整 API 和通知唤醒机制见 [API 与分层](docs/design/agent/operator-only-api.md)。

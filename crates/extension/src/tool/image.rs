@@ -4,7 +4,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use agent_core::harness::{
+use agent_core::contracts::{
     BlobStore, PutBlob, Tool, ToolCallFuture, ToolCallRequest, ToolDefinition, ToolError,
     ToolOutput,
 };

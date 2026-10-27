@@ -10,8 +10,8 @@ mod waits;
 use super::definition::invalid;
 use super::definition::*;
 use crate::{
-    harness::{ModelPort, RunCancellation, RunId, TokenUsage, ToolPort},
-    operator_fabric::{FabricError, OperatorFabric},
+    contracts::fabric::{FabricError, OperatorFabric},
+    contracts::{ModelPort, RunCancellation, RunId, TokenUsage, ToolPort},
 };
 pub use runtime::{
     ConfiguredAgent, GraphEngine, GraphIngress, GraphRun, GraphStatus, GraphStepUsage,
@@ -559,6 +559,6 @@ pub fn event_log_key(tenant: &str, run: RunId) -> String {
 pub fn public_journal_key(tenant: &str, run: RunId) -> String {
     format!(
         "graph-public:{}",
-        crate::event_runtime::EventId::stable("graph-public", &format!("{tenant}:{run}"))
+        crate::contracts::events::EventId::stable("graph-public", &format!("{tenant}:{run}"))
     )
 }

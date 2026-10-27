@@ -1,12 +1,12 @@
 //! OpenAI-compatible Chat Completions streaming adapter.
 //!
 //! Provider SSE, JSON, HTTP headers, credentials, and transport errors terminate
-//! in this crate. The Agent only sees `agent_core::harness::ModelEvent` values.
+//! in this crate. The Agent only sees `agent_core::contracts::ModelEvent` values.
 
 use std::{collections::BTreeMap, sync::Arc};
 
 use agent_core::context::{TokenEstimateRequest, TokenEstimator, TokenSegment};
-use agent_core::harness::{
+use agent_core::contracts::{
     BlobStore, FinishReason, ModelError, ModelErrorKind, ModelEvent, ModelEventStream,
     ModelMessage, ModelPort, ModelRequest, ModelRole, TokenUsage, TokenUsageSource, ToolDefinition,
 };
@@ -457,8 +457,8 @@ struct ChatMessageToolCall {
     function: ChatMessageToolFunction,
 }
 
-impl From<&agent_core::harness::ModelToolCall> for ChatMessageToolCall {
-    fn from(call: &agent_core::harness::ModelToolCall) -> Self {
+impl From<&agent_core::contracts::ModelToolCall> for ChatMessageToolCall {
+    fn from(call: &agent_core::contracts::ModelToolCall) -> Self {
         Self {
             id: call.id.clone(),
             kind: "function",
@@ -818,7 +818,7 @@ mod tests {
             }
         }
     }
-    use agent_core::harness::{
+    use agent_core::contracts::{
         BlobId, BlobMetadata, BlobObject, BlobStoreError, BlobStoreFuture, ModelAttachment,
         PutBlob, RunId,
     };
@@ -887,7 +887,7 @@ mod tests {
                 ModelMessage::assistant_tool_calls(
                     "",
                     "considering the clock",
-                    vec![agent_core::harness::ModelToolCall {
+                    vec![agent_core::contracts::ModelToolCall {
                         id: "call_1".into(),
                         name: "get_current_time".into(),
                         arguments: "{}".into(),

@@ -1,6 +1,6 @@
 use super::*;
 use agent_core::agent::AgentResources;
-use agent_core::harness::*;
+use agent_core::contracts::*;
 use serde_json::json;
 
 struct ApprovalModel;

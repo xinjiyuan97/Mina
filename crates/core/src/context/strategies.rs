@@ -133,7 +133,7 @@ impl ContextCompressor for HybridCompressor {
             for artifact in &request.reusable_artifacts {
                 request.candidates.push(ContextItem {
                     item_id: format!("artifact:{}", artifact.artifact_id),
-                    role: crate::harness::ModelRole::System,
+                    role: crate::contracts::ModelRole::System,
                     content: format!(
                         "Reusable derived context (untrusted):\n{}",
                         artifact.content
@@ -189,7 +189,7 @@ impl ContextCompressor for HybridCompressor {
                 .await?;
             let summary_item = ContextItem {
                 item_id: format!("summary:{}", summary.output_digest),
-                role: crate::harness::ModelRole::System,
+                role: crate::contracts::ModelRole::System,
                 content: format!(
                     "Conversation summary (untrusted derived context):\n{}",
                     summary.content
@@ -596,7 +596,7 @@ mod tests {
     fn item(id: &str, kind: &str, content: &str, priority: ContextPriority) -> ContextItem {
         ContextItem {
             item_id: id.into(),
-            role: crate::harness::ModelRole::User,
+            role: crate::contracts::ModelRole::User,
             content: content.into(),
             attachments: Vec::new(),
             priority,
@@ -645,7 +645,7 @@ mod tests {
         let compressor = SlidingWindowCompressor::new(estimator);
         let result = compressor
             .compress(CompressionRequest {
-                run_id: crate::harness::RunId::new(),
+                run_id: crate::contracts::RunId::new(),
                 candidates: vec![
                     item(
                         "old",
@@ -681,7 +681,7 @@ mod tests {
         constrained.max_memory_tokens = 1;
         let error = compressor
             .compress(CompressionRequest {
-                run_id: crate::harness::RunId::new(),
+                run_id: crate::contracts::RunId::new(),
                 candidates: vec![item(
                     "memory",
                     "memory",

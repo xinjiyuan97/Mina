@@ -368,7 +368,7 @@ fn check_request<'a>(
 
 fn build_runtime(
     limits: ScriptLimits,
-    interrupt: Option<(Instant, agent_core::harness::RunCancellation)>,
+    interrupt: Option<(Instant, agent_core::contracts::RunCancellation)>,
 ) -> Result<Runtime, ScriptError> {
     let memory_limit = usize::try_from(limits.memory_bytes).map_err(|_| {
         invalid_request(
@@ -426,7 +426,7 @@ const fn purpose_name(purpose: ScriptPurpose) -> &'static str {
 
 fn map_engine_error(
     error: rquickjs::Error,
-    interrupt: Option<(Instant, &agent_core::harness::RunCancellation)>,
+    interrupt: Option<(Instant, &agent_core::contracts::RunCancellation)>,
 ) -> ScriptError {
     if let Some((deadline, cancellation)) = interrupt {
         if cancellation.is_cancelled() {

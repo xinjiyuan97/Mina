@@ -5,7 +5,7 @@ use super::{
     MemoryExtractor, MemoryFuture, MemoryId, MemoryKind, MemoryRecord, MemorySensitivity,
     MemoryStore, MemoryWriteDecision, MemoryWritePolicy, PutMemory,
 };
-use crate::harness::ContentPart;
+use crate::contracts::ContentPart;
 
 #[derive(Debug, Default)]
 pub struct RuleMemoryExtractor;
