@@ -1,6 +1,12 @@
 # Demo graph: host injects primary Model and workspace Toolset resources.
-schema_version: 1
+schema_version: 2
 name: demo-assistant
+triggers:
+  start:
+    type: manual
+    version: 1
+    event: agent.start.v1
+    config: {}
 operators:
   context:
     type: agent.context
@@ -37,7 +43,7 @@ operators:
 subscriptions:
   - id: start-agent
     subscriber: context
-    from: "$input"
+    from: start
     events: [agent.start.v1]
   - id: request-model
     subscriber: llm
@@ -77,7 +83,7 @@ subscriptions:
     events: [gate.completed.v1]
 lifecycle:
   start:
-    event: agent.start.v1
+    trigger: start
   terminal:
     from: llm
     completed: stop.completed.v1

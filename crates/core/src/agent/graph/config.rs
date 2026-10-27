@@ -42,12 +42,13 @@ impl GraphAgentConfig {
             model["max_output_tokens"] = json!(limit);
         }
         let mut graph = AgentGraph::new("tool-assistant")
+            .trigger("start", TriggerDefinition::manual("agent.start.v1"))
             .operator("context",op("agent.context",json!({"system_prompt":self.system_prompt,"max_steps":self.max_steps,"toolset":"workspace","allow_run_adf":self.allow_run_adf})))
             .operator("llm",op("agent.model",model))
             .operator("gate",op("agent.gate",json!({})))
             .operator("policy",op("agent.tool_policy",json!({"toolset":"workspace","approval_timeout_ms":self.run_timeout_ms.min(86_400_000),"review_level":self.review_level,"allow_run_adf":self.allow_run_adf})))
             .operator("tools",op("agent.tools",json!({"toolset":"workspace","timeout_ms":self.tool_timeout_ms,"review_level":self.review_level,"allow_run_adf":self.allow_run_adf,"allow_suspend":self.allow_suspend,"parallel":self.parallel_tools})))
-            .subscribe("start","$input","context",["agent.start.v1"])
+            .subscribe("start","start","context",["agent.start.v1"])
             .subscribe("model","context","llm",["model.requested.v1","context.failed.v1"])
             .subscribe("batch","llm","gate",["stop.tool_calls.v1"])
             .subscribe("authorize","gate","policy",["gate.dispatch.v1"])
@@ -123,23 +124,46 @@ impl AgentDefinition {
         registry: &OperatorRegistry,
         payload: &Value,
     ) -> Result<(), FabricError> {
+        self.validate_trigger(registry, &self.lifecycle.start.trigger, payload)
+    }
+    /// Validate a named trigger and its payload before any durable admission.
+    pub fn validate_trigger(
+        &self,
+        registry: &OperatorRegistry,
+        trigger: &str,
+        payload: &Value,
+    ) -> Result<(), FabricError> {
+        let source = self
+            .triggers
+            .get(trigger)
+            .ok_or_else(|| invalid("trigger", "unknown trigger"))?;
+        if source.kind != "manual" || source.version != 1 || source.config != serde_json::json!({})
+        {
+            return Err(invalid(
+                "trigger",
+                "unsupported trigger type, version or config",
+            ));
+        }
+        let mut found = false;
         for subscription in &self.subscriptions {
-            if subscription.from == "$input"
-                && subscription.events.contains(&self.lifecycle.start.event)
-            {
+            if subscription.from == trigger && subscription.events.contains(&source.event) {
+                found = true;
                 let op = self
                     .operators
                     .get(&subscription.subscriber)
-                    .ok_or_else(|| invalid("start", "subscriber does not exist"))?;
+                    .ok_or_else(|| invalid("trigger", "subscriber does not exist"))?;
                 let descriptor = registry
                     .describe(&op.kind, op.version)
                     .ok_or_else(|| invalid("operator", "unregistered type"))?;
                 let schema = descriptor
                     .inputs
-                    .get(&self.lifecycle.start.event)
-                    .ok_or_else(|| invalid("start", "undeclared input"))?;
-                validate_value(schema, payload, "start.payload")?;
+                    .get(&source.event)
+                    .ok_or_else(|| invalid("trigger", "undeclared input"))?;
+                validate_value(schema, payload, "trigger.payload")?;
             }
+        }
+        if !found {
+            return Err(invalid("trigger", "no subscriber"));
         }
         Ok(())
     }

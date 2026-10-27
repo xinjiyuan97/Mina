@@ -45,8 +45,14 @@ flowchart LR
 下面示例使用五种算子，不需要中央 Coordinator。Context 锁定模型可见的工具快照；ToolPolicy 校验和审批；Tools 在执行前重新验证授权。三者引用同一个工具集资源。
 
 ```yaml
-schema_version: 1
+schema_version: 2
 name: tool-assistant
+triggers:
+  start:
+    type: manual
+    version: 1
+    event: agent.start.v1
+    config: {}
 operators:
   context:
     type: agent.context
@@ -80,7 +86,7 @@ operators:
 subscriptions:
   - id: start-agent
     subscriber: context
-    from: "$input"
+    from: start
     events: [agent.start.v1]
   - id: request-model
     subscriber: llm
@@ -120,7 +126,7 @@ subscriptions:
     events: [gate.completed.v1]
 lifecycle:
   start:
-    event: agent.start.v1
+    trigger: start
   terminal:
     from: llm
     completed: stop.completed.v1
@@ -135,7 +141,7 @@ limits:
 
 ```mermaid
 flowchart LR
-    Input["$input"] -->|agent.start| Context[Context]
+    Trigger["start · manual trigger"] -->|agent.start| Context[Context]
     Context -->|model.requested / context.failed| Model[Model]
     Model -->|stop.completed / stop.failed| End[引擎终态]
     Model -->|stop.tool_calls| Gate[Gate]
@@ -148,18 +154,21 @@ flowchart LR
 
 ## 4. 顶层字段
 
-除特别注明外，字段均为必填。v1 拒绝未知字段，防止拼写错误被忽略。YAML 与 JSON 采用相同的数据结构；YAML 仅使用能够转换成 JSON 的类型，拒绝重复键和自定义标签。
+除特别注明外，字段均为必填。v2 拒绝未知字段，防止拼写错误被忽略。YAML 与 JSON 采用相同的数据结构；YAML 仅使用能够转换成 JSON 的类型，拒绝重复键和自定义标签。
 
 | 字段 | 类型 | 作用 |
 | --- | --- | --- |
-| `schema_version` | 正整数 | 图格式版本，本文为 `1` |
+| `schema_version` | 正整数 | 图格式版本，本文为 `2` |
 | `name` | 字符串 | Agent 定义名称，不作为 Run 身份 |
+| `triggers` | 对象 | 具名触发源；当前支持 `manual`，每次触发创建一个 Run |
 | `operators` | 对象 | 算子实例名到类型、版本和配置的映射 |
 | `subscriptions` | 数组 | 发布订阅关系 |
 | `lifecycle` | 对象 | 启动与正常业务终态协议 |
 | `limits` | 对象 | 整个 Run 的时间和投递预算 |
 
 `schema_version` 是文件格式版本；算子 `version` 是实现契约版本；事件名中的 `.v1` 是 payload 协议版本。三者分别管理，不要求同时升级。
+
+图格式 v2 用显式 `triggers` 取代旧隐式输入源。v1 图需要迁移，不自动兼容旧 checkpoint；事件 payload 协议仍可保持 `.v1`。
 
 ## 5. 算子实例 operators
 
@@ -200,7 +209,7 @@ operators:
 | `from` | 发布事件的算子实例名或保留来源 |
 | `events` | 非空的精确事件类型列表，不允许重复 |
 
-v1 的 `from` 是单个来源，`events` 不支持通配符、正则或 payload 条件表达式。订阅多个发布者时写多条订阅。相同的发布者、消费者和事件组合不得通过不同订阅 ID 重复声明。
+`from` 是单个来源，`events` 不支持通配符、正则或 payload 条件表达式。订阅多个发布者时写多条订阅。相同的发布者、消费者和事件组合不得通过不同订阅 ID 重复声明。
 
 一次匹配必须同时满足：同一租户、同一 Run、来源身份一致、事件类型一致。来源身份由引擎绑定，算子不能通过修改 payload 冒充另一个发布者。
 
@@ -208,7 +217,7 @@ v1 的 `from` 是单个来源，`events` 不支持通配符、正则或 payload 
 
 | 来源 | 含义 |
 | --- | --- |
-| `$input` | 宿主通过 `agent.run(input)` 创建的启动事件来源 |
+| `$external` | 宿主向已有 Run 发送审批、唤醒等事件的来源 |
 | `$engine` | 当前提供 `engine.terminal.v1` 终态通知（payload 为 object） |
 
 保留来源只能出现在 `from` 中，不能作为 `subscriber` 或自定义节点名。需要消费 `$engine` 事件时，同样要满足注册表中的协议定义，不能凭空填写事件名。
@@ -242,7 +251,7 @@ v1 的 `from` 是单个来源，`events` 不支持通配符、正则或 payload 
 
 ### 启动
 
-调用 `agent.run(input)` 时，引擎创建 Run、固定图与资源绑定，然后以 `$input` 身份发布 `lifecycle.start.event`。输入数据需满足该事件的 Schema。该事件至少有一个合法消费者。
+调用 `agent.run(input)` 时，引擎触发 `lifecycle.start.trigger` 指定的默认入口。也可调用 `agent.trigger("start", payload)` 选择具名入口。引擎创建 Run、固定图与资源绑定，以 trigger 实例名发布其 `event`。输入需满足所有消费者共同的 Schema。每个 trigger 至少有一个合法消费者，且能到达终态节点。详见 [Trigger 节点与手动触发](graph-triggers.md)。
 
 ### 结束
 
@@ -320,15 +329,16 @@ let run = agent.run(input).await?;
 ### 从代码构建
 
 ```rust,ignore
-use agent_core::agent::{AgentGraph, OperatorDefinition, GraphLifecycle, GraphLimits};
+use agent_core::agent::{AgentGraph, OperatorDefinition, TriggerDefinition, GraphLifecycle, GraphLimits};
 use serde_json::json;
 
 let definition = AgentGraph::new("assistant")
+    .trigger("start", TriggerDefinition::manual("agent.start.v1"))
     .operator("context", OperatorDefinition::new("agent.context", 1,
         json!({"system_prompt":"你是一个助手", "max_steps":12})))
     .operator("llm", OperatorDefinition::new("agent.model", 1,
         json!({"model":"primary", "timeout_ms":60000})))
-    .subscribe("start-agent", "$input", "context", ["agent.start.v1"])
+    .subscribe("start-agent", "start", "context", ["agent.start.v1"])
     .subscribe("request-model", "context", "llm", ["model.requested.v1"])
     .subscribe("context-failure", "context", "llm", ["context.failed.v1"])
     .lifecycle(GraphLifecycle::model("llm"))

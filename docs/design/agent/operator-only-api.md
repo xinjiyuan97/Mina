@@ -120,3 +120,7 @@ OperatorFabric 可通过 `changes()` 提供进程内 watch 通知。MemoryFabric
 图驱动、调用期间的终态检测、公开事件投影和续读采用“订阅通知 → 标记代次 → 读取持久状态 → 等待变化”的顺序，避免读取与等待之间丢失唤醒。常规兜底为一秒，图驱动还按 Run 截止时间缩短等待；通知不是持久化事实，恢复仍以日志和 checkpoint 为准。外部 EventRuntime/JobRuntime 的调度属于其宿主，不因内部图通知而自动跨进程推送。
 
 `fabric_notifications` 回归覆盖读后等待竞态、16 个空闲 Run 的存储访问上限、通知触发的及时唤醒、SQLite 成功/失败事务通知以及独立连接的兜底读取。
+
+## Trigger 入口
+
+图格式 v2 将隐式输入源替换成具名 `triggers`。`ConfiguredAgent::trigger`、`GraphEngine::trigger/start_trigger/admit_trigger` 支持选定手动入口；`AgentEngine::trigger_graph` 通过高层持久化宿主启动指定入口。已有 run/start API 触发图的默认入口。定时调度暂未实现，详见 [Trigger 文档](graph-triggers.md)。

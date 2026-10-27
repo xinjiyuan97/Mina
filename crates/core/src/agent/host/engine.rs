@@ -165,6 +165,21 @@ impl AgentEngine {
         let host = self.admit_graph(definition, payload, plan, failure).await?;
         self.drive(run, host).await
     }
+    /// Fire a named manual source through the durable application host.
+    pub async fn trigger_graph(
+        self: &Arc<Self>,
+        definition: AgentDefinition,
+        trigger: &str,
+        payload: Value,
+    ) -> Result<StartedRun, RunRuntimeError> {
+        self.run_graph(
+            definition
+                .with_start_trigger(trigger)
+                .map_err(persistence)?,
+            payload,
+        )
+        .await
+    }
     pub async fn run_graph(
         self: &Arc<Self>,
         definition: AgentDefinition,

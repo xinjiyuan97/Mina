@@ -9,10 +9,31 @@ use std::{collections::BTreeMap, path::Path};
 pub struct AgentDefinition {
     pub schema_version: u32,
     pub name: String,
+    pub triggers: BTreeMap<String, TriggerDefinition>,
     pub operators: BTreeMap<String, OperatorDefinition>,
     pub subscriptions: Vec<OperatorSubscription>,
     pub lifecycle: GraphLifecycle,
     pub limits: GraphLimits,
+}
+/// A source node that starts a new Run; it is not an operator within a Run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TriggerDefinition {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub version: u32,
+    pub event: String,
+    pub config: Value,
+}
+impl TriggerDefinition {
+    pub fn manual(event: impl Into<String>) -> Self {
+        Self {
+            kind: "manual".into(),
+            version: 1,
+            event: event.into(),
+            config: serde_json::json!({}),
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,7 +69,7 @@ pub struct GraphLifecycle {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphStart {
-    pub event: String,
+    pub trigger: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,7 +83,7 @@ impl GraphLifecycle {
     pub fn model(instance: impl Into<String>) -> Self {
         Self {
             start: GraphStart {
-                event: "agent.start.v1".into(),
+                trigger: "start".into(),
             },
             terminal: GraphTerminal {
                 from: instance.into(),
@@ -91,6 +112,15 @@ pub(crate) fn invalid(path: &str, message: impl std::fmt::Display) -> FabricErro
     FabricError::Invalid(format!("{path}: {message}"))
 }
 impl AgentDefinition {
+    /// Select the default trigger before admitting a Run. The selected definition is pinned.
+    pub fn with_start_trigger(mut self, trigger: impl Into<String>) -> Result<Self, FabricError> {
+        let trigger = trigger.into();
+        if !self.triggers.contains_key(&trigger) {
+            return Err(invalid("lifecycle.start.trigger", "unknown trigger"));
+        }
+        self.lifecycle.start.trigger = trigger;
+        Ok(self)
+    }
     pub fn from_json(source: &str) -> Result<Self, FabricError> {
         let value: UniqueValue =
             serde_json::from_str(source).map_err(|e| invalid("document", e))?;
@@ -144,6 +174,7 @@ impl AgentDefinition {
 /// A serializable graph builder, not a second executor.
 pub struct AgentGraph {
     name: String,
+    triggers: BTreeMap<String, TriggerDefinition>,
     operators: BTreeMap<String, OperatorDefinition>,
     subscriptions: Vec<OperatorSubscription>,
     lifecycle: Option<GraphLifecycle>,
@@ -154,12 +185,20 @@ impl AgentGraph {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            triggers: BTreeMap::new(),
             operators: BTreeMap::new(),
             subscriptions: vec![],
             lifecycle: None,
             limits: None,
             duplicate: None,
         }
+    }
+    pub fn trigger(mut self, name: impl Into<String>, trigger: TriggerDefinition) -> Self {
+        let name = name.into();
+        if self.triggers.insert(name.clone(), trigger).is_some() {
+            self.duplicate = Some(name);
+        }
+        self
     }
     pub fn operator(mut self, name: impl Into<String>, operator: OperatorDefinition) -> Self {
         let name = name.into();
@@ -193,11 +232,12 @@ impl AgentGraph {
     }
     pub fn finish(self) -> Result<AgentDefinition, FabricError> {
         if let Some(name) = self.duplicate {
-            return Err(invalid("operators", format!("duplicate instance {name}")));
+            return Err(invalid("nodes", format!("duplicate instance {name}")));
         }
         Ok(AgentDefinition {
-            schema_version: 1,
+            schema_version: 2,
             name: self.name,
+            triggers: self.triggers,
             operators: self.operators,
             subscriptions: self.subscriptions,
             lifecycle: self

@@ -21,7 +21,7 @@ pub mod definition;
 pub mod graph;
 pub use definition::{
     AgentDefinition, AgentGraph, GraphLifecycle, GraphLimits, GraphStart, GraphTerminal,
-    OperatorDefinition, OperatorSubscription,
+    OperatorDefinition, OperatorSubscription, TriggerDefinition,
 };
 pub use graph::{
     AgentBuilder, AgentResources, ConfiguredAgent, GraphAgent, GraphAgentConfig, GraphContext,

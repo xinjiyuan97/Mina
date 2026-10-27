@@ -73,6 +73,10 @@ fn text_resources(calls: Arc<AtomicUsize>) -> AgentResources {
 async fn yaml_json_and_code_build_the_same_agent_and_isolate_runs() {
     let yaml = text_definition();
     let code = AgentGraph::new("text-assistant")
+        .trigger(
+            "start",
+            agent_core::agent::TriggerDefinition::manual("agent.start.v1"),
+        )
         .operator(
             "context",
             OperatorDefinition::new(
@@ -89,7 +93,7 @@ async fn yaml_json_and_code_build_the_same_agent_and_isolate_runs() {
                 json!({"model":"primary","timeout_ms":60000}),
             ),
         )
-        .subscribe("start-agent", "$input", "context", ["agent.start.v1"])
+        .subscribe("start-agent", "start", "context", ["agent.start.v1"])
         .subscribe("request-model", "context", "llm", ["model.requested.v1"])
         .subscribe("context-failure", "context", "llm", ["context.failed.v1"])
         .lifecycle(GraphLifecycle::model("llm"))
@@ -130,7 +134,7 @@ async fn yaml_json_and_code_build_the_same_agent_and_isolate_runs() {
         .events_after("local", first.run_id, 0, 128)
         .await
         .unwrap();
-    assert_eq!(events[0].from, "$input");
+    assert_eq!(events[0].from, "start");
     assert_eq!(events.last().unwrap().kind, "engine.terminal.v1");
     assert_eq!(
         events.last().unwrap().payload["usage"],
@@ -219,11 +223,15 @@ fn echo_descriptor() -> OperatorDescriptor {
 }
 fn echo_definition() -> AgentDefinition {
     AgentGraph::new("custom-only")
+        .trigger(
+            "start",
+            agent_core::agent::TriggerDefinition::manual("echo.start.v1"),
+        )
         .operator("echo", OperatorDefinition::new("test.echo", 1, json!({})))
-        .subscribe("start", "$input", "echo", ["echo.start.v1"])
+        .subscribe("start", "start", "echo", ["echo.start.v1"])
         .lifecycle(agent_core::agent::GraphLifecycle {
             start: agent_core::agent::GraphStart {
-                event: "echo.start.v1".into(),
+                trigger: "start".into(),
             },
             terminal: agent_core::agent::GraphTerminal {
                 from: "echo".into(),
@@ -502,7 +510,7 @@ async fn subscriptions_filter_publisher_and_terminal_observers_drain() {
             .push(agent_core::agent::OperatorSubscription {
                 id: format!("start-{name}"),
                 subscriber: name.into(),
-                from: "$input".into(),
+                from: "start".into(),
                 events: vec!["echo.start.v1".into()],
             });
     }
@@ -852,6 +860,10 @@ async fn generic_gate_runs_a_custom_approval_graph_without_model_or_tool_protoco
         .register(done, |_, _| Ok(Arc::new(ApprovalDone)))
         .unwrap();
     let definition = AgentGraph::new("approvals")
+        .trigger(
+            "start",
+            agent_core::agent::TriggerDefinition::manual("echo.start.v1"),
+        )
         .operator("begin", OperatorDefinition::new("test.batch", 1, json!({})))
         .operator("gate", OperatorDefinition::new("agent.gate", 1, json!({})))
         .operator(
@@ -859,7 +871,7 @@ async fn generic_gate_runs_a_custom_approval_graph_without_model_or_tool_protoco
             OperatorDefinition::new("test.approval", 1, json!({})),
         )
         .operator("echo", OperatorDefinition::new("test.done", 1, json!({})))
-        .subscribe("start", "$input", "begin", ["echo.start.v1"])
+        .subscribe("start", "start", "begin", ["echo.start.v1"])
         .subscribe("open", "begin", "gate", ["gate.open.v1"])
         .subscribe("dispatch", "gate", "review", ["gate.dispatch.v1"])
         .subscribe("result", "review", "gate", ["gate.result.v1"])
@@ -2149,4 +2161,182 @@ async fn public_waiting_is_emitted_only_after_external_subscription_is_ready() {
     );
     host.cancel(run).await.unwrap();
     host.engine.stop_workers().await;
+}
+
+fn multi_trigger_definition() -> AgentDefinition {
+    let mut definition = echo_definition();
+    definition.triggers.insert(
+        "api".into(),
+        agent_core::agent::TriggerDefinition::manual("echo.start.v1"),
+    );
+    let mut edge = definition.subscriptions[0].clone();
+    edge.id = "api-start".into();
+    edge.from = "api".into();
+    definition.subscriptions.push(edge);
+    definition
+}
+
+#[test]
+fn trigger_nodes_validate_names_types_protocols_and_reachability() {
+    let mut registry = OperatorRegistry::default();
+    registry
+        .register(echo_descriptor(), |_, _| Ok(Arc::new(Echo)))
+        .unwrap();
+    let resources = AgentResources::new(Arc::new(MemoryFabric::default()));
+    let valid = multi_trigger_definition();
+    valid.validate(&registry, &resources).unwrap();
+    for case in 0..9 {
+        let mut invalid = valid.clone();
+        match case {
+            0 => invalid.triggers.clear(),
+            1 => invalid.lifecycle.start.trigger = "missing".into(),
+            2 => invalid.triggers.get_mut("api").unwrap().kind = "cron".into(),
+            3 => invalid.triggers.get_mut("api").unwrap().version = 99,
+            4 => invalid.triggers.get_mut("api").unwrap().config = json!({"unknown":true}),
+            5 => invalid.triggers.get_mut("api").unwrap().event = "other.start.v1".into(),
+            6 => {
+                invalid.triggers.insert(
+                    "echo".into(),
+                    agent_core::agent::TriggerDefinition::manual("echo.start.v1"),
+                );
+            }
+            7 => invalid.subscriptions[0].from = "$input".into(),
+            _ => invalid.schema_version = 1,
+        }
+        assert!(
+            invalid.validate(&registry, &resources).is_err(),
+            "case {case}"
+        );
+    }
+    let mut invalid = valid;
+    invalid.subscriptions.retain(|s| s.from != "api");
+    assert!(invalid.validate(&registry, &resources).is_err());
+    assert!(
+        AgentGraph::new("duplicate")
+            .trigger(
+                "same",
+                agent_core::agent::TriggerDefinition::manual("echo.start.v1")
+            )
+            .trigger(
+                "same",
+                agent_core::agent::TriggerDefinition::manual("echo.start.v1")
+            )
+            .lifecycle(echo_definition().lifecycle)
+            .limits(GraphLimits::new(1000, 10))
+            .finish()
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn manual_triggers_create_independent_runs_and_pin_retry_identity() {
+    let mut registry = OperatorRegistry::default();
+    registry
+        .register(echo_descriptor(), |_, _| Ok(Arc::new(Echo)))
+        .unwrap();
+    let fabric = Arc::new(MemoryFabric::default());
+    let agent = AgentBuilder::new(registry, AgentResources::new(fabric))
+        .build(multi_trigger_definition())
+        .unwrap();
+    assert!(agent.trigger("missing", "hello").await.is_err());
+    let invalid = RunId::new();
+    assert!(
+        agent
+            .engine
+            .admit_trigger("local", invalid, "api", json!({}))
+            .await
+            .is_err()
+    );
+    assert!(agent.engine.get_run("local", invalid).await.is_err());
+    let first = agent.trigger("api", "one").await.unwrap();
+    let second = agent.run("two").await.unwrap();
+    assert_ne!(first.run_id, second.run_id);
+    assert_eq!(
+        terminal(&agent, first.run_id).await.output,
+        Some(json!({"input":"one"}))
+    );
+    assert_eq!(terminal(&agent, second.run_id).await.trigger, "start");
+    let events = agent
+        .engine
+        .events_after("local", first.run_id, 0, 100)
+        .await
+        .unwrap();
+    assert_eq!(events[0].from, "api");
+    agent
+        .engine
+        .start_trigger("local", first.run_id, "api", json!("one"))
+        .await
+        .unwrap();
+    assert_eq!(
+        agent
+            .engine
+            .events_after("local", first.run_id, 0, 100)
+            .await
+            .unwrap()
+            .len(),
+        events.len()
+    );
+    assert!(
+        agent
+            .engine
+            .admit_trigger("local", first.run_id, "start", json!("one"))
+            .await
+            .is_err()
+    );
+    assert!(
+        agent
+            .engine
+            .admit_trigger("local", first.run_id, "api", json!("changed"))
+            .await
+            .is_err()
+    );
+    agent.engine.stop_workers().await;
+}
+
+#[tokio::test]
+async fn sqlite_recovery_keeps_the_selected_trigger_without_firing_again() {
+    use agent_extension::store::SqliteEventStore;
+    let mut registry = OperatorRegistry::default();
+    registry
+        .register(echo_descriptor(), |_, _| Ok(Arc::new(Echo)))
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trigger.sqlite");
+    let definition = multi_trigger_definition();
+    let run = RunId::new();
+    {
+        let store = Arc::new(SqliteEventStore::open(&path, "first").await.unwrap());
+        let agent = AgentBuilder::new(registry.clone(), AgentResources::new(store))
+            .build(definition.clone())
+            .unwrap();
+        agent
+            .engine
+            .admit_trigger("local", run, "api", json!("durable"))
+            .await
+            .unwrap();
+        assert_eq!(
+            agent
+                .engine
+                .events_after("local", run, 0, 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    let store = Arc::new(SqliteEventStore::open(&path, "reopened").await.unwrap());
+    let agent = AgentBuilder::new(registry, AgentResources::new(store))
+        .build(definition)
+        .unwrap();
+    agent.engine.recover("local", run).await.unwrap();
+    let saved = terminal(&agent, run).await;
+    assert_eq!(saved.trigger, "api");
+    assert_eq!(saved.output, Some(json!({"input":"durable"})));
+    let events = agent
+        .engine
+        .events_after("local", run, 0, 100)
+        .await
+        .unwrap();
+    assert_eq!(events.iter().filter(|e| e.from == "api").count(), 1);
+    agent.engine.stop_workers().await;
 }

@@ -355,8 +355,8 @@ fn compile(
         ));
     }
     let d = &definition;
-    if d.schema_version != 1 {
-        return Err(invalid("schema_version", "expected 1"));
+    if d.schema_version != 2 {
+        return Err(invalid("schema_version", "expected 2"));
     }
     if d.name.trim().is_empty() || d.name.len() > 128 {
         return Err(invalid("name", "required, at most 128 bytes"));
@@ -397,8 +397,26 @@ fn compile(
         }
         descriptors.insert(name.clone(), desc.clone());
     }
-    if !event_name(&d.lifecycle.start.event) {
-        return Err(invalid("lifecycle.start.event", "versioned event required"));
+    if d.triggers.is_empty() || d.triggers.len() > 32 {
+        return Err(invalid("triggers", "expected 1..32 trigger nodes"));
+    }
+    for (name, trigger) in &d.triggers {
+        let path = format!("triggers.{name}");
+        if !identifier(name) || d.operators.contains_key(name) {
+            return Err(invalid(&path, "invalid or duplicate node name"));
+        }
+        if trigger.kind != "manual" || trigger.version != 1 {
+            return Err(invalid(&path, "unsupported trigger type or version"));
+        }
+        if trigger.config != serde_json::json!({}) || !event_name(&trigger.event) {
+            return Err(invalid(
+                &path,
+                "manual trigger requires empty config and a versioned event",
+            ));
+        }
+    }
+    if !d.triggers.contains_key(&d.lifecycle.start.trigger) {
+        return Err(invalid("lifecycle.start.trigger", "unknown trigger"));
     }
     let terminal = &d.lifecycle.terminal;
     let terminal_desc = descriptors
@@ -417,7 +435,7 @@ fn compile(
     }
     let mut ids = BTreeSet::new();
     let mut edges = BTreeSet::new();
-    let mut input_schema = None;
+    let mut trigger_schemas = BTreeMap::new();
     for (i, sub) in d.subscriptions.iter().enumerate() {
         let path = format!("subscriptions[{i}]");
         if !identifier(&sub.id) || !ids.insert(&sub.id) {
@@ -440,14 +458,16 @@ fn compile(
             if !edges.insert((&sub.from, &sub.subscriber, event)) {
                 return Err(invalid(&path, "duplicate edge"));
             }
-            if sub.from == "$input" {
-                if event != &d.lifecycle.start.event {
-                    return Err(invalid(&path, "$input only publishes the start event"));
+            if let Some(trigger) = d.triggers.get(&sub.from) {
+                if event != &trigger.event {
+                    return Err(invalid(&path, "trigger only publishes its declared event"));
                 }
-                if input_schema.is_some_and(|old| old != schema) {
-                    return Err(invalid(&path, "inconsistent start schema"));
+                if trigger_schemas
+                    .insert(sub.from.clone(), schema)
+                    .is_some_and(|old| old != schema)
+                {
+                    return Err(invalid(&path, "inconsistent trigger payload schema"));
                 }
-                input_schema = Some(schema);
             } else if sub.from == "$external" {
                 // Host ingress is explicit in the graph and uses the subscriber's registered schema.
             } else if sub.from == "$engine" {
@@ -467,14 +487,13 @@ fn compile(
             }
         }
     }
-    if input_schema.is_none() {
-        return Err(invalid("lifecycle.start", "no subscriber"));
+    for name in d.triggers.keys() {
+        if !trigger_schemas.contains_key(name) {
+            return Err(invalid(&format!("triggers.{name}"), "no subscriber"));
+        }
     }
-    let mut reachable = BTreeSet::from([
-        "$input".to_string(),
-        "$engine".to_string(),
-        "$external".to_string(),
-    ]);
+    let mut reachable: BTreeSet<String> = d.triggers.keys().cloned().collect();
+    reachable.extend(["$engine".to_string(), "$external".to_string()]);
     loop {
         let count = reachable.len();
         for sub in &d.subscriptions {
@@ -491,23 +510,25 @@ fn compile(
             return Err(invalid(&format!("operators.{name}"), "unreachable"));
         }
     }
-    let mut start_reachable = BTreeSet::from(["$input".to_string()]);
-    loop {
-        let count = start_reachable.len();
-        for sub in &d.subscriptions {
-            if start_reachable.contains(&sub.from) {
-                start_reachable.insert(sub.subscriber.clone());
+    for trigger in d.triggers.keys() {
+        let mut start_reachable = BTreeSet::from([trigger.clone()]);
+        loop {
+            let count = start_reachable.len();
+            for sub in &d.subscriptions {
+                if start_reachable.contains(&sub.from) {
+                    start_reachable.insert(sub.subscriber.clone());
+                }
+            }
+            if start_reachable.len() == count {
+                break;
             }
         }
-        if start_reachable.len() == count {
-            break;
+        if !start_reachable.contains(&terminal.from) {
+            return Err(invalid(
+                "lifecycle.terminal.from",
+                format!("must be reachable from trigger {trigger}"),
+            ));
         }
-    }
-    if !start_reachable.contains(&terminal.from) {
-        return Err(invalid(
-            "lifecycle.terminal.from",
-            "must be reachable from the start event",
-        ));
     }
     // No mandatory built-in roles: custom protocols use the identical executor.
     let mut operators = BTreeMap::new();
