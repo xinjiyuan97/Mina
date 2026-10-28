@@ -136,6 +136,37 @@ pub struct DeadLetter {
 
 #[derive(Debug, Clone)]
 pub enum FabricCommand {
+    BeginMaintenance {
+        token: String,
+        now_ms: i64,
+    },
+    EndMaintenance {
+        token: String,
+    },
+    ExportAgentHistory {
+        tenant: String,
+        agent_id: String,
+    },
+    InspectRun {
+        tenant: String,
+        run_id: super::RunId,
+    },
+    ExportRun {
+        tenant: String,
+        run_id: super::RunId,
+        maintenance_token: String,
+    },
+    /// Low-level trusted import; validate resource compatibility using RunManager first.
+    ImportRun {
+        bundle: super::run_archive::RunBundle,
+        maintenance_token: String,
+    },
+    /// Atomic standard host records plus one Fabric transaction. Trusted host API.
+    HostTransact {
+        records: Vec<super::host::HostRecord>,
+        completion: Option<super::host::RunCompletion>,
+        transaction: Box<FabricCommand>,
+    },
     /// Maintenance operation: retire terminal, quiescent run resources after retention.
     RetireRun {
         tenant: String,
@@ -272,6 +303,10 @@ pub enum FabricCommand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FabricReply {
+    Maintenance,
+    RunInspection(super::run_archive::RunInspectionSnapshot),
+    RunBundle(super::run_archive::RunBundle),
+    AgentHistory(super::agent_history::AgentHistory),
     Collected(CollectionReport),
     ArtifactRoots(Vec<crate::contracts::BlobId>),
     /// None means no log exists (for compatibility with inline legacy history).
@@ -335,6 +370,15 @@ pub trait OperatorFabric: Send + Sync {
 impl FabricCommand {
     /// Whether a successful command commits checkpoint or log state.
     pub fn writes_checkpoint(&self) -> bool {
+        if matches!(
+            self,
+            Self::HostTransact { .. }
+                | Self::BeginMaintenance { .. }
+                | Self::EndMaintenance { .. }
+                | Self::ImportRun { .. }
+        ) {
+            return true;
+        }
         matches!(
             self,
             Self::Transact { .. }

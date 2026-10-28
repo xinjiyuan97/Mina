@@ -273,3 +273,9 @@ pub mod events;
 /// Durable execution, external event and context admission protocols.
 pub mod fabric;
 pub mod preparation;
+
+pub mod host;
+
+pub mod run_archive;
+
+pub mod agent_history;

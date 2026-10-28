@@ -24,11 +24,17 @@ pub use definition::{
     OperatorDefinition, OperatorSubscription, TriggerDefinition,
 };
 pub use graph::{
-    AgentBuilder, AgentResources, ConfiguredAgent, GraphAgent, GraphAgentConfig, GraphContext,
-    GraphEngine, GraphEvent, GraphHost, GraphIngress, GraphOperator, GraphOutput, GraphRun,
-    GraphStatus, GraphStepUsage, GraphWaitBridge, OperatorDescriptor, OperatorRegistry,
+    AgentBuilder, AgentResources, CompactorConfig, ConfiguredAgent, GraphAgent, GraphAgentConfig,
+    GraphContext, GraphEngine, GraphEvent, GraphHost, GraphIngress, GraphOperator, GraphOutput,
+    GraphRun, GraphStatus, GraphStepUsage, GraphWaitBridge, OperatorDescriptor, OperatorRegistry,
 };
 
 pub mod artifacts;
 
 pub use host::{AgentLoop, SingleTurnAgent};
+
+pub mod bindings;
+pub use bindings::{BindingContract, BindingSnapshot, HostBindings, HostPolicy};
+
+pub mod run_manager;
+pub use run_manager::RunManager;

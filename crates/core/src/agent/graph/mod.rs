@@ -1,7 +1,7 @@
 //! Static, protocol-checked single-agent graphs. Both construction paths use this engine.
 mod builtins;
 mod config;
-pub use config::GraphAgentConfig;
+pub use config::{CompactorConfig, GraphAgentConfig};
 mod host;
 mod runtime;
 mod stream;
@@ -137,8 +137,20 @@ pub struct AgentResources {
     models: BTreeMap<String, ModelResource>,
     toolsets: BTreeMap<String, ToolResource>,
     waits: BTreeMap<String, (String, Arc<GraphWaitBridge>)>,
+    host_policy: Option<super::bindings::HostPolicy>,
+    agent_id: Option<String>,
 }
 impl AgentResources {
+    /// Stable host identity, independent of graph names and revisions.
+    pub fn with_agent_id(mut self, agent_id: impl Into<String>) -> Self {
+        self.agent_id = Some(agent_id.into());
+        self
+    }
+    /// Enforced on both construction and recovery before resource factories run.
+    pub fn with_host_policy(mut self, policy: super::bindings::HostPolicy) -> Self {
+        self.host_policy = Some(policy);
+        self
+    }
     pub fn has_wait_service(&self, name: &str) -> bool {
         self.waits.contains_key(name)
     }
@@ -148,6 +160,8 @@ impl AgentResources {
             models: BTreeMap::new(),
             toolsets: BTreeMap::new(),
             waits: BTreeMap::new(),
+            host_policy: None,
+            agent_id: None,
         }
     }
     pub fn model(
@@ -302,7 +316,7 @@ fn compile_schema(schema: &Value, path: &str) -> Result<jsonschema::JSONSchema, 
     }
     jsonschema::JSONSchema::compile(schema).map_err(|e| invalid(path, e))
 }
-fn validate_value(schema: &Value, value: &Value, path: &str) -> Result<(), FabricError> {
+pub(crate) fn validate_value(schema: &Value, value: &Value, path: &str) -> Result<(), FabricError> {
     let compiled = compile_schema(schema, path)?;
     if !compiled.is_valid(value) {
         return Err(invalid(path, "value does not satisfy schema"));
@@ -343,6 +357,16 @@ fn compile(
     registry: &OperatorRegistry,
     resources: &AgentResources,
 ) -> Result<Compiled, FabricError> {
+    if let Some(policy) = &resources.host_policy {
+        let mut constrained = definition.clone();
+        constrained.apply_host_policy(policy)?;
+        if constrained != definition {
+            return Err(invalid(
+                "host_policy",
+                "graph requires reauthorization under current host policy",
+            ));
+        }
+    }
     let caps = resources.fabric.capabilities();
     if !(caps.atomic_batch
         && caps.continuous_offset
@@ -355,9 +379,7 @@ fn compile(
         ));
     }
     let d = &definition;
-    if d.schema_version != 2 {
-        return Err(invalid("schema_version", "expected 2"));
-    }
+    d.validate_binding_snapshot()?;
     if d.name.trim().is_empty() || d.name.len() > 128 {
         return Err(invalid("name", "required, at most 128 bytes"));
     }
@@ -396,6 +418,37 @@ fn compile(
             bindings.insert(format!("{name}:{field}:{resource}"), revision.clone());
         }
         descriptors.insert(name.clone(), desc.clone());
+    }
+    // The preflight budget must cover the actual downstream generation limit.
+    for (name, op) in &d.operators {
+        if op.kind != "agent.compactor" {
+            continue;
+        }
+        let reserve = op.config["reserved_output_tokens"].as_u64().unwrap_or(0);
+        for response in &d.subscriptions {
+            if response.from != *name || !response.events.iter().any(|e| e == "context.prepared.v1")
+            {
+                continue;
+            }
+            for request in &d.subscriptions {
+                if request.from != response.subscriber
+                    || !request.events.iter().any(|e| e == "model.requested.v1")
+                {
+                    continue;
+                }
+                if let Some(model) = d.operators.get(&request.subscriber)
+                    && model.kind == "agent.model"
+                    && model.config["max_output_tokens"]
+                        .as_u64()
+                        .is_none_or(|limit| limit > reserve)
+                {
+                    return Err(invalid(
+                        "compactor.reserved_output_tokens",
+                        "explicit downstream model output limit must fit reserve",
+                    ));
+                }
+            }
+        }
     }
     if d.triggers.is_empty() || d.triggers.len() > 32 {
         return Err(invalid("triggers", "expected 1..32 trigger nodes"));
@@ -556,11 +609,28 @@ impl AgentBuilder {
             resources,
         }
     }
+    pub fn build_with_bindings(
+        mut self,
+        definition: AgentDefinition,
+        bindings: super::bindings::HostBindings,
+        policy: super::bindings::HostPolicy,
+    ) -> Result<ConfiguredAgent, FabricError> {
+        self.resources.host_policy = Some(policy.clone());
+        self.build(definition.bind(bindings, policy)?)
+    }
     pub fn build(self, definition: AgentDefinition) -> Result<ConfiguredAgent, FabricError> {
         let compiled = compile(definition, &self.registry, &self.resources)?;
         Ok(ConfiguredAgent {
             engine: Arc::new(GraphEngine::new(compiled, self.registry, self.resources)),
         })
+    }
+    pub fn from_file_with_bindings(
+        self,
+        path: impl AsRef<std::path::Path>,
+        bindings: super::bindings::HostBindings,
+        policy: super::bindings::HostPolicy,
+    ) -> Result<ConfiguredAgent, FabricError> {
+        self.build_with_bindings(AgentDefinition::from_file(path)?, bindings, policy)
     }
     pub fn from_file(
         self,

@@ -65,6 +65,10 @@ required-features = ["agent-chat"]
 name = "operator_retention"
 required-features = ["sqlite"]
 
+[[example]]
+name = "host_completion_projection"
+required-features = ["sqlite"]
+
 [dependencies]
 agent-core.workspace = true
 async-stream = { workspace = true, optional = true }

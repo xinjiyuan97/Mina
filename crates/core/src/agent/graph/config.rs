@@ -16,6 +16,8 @@ pub struct GraphAgentConfig {
     pub allow_run_adf: bool,
     pub parallel_tools: bool,
     pub allow_suspend: bool,
+    #[serde(default)]
+    pub compaction: Option<CompactorConfig>,
 }
 impl GraphAgentConfig {
     pub fn new(model: impl Into<String>, system_prompt: impl Into<String>) -> Self {
@@ -31,6 +33,7 @@ impl GraphAgentConfig {
             allow_run_adf: false,
             parallel_tools: false,
             allow_suspend: false,
+            compaction: None,
         }
     }
     /// Resource names: primary (model), workspace (tools), durable (optional waits).
@@ -67,7 +70,11 @@ impl GraphAgentConfig {
                 .subscribe("resumed", "wait", "gate", ["gate.result.v1"])
                 .subscribe("cleanup", "$engine", "wait", ["engine.terminal.v1"]);
         }
-        graph.finish()
+        let mut definition = graph.finish()?;
+        if let Some(config) = &self.compaction {
+            definition.enable_compaction(config.clone())?;
+        }
+        Ok(definition)
     }
 }
 
@@ -112,6 +119,10 @@ impl AgentDefinition {
                     );
                 }
             }
+        }
+        if let Some(mut snapshot) = self.binding_snapshot.take() {
+            snapshot.resolved_digest = crate::agent::bindings::digest(self)?;
+            self.binding_snapshot = Some(snapshot);
         }
         Ok(())
     }
@@ -165,6 +176,119 @@ impl AgentDefinition {
         if !found {
             return Err(invalid("trigger", "no subscriber"));
         }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompactorConfig {
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    pub context_window_tokens: u64,
+    pub reserved_output_tokens: u64,
+    pub summary_context_window_tokens: u64,
+    pub safety_margin_tokens: u64,
+    pub max_output_tokens: u32,
+    pub trigger_percent: u64,
+    pub target_percent: u64,
+    pub keep_recent_blocks: usize,
+    pub timeout_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment_tokens: Option<u64>,
+    pub fallback: String,
+}
+impl Default for CompactorConfig {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            model_name: None,
+            context_window_tokens: 0,
+            reserved_output_tokens: 0,
+            summary_context_window_tokens: 0,
+            safety_margin_tokens: 1024,
+            max_output_tokens: 2048,
+            trigger_percent: 80,
+            target_percent: 60,
+            keep_recent_blocks: 2,
+            timeout_ms: 30_000,
+            attachment_tokens: None,
+            fallback: "fail".into(),
+        }
+    }
+}
+
+impl CompactorConfig {
+    /// Model context capacities must come from the host/provider configuration.
+    pub fn new(
+        model: impl Into<String>,
+        context_window_tokens: u64,
+        reserved_output_tokens: u64,
+        summary_context_window_tokens: u64,
+    ) -> Self {
+        Self {
+            model: model.into(),
+            context_window_tokens,
+            reserved_output_tokens,
+            summary_context_window_tokens,
+            ..Self::default()
+        }
+    }
+}
+impl AgentDefinition {
+    /// Enable pre-request compaction for the convenience graph's context/llm nodes.
+    pub fn enable_compaction(&mut self, config: CompactorConfig) -> Result<(), FabricError> {
+        if self.binding_snapshot.is_some() || self.operators.contains_key("compactor") {
+            return Err(invalid("compaction", "configure before binding, once"));
+        }
+        let context = self
+            .operators
+            .get("context")
+            .ok_or_else(|| invalid("compaction", "context node required"))?;
+        let model = self
+            .operators
+            .get("llm")
+            .ok_or_else(|| invalid("compaction", "llm node required"))?;
+        if context.kind != "agent.context" || model.kind != "agent.model" {
+            return Err(invalid("compaction", "expected built-in context and model"));
+        }
+        let reserve = u32::try_from(config.reserved_output_tokens)
+            .map_err(|e| invalid("reserved_output_tokens", e))?;
+        if reserve == 0
+            || model.config["max_output_tokens"]
+                .as_u64()
+                .is_some_and(|n| n > u64::from(reserve))
+        {
+            return Err(invalid(
+                "reserved_output_tokens",
+                "must cover model output limit",
+            ));
+        }
+        let value = serde_json::to_value(config).map_err(|e| invalid("compaction", e))?;
+        self.operators.get_mut("context").expect("checked").version = 3;
+        let model = self.operators.get_mut("llm").expect("checked");
+        if model.config.get("max_output_tokens").is_none() {
+            model.config["max_output_tokens"] = json!(reserve);
+        }
+        self.operators.insert(
+            "compactor".into(),
+            OperatorDefinition::new("agent.compactor", 1, value),
+        );
+        self.subscriptions.extend([
+            OperatorSubscription {
+                id: "prepare-context".into(),
+                from: "context".into(),
+                subscriber: "compactor".into(),
+                events: vec!["context.prepare.requested.v1".into()],
+            },
+            OperatorSubscription {
+                id: "prepared-context".into(),
+                from: "compactor".into(),
+                subscriber: "context".into(),
+                events: vec!["context.prepared.v1".into()],
+            },
+        ]);
         Ok(())
     }
 }

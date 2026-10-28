@@ -1392,7 +1392,7 @@ fn active_subscriptions(connection: &Connection) -> Result<Vec<Subscription>, Ev
     .collect()
 }
 
-fn insert_subscription(
+pub(super) fn insert_subscription(
     connection: &Connection,
     subscription: &Subscription,
     definition_json: &str,
@@ -1914,7 +1914,7 @@ fn load_delivery(connection: &Connection, id: &DeliveryId) -> Result<Delivery, E
     )
 }
 
-fn load_delivery_strings(
+pub(super) fn load_delivery_strings(
     connection: &Connection,
     subscription_id: &str,
     event_id: &str,
@@ -2054,7 +2054,7 @@ fn connect(path: &Path) -> Result<Connection, EventError> {
     Ok(connection)
 }
 
-fn migrate(connection: &Connection) -> Result<(), EventError> {
+pub(super) fn migrate(connection: &Connection) -> Result<(), EventError> {
     connection
         .execute_batch(
             "BEGIN IMMEDIATE;
@@ -2202,9 +2202,21 @@ fn migrate(connection: &Connection) -> Result<(), EventError> {
          CREATE INDEX IF NOT EXISTS workflow_jobs_notification_idx
             ON workflow_jobs(notification_status, notification_next_attempt_at_ms,
                 notification_lease_until_ms);
-         COMMIT;",
+         ",
         )
-        .map_err(|error| sql_error("create event runtime schema", error))
+        .map_err(|error| {
+            let _ = connection.execute_batch("ROLLBACK");
+            sql_error("create event runtime schema", error)
+        })?;
+    let result = super::wait_archive::install_fence(connection).and_then(|_| {
+        connection
+            .execute_batch("COMMIT")
+            .map_err(|e| sql_error("commit event schema", e))
+    });
+    if result.is_err() {
+        let _ = connection.execute_batch("ROLLBACK");
+    }
+    result
 }
 
 fn lock_connection(

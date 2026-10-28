@@ -29,3 +29,11 @@ pub use run::*;
 pub use skill::*;
 #[cfg(feature = "workspace-skill")]
 pub use workspace_skill::*;
+
+#[cfg(feature = "sqlite")]
+mod sqlite_options;
+#[cfg(feature = "sqlite")]
+pub use sqlite_options::*;
+
+#[cfg(feature = "sqlite")]
+mod wait_archive;

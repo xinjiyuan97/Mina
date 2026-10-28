@@ -7,6 +7,7 @@ use crate::{
     operator::{DeliveryClass, EngineVersion, PayloadContract},
 };
 use serde::{Deserialize, Serialize};
+pub mod archive;
 mod retention;
 
 #[derive(Default)]
@@ -433,7 +434,131 @@ impl FabricState {
         command: FabricCommand,
         consumer: Option<&str>,
     ) -> Result<FabricReply, FabricError> {
+        if self.checkpoints.contains_key(archive::MAINTENANCE_KEY)
+            && !archive::maintenance_allowed(&command)
+        {
+            return Err(FabricError::Fenced);
+        }
         match command {
+            FabricCommand::BeginMaintenance { token, now_ms } => {
+                self.begin_maintenance(token, now_ms)
+            }
+            FabricCommand::EndMaintenance { token } => self.end_maintenance(&token),
+            FabricCommand::ExportAgentHistory { tenant, agent_id } => {
+                self.export_agent_history(&tenant, &agent_id)
+            }
+            FabricCommand::InspectRun { tenant, run_id } => self.inspect_run(&tenant, run_id),
+            FabricCommand::ExportRun {
+                tenant,
+                run_id,
+                maintenance_token,
+            } => self.export_run(&tenant, run_id, &maintenance_token),
+            FabricCommand::ImportRun {
+                bundle,
+                maintenance_token,
+            } => self.import_run(bundle, &maintenance_token),
+            FabricCommand::HostTransact {
+                records,
+                completion,
+                transaction,
+            } => {
+                if !matches!(
+                    *transaction,
+                    FabricCommand::Transact { .. }
+                        | FabricCommand::TransactMany { .. }
+                        | FabricCommand::TransactLog { .. }
+                        | FabricCommand::Commit { .. }
+                ) {
+                    return Err(invalid("host transaction must contain a single commit"));
+                }
+                if records.len() > MAX_BATCH_ITEMS {
+                    return Err(invalid("host record count"));
+                }
+                let mut writes = std::collections::BTreeMap::new();
+                for record in records {
+                    record.validate()?;
+                    let key = crate::contracts::host::host_record_key(
+                        &record.tenant,
+                        &record.namespace,
+                        &record.operation_id,
+                    );
+                    let value = serde_json::to_value(record).map_err(storage)?;
+                    if writes
+                        .insert(key, value.clone())
+                        .is_some_and(|old| old != value)
+                    {
+                        return Err(FabricError::Conflict);
+                    }
+                }
+                let mut completion_append = None;
+                if let Some(record) = completion {
+                    if record.schema_version != 1
+                        || record.completion_id
+                            != format!(
+                                "{}",
+                                crate::contracts::events::EventId::stable(
+                                    "run-completion",
+                                    &serde_json::json!([record.tenant, record.run_id]).to_string()
+                                )
+                            )
+                    {
+                        return Err(invalid("completion identity/version"));
+                    }
+                    let key = crate::contracts::host::host_record_key(
+                        &record.tenant,
+                        "$completion",
+                        &record.run_id.to_string(),
+                    );
+                    let value = serde_json::to_value(&record).map_err(storage)?;
+                    if let Some(old) = self.checkpoints.get(&key) {
+                        if old.value != value {
+                            return Err(FabricError::Conflict);
+                        }
+                    } else {
+                        completion_append = Some((
+                            crate::contracts::host::completion_log(&record.tenant),
+                            value.clone(),
+                        ));
+                        writes.insert(key, value);
+                    }
+                }
+                for (key, value) in &writes {
+                    if self
+                        .checkpoints
+                        .get(key)
+                        .is_some_and(|old| old.value != *value)
+                    {
+                        return Err(FabricError::Conflict);
+                    }
+                }
+                let reply = self.apply_scoped(*transaction, consumer)?;
+                for (key, value) in writes {
+                    if !self.checkpoints.contains_key(&key) {
+                        self.apply_scoped(
+                            FabricCommand::Transact {
+                                checkpoint: CheckpointWrite {
+                                    key,
+                                    expected: None,
+                                    value,
+                                },
+                                outbox: vec![],
+                                delivery: None,
+                            },
+                            consumer,
+                        )?;
+                    }
+                }
+                if let Some((log, value)) = completion_append {
+                    if let Some(undo) = &mut self.undo {
+                        undo.logs
+                            .entry(log.clone())
+                            .or_insert_with(|| self.logs.get(&log).map(Vec::len));
+                    }
+                    self.schema_version = self.schema_version.max(2);
+                    self.logs.entry(log).or_default().push(Arc::new(value));
+                }
+                Ok(reply)
+            }
             FabricCommand::RetireRun {
                 tenant,
                 run_id,

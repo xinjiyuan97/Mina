@@ -1,0 +1,64 @@
+schema_version: 3
+name: host-bound-assistant
+bindings:
+  id: mina.assistant
+  version: 1
+  schema:
+    type: object
+    additionalProperties: false
+    required: [system_prompt, context, model_name, max_output_tokens]
+    properties:
+      system_prompt: {type: string}
+      context:
+        type: object
+        additionalProperties: false
+        properties:
+          prior_messages: {type: array}
+      model_name: {type: string, minLength: 1}
+      max_output_tokens: {type: integer, minimum: 1}
+triggers:
+  start:
+    type: manual
+    version: 1
+    event: agent.start.v1
+    config: {}
+operators:
+  context:
+    type: agent.context
+    version: 2
+    config:
+      system_prompt: {$binding: system_prompt}
+      context: {$binding: context}
+      max_steps: 8
+  llm:
+    type: agent.model
+    version: 1
+    config:
+      model: primary
+      model_name: {$binding: model_name}
+      max_output_tokens: {$binding: max_output_tokens}
+      timeout_ms: 60000
+subscriptions:
+  - id: start-agent
+    subscriber: context
+    from: start
+    events: [agent.start.v1]
+  - id: request-model
+    subscriber: llm
+    from: context
+    events: [model.requested.v1]
+  - id: context-failure
+    subscriber: llm
+    from: context
+    events: [context.failed.v1]
+lifecycle:
+  start:
+    trigger: start
+  terminal:
+    from: llm
+    completed: stop.completed.v1
+    failed: stop.failed.v1
+    cancelled: stop.cancelled.v1
+limits:
+  timeout_ms: 900000
+  max_deliveries: 10000

@@ -549,3 +549,7 @@ host.project_into(run_id, runs.as_ref()).await?;
 Fabric 的 `RetireRun` 识别静态图 checkpoint、内部事件日志、公开日志和等待绑定。运行必须已终止、超过保留期、没有待投递事件或有效租约；其他记录引用运行时不能删除。外部等待清理完成后才能回收相关记录，退休墓碑阻止同一 Run 再次执行。
 
 `run_waiting` 仅由 Wait 完成外部订阅与副作用登记后发出的 `wait.registered.v1` 投影；`run_resumed` 来自验证并处理唤醒后的 `wait.completed.v1`。因此客户端收到等待通知后立即发送结果不会落在订阅注册之前。
+
+## 宿主绑定与恢复包
+
+本文主要示例仍为兼容的 v2。新 v3 绑定语法、`agent.context@2` 和公开 RunManager 见[宿主集成 API](host-integration-api.md)及[完整绑定示例](../../../config/agents/host-bound.yaml)。恢复导出使用维护屏障并验证依赖，单独的 checkpoint JSON 仍只是诊断材料。

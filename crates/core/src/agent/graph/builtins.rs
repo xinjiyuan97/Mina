@@ -2,6 +2,7 @@ use super::*;
 use crate::contracts::*;
 use futures_util::StreamExt;
 use serde_json::json;
+mod compactor;
 mod flow;
 mod policy;
 
@@ -20,6 +21,12 @@ fn protocol(event: &str) -> Value {
         }
         "approval.expire.v1" => {
             json!({"type":"object","additionalProperties":false,"required":["approval_id"],"properties":{"approval_id":{"type":"string","format":"uuid"}}})
+        }
+        "context.prepare.requested.v1" => {
+            json!({"type":"object","required":["prepare_id","source_digest","round","messages","tools","current_user_index"],"properties":{"prepare_id":{"type":"string","minLength":1},"source_digest":{"type":"string","minLength":1},"round":{"type":"integer","minimum":1},"messages":{"type":"array"},"tools":{"type":"array"},"current_user_index":{"type":"integer","minimum":0}}})
+        }
+        "context.prepared.v1" => {
+            json!({"type":"object","required":["prepare_id","source_digest","round"],"properties":{"prepare_id":{"type":"string","minLength":1},"source_digest":{"type":"string","minLength":1},"round":{"type":"integer","minimum":1},"messages":{"type":"array"},"current_user_index":{"type":"integer","minimum":0},"code":{"type":"string","minLength":1}},"oneOf":[{"required":["messages","current_user_index"],"not":{"required":["code"]}},{"required":["code"],"not":{"required":["messages"]}}]})
         }
         "model.requested.v1" => {
             json!({"type":"object","required":["round","messages","tools"],"properties":{"round":{"type":"integer","minimum":1},"messages":{"type":"array"},"tools":{"type":"array"}}})
@@ -75,6 +82,7 @@ pub(super) fn descriptor(
 pub(super) fn registry() -> OperatorRegistry {
     let mut registry = OperatorRegistry::default();
     flow::register(&mut registry);
+    compactor::register(&mut registry);
     policy::register(&mut registry);
     super::waits::register(&mut registry);
     let mut model = descriptor(

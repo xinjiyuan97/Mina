@@ -10,6 +10,8 @@ Mina 是一个 Rust Agent 框架，使用静态事件订阅图组织单 Agent �
 | --- | --- |
 | 配置入口与手动触发 | [Trigger 节点与手动触发](docs/design/agent/graph-triggers.md) |
 | 编写 YAML/JSON 图，或用 Rust 构建图 | [静态 Agent 图编写指南](docs/design/agent/static-agent-graph.md) |
+| 宿主绑定、Run 恢复包与事务集成 | [宿主集成 API](docs/design/agent/host-integration-api.md) · [目标设计](docs/design/agent/host-integration-contracts.md) |
+| checkpoint 崩溃恢复与已结束 Run 历史导出 | [恢复与历史](docs/design/agent/recovery-and-history.md) |
 | 实现并注册自定义节点 | [自定义 Graph 节点](docs/design/agent/custom-graph-nodes.md) |
 | 查节点能力、配置字段、输入输出事件 | [Graph 节点参考](docs/design/agent/graph-nodes.md) |
 | 选择底层总线或高层 Agent API | [API 与分层](docs/design/agent/operator-only-api.md) |
