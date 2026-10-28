@@ -55,6 +55,8 @@ fn accumulate_usage(previous: Option<TokenUsage>, next: Option<TokenUsage>) -> O
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphRun {
     pub tenant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     pub run_id: RunId,
     pub definition: AgentDefinition,
     pub input: Value,
@@ -81,6 +83,23 @@ pub struct GraphRun {
     inflight: BTreeMap<String, Invocation>,
 }
 impl GraphRun {
+    pub fn validate_resources(
+        &self,
+        registry: &OperatorRegistry,
+        resources: &AgentResources,
+    ) -> Result<(), FabricError> {
+        if resources.agent_id.is_some() && self.agent_id != resources.agent_id {
+            return Err(invalid("recovery", "agent identity changed"));
+        }
+        let compiled = compile(self.definition.clone(), registry, resources)?;
+        compiled
+            .definition
+            .validate_trigger(registry, &self.trigger, &self.input)?;
+        if compiled.bindings != self.bindings || compiled.descriptors != self.descriptors {
+            return Err(invalid("recovery", "resource or operator contract changed"));
+        }
+        Ok(())
+    }
     pub fn is_terminal(&self) -> bool {
         self.status != GraphStatus::Running
     }
@@ -260,24 +279,71 @@ async fn commit(
     {
         return Err(FabricError::Capacity);
     }
+    let completion = events
+        .iter()
+        .find(|e| e.envelope.event_type == "engine.terminal.v1")
+        .map(|event| {
+            Ok::<_, FabricError>(crate::contracts::host::RunCompletion {
+                schema_version: 1,
+                tenant: run.tenant.clone(),
+                run_id: run.run_id,
+                completion_id: EventId::stable(
+                    "run-completion",
+                    &json!([run.tenant, run.run_id]).to_string(),
+                )
+                .to_string(),
+                status: serde_json::to_value(run.status)
+                    .map_err(|e| invalid("completion", e))?
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .into(),
+                output: run.output.clone(),
+                error: run.error.clone(),
+                usage: run.usage.as_ref().map(|u| json!(u)),
+                completed_at_ms: event.envelope.occurred_at_ms,
+                definition_digest: crate::agent::bindings::digest(&run.definition)?,
+            })
+        })
+        .transpose()?;
     let expected = run.event_count;
     run.event_count += events.len() as u64;
     let items = events
         .iter()
         .map(|event| serde_json::to_value(published(event)).expect("event serialization"))
         .collect();
+    let transaction = FabricCommand::TransactLog {
+        log: log_key(&run.tenant, run.run_id),
+        expected,
+        items,
+        checkpoints: vec![CheckpointWrite {
+            key: root(&run.tenant, run.run_id),
+            expected: version,
+            value: serde_json::to_value(&run).map_err(|e| invalid("run", e))?,
+        }],
+        outbox,
+        delivery: delivery.map(|lease| (lease, now())),
+    };
+    let records = run
+        .agent_id
+        .as_ref()
+        .filter(|_| version.is_none())
+        .map(|id| {
+            vec![crate::contracts::agent_history::membership(
+                &run.tenant,
+                id,
+                run.run_id,
+            )]
+        })
+        .unwrap_or_default();
     fabric
-        .execute(FabricCommand::TransactLog {
-            log: log_key(&run.tenant, run.run_id),
-            expected,
-            items,
-            checkpoints: vec![CheckpointWrite {
-                key: root(&run.tenant, run.run_id),
-                expected: version,
-                value: serde_json::to_value(&run).map_err(|e| invalid("run", e))?,
-            }],
-            outbox,
-            delivery: delivery.map(|lease| (lease, now())),
+        .execute(if completion.is_some() || !records.is_empty() {
+            FabricCommand::HostTransact {
+                records,
+                completion,
+                transaction: Box::new(transaction),
+            }
+        } else {
+            transaction
         })
         .await
         .map(|_| ())
@@ -879,6 +945,14 @@ impl GraphEngine {
         if tenant.trim().is_empty() || tenant.len() > 128 {
             return Err(invalid("tenant", "invalid tenant"));
         }
+        if self
+            .resources
+            .agent_id
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty() || id.len() > 128)
+        {
+            return Err(invalid("agent_id", "invalid host identity"));
+        }
         let compiled = compile(self.definition.clone(), &self.registry, &self.resources)?;
         compiled
             .definition
@@ -886,6 +960,7 @@ impl GraphEngine {
         let source = &compiled.definition.triggers[trigger];
         let run = GraphRun {
             tenant: tenant.into(),
+            agent_id: self.resources.agent_id.clone(),
             run_id,
             definition: compiled.definition.clone(),
             input: input.clone(),
@@ -931,7 +1006,8 @@ impl GraphEngine {
         {
             Err(FabricError::Fenced) => {
                 let saved = self.get_run(tenant, run_id).await?;
-                if saved.trigger != run.trigger
+                if saved.agent_id != run.agent_id
+                    || saved.trigger != run.trigger
                     || saved.input != run.input
                     || saved.definition != run.definition
                     || saved.bindings != run.bindings
@@ -948,12 +1024,24 @@ impl GraphEngine {
     pub async fn get_run(&self, tenant: &str, run: RunId) -> Result<GraphRun, FabricError> {
         Ok(read(self.resources.fabric.as_ref(), tenant, run).await?.1)
     }
+    /// Resume the last atomically committed state, including pending triggers and waits.
+    /// Does not replay historical output or rewind uncertain external effects.
+    pub async fn recover_run(
+        self: &Arc<Self>,
+        tenant: &str,
+        run: RunId,
+    ) -> Result<GraphRun, FabricError> {
+        self.recover(tenant, run).await
+    }
     pub async fn recover(
         self: &Arc<Self>,
         tenant: &str,
         run: RunId,
     ) -> Result<GraphRun, FabricError> {
         let saved = self.get_run(tenant, run).await?;
+        if self.resources.agent_id.is_some() && saved.agent_id != self.resources.agent_id {
+            return Err(invalid("recovery", "agent identity changed"));
+        }
         let compiled = compile(saved.definition.clone(), &self.registry, &self.resources)?;
         compiled
             .definition

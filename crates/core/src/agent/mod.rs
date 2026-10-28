@@ -32,3 +32,9 @@ pub use graph::{
 pub mod artifacts;
 
 pub use host::{AgentLoop, SingleTurnAgent};
+
+pub mod bindings;
+pub use bindings::{BindingContract, BindingSnapshot, HostBindings, HostPolicy};
+
+pub mod run_manager;
+pub use run_manager::RunManager;

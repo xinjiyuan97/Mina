@@ -1411,7 +1411,15 @@ async fn graph_wait_recovers_and_rejects_forged_delivery_without_reexecuting_too
     )
     .build(wait_definition())
     .unwrap();
-    agent.engine.recover("local", run).await.unwrap();
+    agent.engine.recover_run("local", run).await.unwrap();
+    // No new trigger: recovery must stay at the durable wait and not repeat effects.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        agent.engine.get_run("local", run).await.unwrap().status,
+        GraphStatus::Running
+    );
+    assert_eq!(tools.load(Ordering::SeqCst), 1);
+    assert_eq!(models.load(Ordering::SeqCst), 1);
     let published = store
         .publish(PublishEvent {
             event_id: EventId::new(),
@@ -2338,5 +2346,266 @@ async fn sqlite_recovery_keeps_the_selected_trigger_without_firing_again() {
         .await
         .unwrap();
     assert_eq!(events.iter().filter(|e| e.from == "api").count(), 1);
+    agent.engine.stop_workers().await;
+}
+
+#[tokio::test]
+async fn waiting_run_archive_moves_sqlite_dependencies_and_resumes_once() {
+    use agent_core::{
+        agent::{GraphWaitBridge, RunManager},
+        contracts::events::*,
+    };
+    use agent_extension::store::SqliteEventStore;
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let models = Arc::new(AtomicUsize::new(0));
+    let resources = |store: Arc<SqliteEventStore>| {
+        AgentResources::new(store.clone())
+            .model("primary", "v1", Arc::new(WaitingModel(models.clone())))
+            .toolset("workspace", "v1", Arc::new(WaitingEcho(calls.clone())))
+            .wait_service(
+                "durable",
+                "v1",
+                Arc::new(GraphWaitBridge::new(store.clone(), store.clone(), store)),
+            )
+    };
+    let source = Arc::new(
+        SqliteEventStore::open(dir.path().join("source.db"), "source")
+            .await
+            .unwrap(),
+    );
+    let agent = AgentBuilder::new(OperatorRegistry::builtins(), resources(source.clone()))
+        .build(wait_definition())
+        .unwrap();
+    let run = agent.run("wait").await.unwrap().run_id;
+    let subscription = SubscriptionId::stable("graph-wait-test", &run.to_string());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if source
+                .get_subscription(subscription)
+                .await
+                .unwrap()
+                .is_some()
+                && agent
+                    .engine
+                    .get_run("local", run)
+                    .await
+                    .unwrap()
+                    .step_usage
+                    .iter()
+                    .any(|s| s.instance == "wait")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    agent.engine.stop_workers().await;
+    let manager = RunManager::new("local", source.clone());
+    manager
+        .begin_maintenance("source", i64::MAX - 1)
+        .await
+        .unwrap();
+    let bundle = manager.export_run(run, "source").await.unwrap();
+    assert!(bundle.dependencies.is_some());
+    let target = Arc::new(
+        SqliteEventStore::open(dir.path().join("target.db"), "target")
+            .await
+            .unwrap(),
+    );
+    let imported = RunManager::new("local", target.clone());
+    imported
+        .begin_maintenance("target", i64::MAX - 1)
+        .await
+        .unwrap();
+    imported
+        .import_run(
+            bundle.clone(),
+            "target",
+            &OperatorRegistry::builtins(),
+            &resources(target.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    imported
+        .import_run(
+            bundle,
+            "target",
+            &OperatorRegistry::builtins(),
+            &resources(target.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        target
+            .get_subscription(subscription)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let event = PublishEvent {
+        event_id: EventId::new(),
+        topic: "test.answer".into(),
+        event_type: "test.answer".into(),
+        schema_version: 1,
+        source: EventSource::Gateway,
+        subject: Some(format!("run/{run}")),
+        correlation_id: Some(run.to_string()),
+        causation_id: None,
+        occurred_at_ms: 0,
+        recorded_at_ms: 0,
+        payload: json!({"answer":42}),
+    };
+    assert!(target.publish(event.clone()).await.is_err());
+    assert!(source.publish(event.clone()).await.is_err());
+    imported.end_maintenance("target").await.unwrap();
+    let bridge = Arc::new(GraphWaitBridge::new(
+        target.clone(),
+        target.clone(),
+        target.clone(),
+    ));
+    let agent = AgentBuilder::new(OperatorRegistry::builtins(), resources(target.clone()))
+        .build(wait_definition())
+        .unwrap();
+    agent.engine.recover("local", run).await.unwrap();
+    let published = target.publish(event).await.unwrap();
+    let deliveries = target
+        .claim_deliveries(ClaimDeliveries {
+            worker_id: "restore".into(),
+            now_ms: 1,
+            lease_until_ms: 10000,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    bridge
+        .deliver(deliveries[0].clone(), published.event)
+        .await
+        .unwrap();
+    terminal(&agent, run).await;
+    agent.engine.stop_workers().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(models.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn approval_archive_preserves_binding_and_executes_only_after_decision() {
+    use agent_core::agent::{GraphIngress, RunManager};
+    use agent_core::contracts::events::EventId;
+    let models = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let definition =
+        AgentDefinition::from_yaml(include_str!("../../../config/agents/tools.yaml")).unwrap();
+    let resources = |fabric: Arc<dyn agent_core::contracts::fabric::OperatorFabric>| {
+        AgentResources::new(fabric)
+            .model("primary", "v1", Arc::new(RoundModel(models.clone())))
+            .toolset("workspace", "v1", Arc::new(ReviewedEcho(calls.clone())))
+    };
+    let source = Arc::new(MemoryFabric::default());
+    let agent = AgentBuilder::new(OperatorRegistry::builtins(), resources(source.clone()))
+        .build(definition.clone())
+        .unwrap();
+    let run = agent.run("approve").await.unwrap().run_id;
+    let request = approval_event(&agent, run).await;
+    agent.engine.stop_workers().await;
+    let source_manager = RunManager::new("local", source);
+    source_manager
+        .begin_maintenance("source", i64::MAX - 1)
+        .await
+        .unwrap();
+    let bundle = source_manager.export_run(run, "source").await.unwrap();
+    let target = Arc::new(MemoryFabric::default());
+    let target_manager = RunManager::new("local", target.clone());
+    target_manager
+        .begin_maintenance("target", i64::MAX - 1)
+        .await
+        .unwrap();
+    target_manager
+        .import_run(
+            bundle,
+            "target",
+            &OperatorRegistry::builtins(),
+            &resources(target.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    target_manager.end_maintenance("target").await.unwrap();
+    let agent = AgentBuilder::new(OperatorRegistry::builtins(), resources(target.clone()))
+        .build(definition)
+        .unwrap();
+    agent.engine.recover("local", run).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    GraphIngress::new(target).send("local",run,EventId::new(),GraphEvent::new("approval.decided.v1",json!({"approval_id":request["approval_id"],"binding_digest":request["binding_digest"],"actor":"test","resolution":{"decision":"allow-once"}}))).await.unwrap();
+    assert_eq!(terminal(&agent, run).await.status, GraphStatus::Completed);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    agent.engine.stop_workers().await;
+}
+
+#[tokio::test]
+async fn archive_keeps_unconfirmed_model_invocation_without_replay() {
+    use agent_core::agent::RunManager;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resources = |fabric: Arc<MemoryFabric>| {
+        AgentResources::new(fabric).model("primary", "v1", Arc::new(Pending(calls.clone())))
+    };
+    let source = Arc::new(MemoryFabric::default());
+    let mut definition = text_definition();
+    definition.limits.timeout_ms = 400;
+    let agent = AgentBuilder::new(OperatorRegistry::builtins(), resources(source.clone()))
+        .build(definition.clone())
+        .unwrap();
+    let run = agent.run("pending").await.unwrap().run_id;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    agent.engine.stop_workers().await;
+    let source_manager = RunManager::new("local", source);
+    source_manager
+        .begin_maintenance("source", i64::MAX - 1)
+        .await
+        .unwrap();
+    let bundle = source_manager.export_run(run, "source").await.unwrap();
+    assert!(
+        !serde_json::to_value(bundle.graph_run().unwrap()).unwrap()["inflight"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    let target = Arc::new(MemoryFabric::default());
+    let target_manager = RunManager::new("local", target.clone());
+    target_manager
+        .begin_maintenance("target", i64::MAX - 1)
+        .await
+        .unwrap();
+    target_manager
+        .import_run(
+            bundle,
+            "target",
+            &OperatorRegistry::builtins(),
+            &resources(target.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    target_manager.end_maintenance("target").await.unwrap();
+    let agent = AgentBuilder::new(OperatorRegistry::builtins(), resources(target))
+        .build(definition)
+        .unwrap();
+    agent.engine.recover("local", run).await.unwrap();
+    assert_eq!(
+        terminal(&agent, run).await.error.as_deref(),
+        Some("run_timeout")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     agent.engine.stop_workers().await;
 }

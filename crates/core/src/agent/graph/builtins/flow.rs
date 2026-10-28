@@ -12,6 +12,17 @@ pub(super) fn register(registry: &mut OperatorRegistry) {
     context
         .resources
         .insert("toolset".into(), ResourceKind::Toolset);
+    let mut bound_context = context.clone();
+    bound_context.version = 2;
+    bound_context.config_schema["properties"]["context"] = json!({"type":"object","additionalProperties":false,"properties":{"prior_messages":{"type":"array"}}});
+    registry
+        .register(bound_context, |config, resources| {
+            Ok(Arc::new(Context {
+                config: serde_json::from_value(config.clone()).map_err(|e| invalid("config", e))?,
+                resources: resources.clone(),
+            }))
+        })
+        .expect("bound context registration");
     registry
         .register(context, |config, resources| {
             Ok(Arc::new(Context {
@@ -56,11 +67,19 @@ fn round(payload: &Value) -> Result<u32, FabricError> {
 #[derive(Deserialize)]
 struct ContextConfig {
     system_prompt: String,
+    #[serde(default)]
+    context: BoundContext,
     max_steps: u32,
     toolset: Option<String>,
     allowed_tools: Option<Vec<String>>,
     #[serde(default)]
     allow_run_adf: bool,
+}
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundContext {
+    #[serde(default)]
+    prior_messages: Vec<ModelMessage>,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct ContextState {
@@ -100,6 +119,9 @@ impl GraphOperator for Context {
                         return Err(invalid("input", "text or attachments required"));
                     }
                     saved.messages = vec![ModelMessage::system(&self.config.system_prompt)];
+                    saved
+                        .messages
+                        .extend(self.config.context.prior_messages.clone());
                     saved.messages.extend(input.prior_messages);
                     saved.messages.push(ModelMessage::user_with_attachments(
                         input.input,

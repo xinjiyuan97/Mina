@@ -113,6 +113,10 @@ impl AgentDefinition {
                 }
             }
         }
+        if let Some(mut snapshot) = self.binding_snapshot.take() {
+            snapshot.resolved_digest = crate::agent::bindings::digest(self)?;
+            self.binding_snapshot = Some(snapshot);
+        }
         Ok(())
     }
 }

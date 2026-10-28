@@ -40,9 +40,25 @@ fn transact(
     connection: &mut Connection,
     command: FabricCommand,
 ) -> Result<FabricReply, FabricError> {
+    let needs_v6 = match &command {
+        FabricCommand::HostTransact { records, .. } => {
+            records.iter().any(|r| r.namespace == "$agent-run")
+        }
+        FabricCommand::ImportRun { bundle, .. } => bundle.graph_run()?.agent_id.is_some(),
+        _ => false,
+    };
+    let needs_v5 = matches!(
+        command,
+        FabricCommand::HostTransact { .. }
+            | FabricCommand::BeginMaintenance { .. }
+            | FabricCommand::ImportRun { .. }
+    );
     let read_only = matches!(
         command,
         FabricCommand::ReadLog { .. }
+            | FabricCommand::ExportAgentHistory { .. }
+            | FabricCommand::InspectRun { .. }
+            | FabricCommand::ExportRun { .. }
             | FabricCommand::InspectRetention { .. }
             | FabricCommand::ArtifactRoots
             | FabricCommand::Replay { .. }
@@ -73,10 +89,14 @@ fn transact(
         Some(encoded) => serde_json::from_str(&encoded).map_err(storage)?,
         None => serde_json::to_value(FabricState::default()).map_err(storage)?,
     };
+    let previous_version = value["schema_version"].as_u64().unwrap_or(0);
     if value["schema_version"] == 3 {
         // Schema 3 already has relational rows; only upgrade the compatibility fence.
         transaction.execute("UPDATE workflow_operator_fabric_v1 SET state_json='{\"schema_version\":4}' WHERE singleton=1", []).map_err(storage)?;
-    } else if value["schema_version"] != 4 {
+    } else if value["schema_version"] != 4
+        && value["schema_version"] != 5
+        && value["schema_version"] != 6
+    {
         validate_legacy(&value)?;
         let state: FabricState = serde_json::from_value(value).map_err(storage)?;
         persist_rows(
@@ -86,6 +106,15 @@ fn transact(
         )?;
         // Old binaries must reject the migrated database instead of silently overwriting it.
         transaction.execute("INSERT INTO workflow_operator_fabric_v1(singleton,state_json) VALUES(1,'{\"schema_version\":4}') ON CONFLICT(singleton) DO UPDATE SET state_json=excluded.state_json", []).map_err(storage)?;
+    }
+    if needs_v6 {
+        transaction.execute("UPDATE workflow_operator_fabric_v1 SET state_json='{\"schema_version\":6}' WHERE singleton=1", []).map_err(storage)?;
+    } else if needs_v5 && previous_version < 5 {
+        transaction.execute("UPDATE workflow_operator_fabric_v1 SET state_json='{\"schema_version\":5}' WHERE singleton=1", []).map_err(storage)?;
+    }
+    let frozen: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM workflow_fabric_records WHERE section='checkpoints' AND identity=?1)", [agent_core::agent::memory_fabric::archive::MAINTENANCE_KEY], |r| r.get(0)).map_err(storage)?;
+    if frozen && !agent_core::agent::memory_fabric::archive::maintenance_allowed(&command) {
+        return Err(FabricError::Fenced);
     }
     if let Some(reply) = indexed::execute(&transaction, &command)? {
         transaction.commit().map_err(storage)?;
@@ -165,7 +194,14 @@ fn transact(
     }
     let all = matches!(
         command,
-        FabricCommand::InspectRetention { .. }
+        FabricCommand::HostTransact { .. }
+            | FabricCommand::BeginMaintenance { .. }
+            | FabricCommand::EndMaintenance { .. }
+            | FabricCommand::ExportAgentHistory { .. }
+            | FabricCommand::InspectRun { .. }
+            | FabricCommand::ExportRun { .. }
+            | FabricCommand::ImportRun { .. }
+            | FabricCommand::InspectRetention { .. }
             | FabricCommand::RetireRun { .. }
             | FabricCommand::CollectArtifacts { .. }
             | FabricCommand::ArtifactRoots
@@ -209,10 +245,76 @@ fn transact(
     let value = assemble(&before)?;
     validate_legacy(&value)?;
     let mut state: FabricState = serde_json::from_value(value).map_err(storage)?;
-    let reply = state.apply(command)?;
+    let reply = match command {
+        FabricCommand::BeginMaintenance { token, now_ms } => {
+            super::wait_archive::check_leases(&transaction, now_ms)?;
+            state.apply(FabricCommand::BeginMaintenance { token, now_ms })?
+        }
+        FabricCommand::ExportRun {
+            tenant,
+            run_id,
+            maintenance_token,
+        } => {
+            let FabricReply::RunInspection(snapshot) = state.apply(FabricCommand::InspectRun {
+                tenant: tenant.clone(),
+                run_id,
+            })?
+            else {
+                return Err(FabricError::Conflict);
+            };
+            let has_waits = snapshot.items.iter().any(|item| {
+                item.payload["value"]["definition"]["operators"]
+                    .as_object()
+                    .is_some_and(|ops| ops.values().any(|op| op["type"] == "agent.wait"))
+            });
+            if has_waits {
+                let dependencies = super::wait_archive::capture(
+                    &transaction,
+                    run_id,
+                    &serde_json::to_value(snapshot).map_err(storage)?,
+                )?;
+                state.export_with_dependencies(&tenant, run_id, &maintenance_token, dependencies)?
+            } else {
+                state.apply(FabricCommand::ExportRun {
+                    tenant,
+                    run_id,
+                    maintenance_token,
+                })?
+            }
+        }
+        FabricCommand::ImportRun {
+            bundle,
+            maintenance_token,
+        } if bundle.dependencies.is_some() => {
+            let marker =
+                agent_core::contracts::run_archive::import_marker(&bundle.tenant, bundle.run_id);
+            let already = before
+                .get(&("checkpoints".into(), marker, 0))
+                .is_some_and(|v| v["value"] == serde_json::json!([bundle.tenant, bundle.digest]));
+            let reply = state.import_archive(bundle.clone(), &maintenance_token, true)?;
+            if !already {
+                let FabricReply::RunInspection(snapshot) =
+                    state.apply(FabricCommand::InspectRun {
+                        tenant: bundle.tenant.clone(),
+                        run_id: bundle.run_id,
+                    })?
+                else {
+                    return Err(FabricError::Conflict);
+                };
+                super::wait_archive::restore(
+                    &transaction,
+                    bundle.dependencies.as_ref().ok_or(FabricError::Conflict)?,
+                    bundle.run_id,
+                    &serde_json::to_value(snapshot).map_err(storage)?,
+                )?;
+            }
+            reply
+        }
+        command => state.apply(command)?,
+    };
     if !read_only {
         let after = rows(serde_json::to_value(state).map_err(storage)?)?;
-        let after = if collection {
+        let after = if collection || all {
             collection_positions(&before, after)?
         } else if is_scoped {
             indexed::restore_positions(&transaction, &before, after)?
@@ -262,7 +364,9 @@ fn validate_legacy(value: &serde_json::Value) -> Result<(), FabricError> {
             let e = &event["event"]["envelope"];
             e["schema_version"] != 1
                 || e["projection_version"] != 1
-                || e["operator"]["version"] != 1
+                || !e["operator"]["version"]
+                    .as_u64()
+                    .is_some_and(|v| v > 0 && v <= u64::from(u32::MAX))
                 || !matches!(
                     e["engine_version"].as_str(),
                     Some("legacy_machine" | "operator_v1")
@@ -401,13 +505,25 @@ fn collection_positions(before: &Rows, after: Rows) -> Result<Rows, FabricError>
                 .push_back(*position);
         }
     }
+    let mut tails = std::collections::BTreeMap::<String, i64>::new();
+    for (section, _, position) in before.keys() {
+        tails
+            .entry(section.clone())
+            .and_modify(|tail| *tail = (*tail).max(*position + 1))
+            .or_insert(*position + 1);
+    }
     let mut restored = Rows::new();
     for ((section, key, position), value) in after {
         let position = if let Some(id) = identity(&section, &value) {
             positions
                 .get_mut(&(section.clone(), id))
                 .and_then(|p| p.pop_front())
-                .ok_or(FabricError::Conflict)?
+                .unwrap_or_else(|| {
+                    let tail = tails.entry(section.clone()).or_default();
+                    let next = *tail;
+                    *tail += 1;
+                    next
+                })
         } else {
             position
         };

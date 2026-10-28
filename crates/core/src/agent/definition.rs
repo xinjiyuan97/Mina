@@ -9,6 +9,10 @@ use std::{collections::BTreeMap, path::Path};
 pub struct AgentDefinition {
     pub schema_version: u32,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bindings: Option<super::bindings::BindingContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_snapshot: Option<super::bindings::BindingSnapshot>,
     pub triggers: BTreeMap<String, TriggerDefinition>,
     pub operators: BTreeMap<String, OperatorDefinition>,
     pub subscriptions: Vec<OperatorSubscription>,
@@ -236,6 +240,8 @@ impl AgentGraph {
         }
         Ok(AgentDefinition {
             schema_version: 2,
+            bindings: None,
+            binding_snapshot: None,
             name: self.name,
             triggers: self.triggers,
             operators: self.operators,

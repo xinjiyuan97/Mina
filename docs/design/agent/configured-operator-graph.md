@@ -26,3 +26,7 @@ Core 提供两种等价入口：文件解析为 `AgentDefinition`，或者用 `A
 ## 默认图节点
 
 纯文本图为 `agent.context → agent.model`，Model 直接发布 `stop.completed / stop.tool_calls / stop.failed`。工具图把 `stop.tool_calls.v1` 连接到 `agent.gate`，Gate 分发到 ToolPolicy，经授权后进入 Tools，收齐结果后回到 Context。Gate 使用通用 batch_id、分支 id 和不透明 payload，也支持自定义审批等节点。Router、ToolJoin 和 Coordinator 的旧静态图类型已删除。Compactor 尚未实现。
+
+## 分发图的宿主绑定
+
+v3 已提供独立的绑定契约、JSON Schema、`HostBindings` 和 `HostPolicy`，构建时完成解析及权限收紧并保存快照。宿主不依赖节点名；`AgentResources` 继续注入实例。实际用法及限制见[宿主集成 API](host-integration-api.md)，目标扩展见[宿主集成契约](host-integration-contracts.md)。

@@ -124,3 +124,7 @@ OperatorFabric 可通过 `changes()` 提供进程内 watch 通知。MemoryFabric
 ## Trigger 入口
 
 图格式 v2 将隐式输入源替换成具名 `triggers`。`ConfiguredAgent::trigger`、`GraphEngine::trigger/start_trigger/admit_trigger` 支持选定手动入口；`AgentEngine::trigger_graph` 通过高层持久化宿主启动指定入口。已有 run/start API 触发图的默认入口。定时调度暂未实现，详见 [Trigger 文档](graph-triggers.md)。
+
+## 宿主集成接口
+
+[宿主集成 API](host-integration-api.md)说明 RunManager 检查/恢复包、v3 类型绑定、SQLite 打开选项、同库不可变宿主记录及独立库完成投影。`ReadCheckpoint` 与 `project_into` 本身仍不构成完整备份或跨库事务。

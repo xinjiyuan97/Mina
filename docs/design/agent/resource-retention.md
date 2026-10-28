@@ -27,3 +27,7 @@ Fabric 新上传先写未完成 manifest，再写分块，最后 CAS 标记完�
 SQLite 回收在一个事务中删除记录，保留原有位置；失败整体回滚。数据版本标记升级为 4，阻止不认识退休事件的旧版实现打开库。没有自动降级。
 
 InspectRetention 只是盘点，不遍历 blob 内容，不得直接用于删除。
+
+## 与恢复包及宿主投影的衔接
+
+[宿主集成 API](host-integration-api.md)使用持久化全库维护屏障阻止导出期间的 Fabric 写入和 GC。完成记录与日志首版永久保留，关联输出 blob 继续参与根引用扫描，consumer ACK 不触发删除。完成记录压缩、通用跨存储 pin 和 consumer 注册生命周期仍属[目标设计](host-integration-contracts.md)。

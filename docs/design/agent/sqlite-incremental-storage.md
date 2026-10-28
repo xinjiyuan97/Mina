@@ -28,3 +28,7 @@ checkpoint、日志追加、水位、outbox、租约确认和回执处于同一�
 
 
 索引查询验证：在同库放入其他运行的不兼容事件、订阅、回执及死信，目标运行的发布、领取、提交、回放和 checkpoint 仍成功；EXPLAIN QUERY PLAN 验证 consumer 查询使用订阅索引。35 项 Fabric 契约测试和 8 项 checkpoint 事务测试通过。
+
+## 公开集成边界
+
+表和索引属于 Extension 私有实现；宿主使用 RunManager 检查、导出和导入。显式打开选项、标准宿主事务和稳定完成日志见[宿主集成 API](host-integration-api.md)。新功能首次写入把兼容标记提升为 5，旧二进制拒绝访问；独立 Session/Profile 库通过幂等投影补齐。
