@@ -154,6 +154,7 @@ impl AgentDefinition {
                 op.kind.as_str(),
                 "agent.context"
                     | "agent.model"
+                    | "agent.compactor"
                     | "agent.gate"
                     | "agent.tools"
                     | "agent.tool_policy"
@@ -164,7 +165,7 @@ impl AgentDefinition {
                     "custom operator requires a reviewed policy adapter",
                 ));
             }
-            if op.kind == "agent.model" {
+            if matches!(op.kind.as_str(), "agent.model" | "agent.compactor") {
                 let model = op.config["model_name"].as_str().ok_or_else(|| {
                     invalid("model_name", "explicit host-approved model required")
                 })?;

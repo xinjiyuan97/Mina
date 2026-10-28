@@ -2609,3 +2609,224 @@ async fn archive_keeps_unconfirmed_model_invocation_without_replay() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     agent.engine.stop_workers().await;
 }
+
+#[tokio::test]
+async fn compactor_writes_back_before_model_and_keeps_compacted_history_after_tools() {
+    use agent_core::agent::CompactorConfig;
+    let models = Arc::new(AtomicUsize::new(0));
+    let summaries = Arc::new(AtomicUsize::new(0));
+    let tools = Arc::new(AtomicUsize::new(0));
+    let fabric = Arc::new(MemoryFabric::default());
+    let resources = AgentResources::new(fabric)
+        .model("primary", "m1", Arc::new(RoundModel(models.clone())))
+        .model("summary", "s1", Arc::new(Text(summaries.clone())))
+        .toolset("workspace", "t1", Arc::new(EchoTool(tools.clone())));
+    let mut definition =
+        AgentDefinition::from_yaml(include_str!("../../../config/agents/tools.yaml")).unwrap();
+    let mut config = CompactorConfig::new("summary", 4000, 256, 32000);
+    config.safety_margin_tokens = 64;
+    config.max_output_tokens = 128;
+    config.keep_recent_blocks = 1;
+    definition.enable_compaction(config).unwrap();
+    let agent = AgentBuilder::new(OperatorRegistry::builtins(), resources.clone())
+        .build(definition.clone())
+        .unwrap();
+    let run = agent.engine.run("local", json!({"input":"Continue the task", "prior_messages":[ModelMessage::user("OLD_HISTORY_MARKER ".repeat(3000))]})).await.unwrap();
+    let state = terminal(&agent, run.run_id).await;
+    assert_eq!(state.status, GraphStatus::Completed, "{:?}", state.error);
+    assert_eq!(state.usage, Some(test_usage(30, 15)));
+    assert_eq!(models.load(Ordering::SeqCst), 2);
+    assert_eq!(summaries.load(Ordering::SeqCst), 1);
+    assert_eq!(tools.load(Ordering::SeqCst), 1);
+    let events = agent
+        .engine
+        .events_after("local", run.run_id, 0, 128)
+        .await
+        .unwrap();
+    let requests: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == "model.requested.v1")
+        .collect();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert!(
+            !request.payload["messages"]
+                .to_string()
+                .contains("OLD_HISTORY_MARKER")
+        );
+        assert!(
+            request.payload["messages"]
+                .to_string()
+                .contains("Conversation summary")
+        );
+        assert!(
+            request.payload["messages"]
+                .to_string()
+                .contains("Continue the task")
+        );
+        assert_eq!(request.from, "context");
+    }
+    let state = serde_json::to_value(state).unwrap();
+    assert!(
+        !state["states"]["context"]["messages"]
+            .to_string()
+            .contains("OLD_HISTORY_MARKER")
+    );
+    agent.engine.stop_workers().await;
+    let recovered = AgentBuilder::new(OperatorRegistry::builtins(), resources)
+        .build(definition)
+        .unwrap();
+    recovered.engine.recover("local", run.run_id).await.unwrap();
+    assert_eq!(
+        terminal(&recovered, run.run_id).await.status,
+        GraphStatus::Completed
+    );
+    assert_eq!(summaries.load(Ordering::SeqCst), 1);
+    assert_eq!(models.load(Ordering::SeqCst), 2);
+    recovered.engine.stop_workers().await;
+}
+
+#[test]
+fn compactor_rejects_invalid_thresholds_and_unreserved_model_output() {
+    use agent_core::agent::CompactorConfig;
+    let resources = text_resources(Arc::new(AtomicUsize::new(0)));
+    let mut definition = text_definition();
+    definition
+        .enable_compaction(CompactorConfig::new("primary", 8000, 1024, 8000))
+        .unwrap();
+    definition
+        .validate(&OperatorRegistry::builtins(), &resources)
+        .unwrap();
+    definition.operators.get_mut("llm").unwrap().config["max_output_tokens"] = json!(2048);
+    assert!(
+        definition
+            .validate(&OperatorRegistry::builtins(), &resources)
+            .is_err()
+    );
+    definition.operators.get_mut("llm").unwrap().config["max_output_tokens"] = json!(1024);
+    definition.operators.get_mut("compactor").unwrap().config["target_percent"] = json!(90);
+    assert!(
+        definition
+            .validate(&OperatorRegistry::builtins(), &resources)
+            .is_err()
+    );
+}
+
+struct GrowingContextModel(Arc<AtomicUsize>);
+impl ModelPort for GrowingContextModel {
+    fn stream(&self, request: ModelRequest) -> ModelEventStream {
+        let round = self.0.fetch_add(1, Ordering::SeqCst);
+        // A summary must never leave orphan tool results in the provider request.
+        let calls: std::collections::BTreeSet<_> = request
+            .messages
+            .iter()
+            .flat_map(|m| m.tool_calls.iter().map(|c| c.id.as_str()))
+            .collect();
+        for message in &request.messages {
+            if let Some(id) = &message.tool_call_id {
+                assert!(calls.contains(id.as_str()));
+            }
+        }
+        let events = if round < 5 {
+            let id = format!("growing-{round}");
+            vec![
+                ModelEvent::ToolCallStarted {
+                    call_id: id.clone(),
+                    name: "echo".into(),
+                },
+                ModelEvent::ToolCallArgumentsDelta {
+                    call_id: id,
+                    delta: json!({"text":"x".repeat(2000)}).to_string(),
+                },
+                ModelEvent::Completed {
+                    finish_reason: FinishReason::ToolCall,
+                },
+            ]
+        } else {
+            vec![
+                ModelEvent::TextDelta {
+                    delta: "done".into(),
+                },
+                ModelEvent::Completed {
+                    finish_reason: FinishReason::Stop,
+                },
+            ]
+        };
+        Box::pin(futures_util::stream::iter(events))
+    }
+}
+
+#[tokio::test]
+async fn compactor_checks_each_tool_round_and_rolls_previous_summary_forward() {
+    use agent_core::agent::CompactorConfig;
+    let models = Arc::new(AtomicUsize::new(0));
+    let summaries = Arc::new(AtomicUsize::new(0));
+    let tools = Arc::new(AtomicUsize::new(0));
+    let resources = AgentResources::new(Arc::new(MemoryFabric::default()))
+        .model(
+            "primary",
+            "m1",
+            Arc::new(GrowingContextModel(models.clone())),
+        )
+        .model("summary", "s1", Arc::new(Text(summaries.clone())))
+        .toolset("workspace", "t1", Arc::new(EchoTool(tools.clone())));
+    let mut config = agent_core::agent::GraphAgentConfig::new("business", "system");
+    let mut compaction = CompactorConfig::new("summary", 4000, 256, 32000);
+    compaction.safety_margin_tokens = 64;
+    compaction.max_output_tokens = 128;
+    compaction.keep_recent_blocks = 1;
+    config.compaction = Some(compaction);
+    let agent = AgentBuilder::new(OperatorRegistry::builtins(), resources)
+        .build(config.definition().unwrap())
+        .unwrap();
+    let run = agent.run("Keep working").await.unwrap();
+    let state = terminal(&agent, run.run_id).await;
+    assert_eq!(state.status, GraphStatus::Completed, "{:?}", state.error);
+    assert_eq!(models.load(Ordering::SeqCst), 6);
+    assert_eq!(tools.load(Ordering::SeqCst), 5);
+    assert!(summaries.load(Ordering::SeqCst) >= 2);
+    let events = agent
+        .engine
+        .events_after("local", run.run_id, 0, 128)
+        .await
+        .unwrap();
+    let prepared: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == "context.prepared.v1")
+        .collect();
+    assert_eq!(prepared.len(), 6);
+    assert_eq!(prepared[0].payload["compacted"], false);
+    let compacted: Vec<_> = prepared
+        .iter()
+        .filter(|e| e.payload["compacted"] == true)
+        .collect();
+    assert!(compacted.len() >= 2);
+    for result in compacted {
+        let messages: Vec<ModelMessage> =
+            serde_json::from_value(result.payload["messages"].clone()).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.content.starts_with("Conversation summary"))
+                .count(),
+            1
+        );
+        assert!(messages.iter().any(|m| m.content == "Keep working"));
+    }
+    agent.engine.stop_workers().await;
+}
+
+#[test]
+fn compaction_example_has_valid_wiring() {
+    let resources = text_resources(Arc::new(AtomicUsize::new(0))).toolset(
+        "workspace",
+        "t1",
+        Arc::new(EchoTool(Arc::new(AtomicUsize::new(0)))),
+    );
+    let definition =
+        AgentDefinition::from_yaml(include_str!("../../../config/agents/tools-compaction.yaml"))
+            .unwrap();
+    definition
+        .validate(&OperatorRegistry::builtins(), &resources)
+        .unwrap();
+}

@@ -15,11 +15,31 @@ pub(super) fn register(registry: &mut OperatorRegistry) {
     let mut bound_context = context.clone();
     bound_context.version = 2;
     bound_context.config_schema["properties"]["context"] = json!({"type":"object","additionalProperties":false,"properties":{"prior_messages":{"type":"array"}}});
+    let mut compacting_context = bound_context.clone();
+    compacting_context.version = 3;
+    compacting_context.inputs.insert(
+        "context.prepared.v1".into(),
+        protocol("context.prepared.v1"),
+    );
+    compacting_context.outputs.insert(
+        "context.prepare.requested.v1".into(),
+        protocol("context.prepare.requested.v1"),
+    );
+    registry
+        .register(compacting_context, |config, resources| {
+            Ok(Arc::new(Context {
+                config: serde_json::from_value(config.clone()).map_err(|e| invalid("config", e))?,
+                resources: resources.clone(),
+                compact: true,
+            }))
+        })
+        .expect("compacting context registration");
     registry
         .register(bound_context, |config, resources| {
             Ok(Arc::new(Context {
                 config: serde_json::from_value(config.clone()).map_err(|e| invalid("config", e))?,
                 resources: resources.clone(),
+                compact: false,
             }))
         })
         .expect("bound context registration");
@@ -28,6 +48,7 @@ pub(super) fn register(registry: &mut OperatorRegistry) {
             Ok(Arc::new(Context {
                 config: serde_json::from_value(config.clone()).map_err(|e| invalid("config", e))?,
                 resources: resources.clone(),
+                compact: false,
             }))
         })
         .expect("context registration");
@@ -85,8 +106,15 @@ struct BoundContext {
 struct ContextState {
     messages: Vec<ModelMessage>,
     round: u32,
+    #[serde(default)]
+    current_user_index: usize,
+    #[serde(default)]
+    pending: Option<Value>,
+    #[serde(default)]
+    completed_round: u32,
 }
 struct Context {
+    compact: bool,
     config: ContextConfig,
     resources: AgentResources,
 }
@@ -94,6 +122,46 @@ impl GraphOperator for Context {
     fn handle(&self, ctx: GraphContext) -> GraphFuture<'_> {
         Box::pin(async move {
             let mut saved: ContextState = state(ctx.state)?;
+            if self.compact && ctx.event.kind == "context.prepared.v1" {
+                let Some(pending) = saved.pending.as_ref() else {
+                    return output(saved, vec![]);
+                };
+                let result = &ctx.event.payload;
+                if result["prepare_id"] != pending["prepare_id"]
+                    || result["source_digest"] != pending["source_digest"]
+                    || result["round"] != pending["round"]
+                {
+                    return output(saved, vec![]);
+                }
+                if let Some(code) = result["code"].as_str() {
+                    let event = GraphEvent::new(
+                        "context.failed.v1",
+                        json!({"round":saved.round,"code":code}),
+                    );
+                    saved.pending = None;
+                    return output(saved, vec![event]);
+                }
+                let messages: Vec<ModelMessage> =
+                    serde_json::from_value(result["messages"].clone())
+                        .map_err(|e| invalid("messages", e))?;
+                let index = result["current_user_index"]
+                    .as_u64()
+                    .ok_or_else(|| invalid("current_user_index", "required"))?
+                    as usize;
+                if messages.get(index) != saved.messages.get(saved.current_user_index)
+                    || messages.get(index).is_none()
+                {
+                    return Err(invalid(
+                        "current_user_index",
+                        "current request must be preserved",
+                    ));
+                }
+                let mut request = saved.pending.take().expect("pending request");
+                saved.messages = messages;
+                saved.current_user_index = index;
+                request["messages"] = json!(saved.messages);
+                return output(saved, vec![GraphEvent::new("model.requested.v1", request)]);
+            }
             match ctx.event.kind.as_str() {
                 "agent.start.v1" if saved.round == 0 => {
                     #[derive(Deserialize)]
@@ -123,14 +191,20 @@ impl GraphOperator for Context {
                         .messages
                         .extend(self.config.context.prior_messages.clone());
                     saved.messages.extend(input.prior_messages);
+                    saved.current_user_index = saved.messages.len();
                     saved.messages.push(ModelMessage::user_with_attachments(
                         input.input,
                         input.attachments,
                     ));
                 }
                 "gate.completed.v1"
-                    if round(&ctx.event.payload["context"])? == saved.round && saved.round > 0 =>
+                    if round(&ctx.event.payload["context"])? == saved.round
+                        && saved.round > 0
+                        && (!self.compact
+                            || (saved.pending.is_none()
+                                && saved.completed_round < saved.round)) =>
                 {
+                    saved.completed_round = saved.round;
                     let batch = &ctx.event.payload["context"];
                     let calls: Vec<ModelToolCall> = serde_json::from_value(batch["calls"].clone())
                         .map_err(|e| invalid("calls", e))?;
@@ -198,10 +272,18 @@ impl GraphOperator for Context {
                 .as_ref()
                 .map(|s| s.definitions.clone())
                 .unwrap_or_default();
-            let event = GraphEvent::new(
-                "model.requested.v1",
-                json!({"round":saved.round,"messages":saved.messages,"tools":tools,"tool_snapshot":snapshot}),
-            );
+            let mut request = json!({"round":saved.round,"messages":saved.messages,"tools":tools,"tool_snapshot":snapshot});
+            let kind = if self.compact {
+                request["current_user_index"] = json!(saved.current_user_index);
+                request["prepare_id"] =
+                    json!(format!("{}:{}:{}", ctx.run_id, ctx.instance, saved.round));
+                request["source_digest"] = json!(crate::agent::bindings::digest(&request)?);
+                saved.pending = Some(request.clone());
+                "context.prepare.requested.v1"
+            } else {
+                "model.requested.v1"
+            };
+            let event = GraphEvent::new(kind, request);
             output(saved, vec![event])
         })
     }
@@ -318,6 +400,55 @@ mod tests {
             {"id":"security","payload":{"review":"security"}},
             {"id":"owner","payload":{"review":"ownership"}}
         ]})
+    }
+    #[tokio::test]
+    async fn context_restores_pending_preparation_and_ignores_duplicate_or_stale_results() {
+        let context = Context {
+            compact: true,
+            config: serde_json::from_value(json!({"system_prompt":"system", "max_steps":8}))
+                .unwrap(),
+            resources: AgentResources::new(Arc::new(
+                crate::agent::memory_fabric::MemoryFabric::default(),
+            )),
+        };
+        let started = context
+            .handle(ctx("agent.start.v1", json!("task"), Value::Null))
+            .await
+            .unwrap();
+        assert_eq!(started.events[0].kind, "context.prepare.requested.v1");
+        let request = started.events[0].payload.clone();
+        let restored: Value =
+            serde_json::from_str(&serde_json::to_string(&started.state).unwrap()).unwrap();
+        let mut stale = request.clone();
+        stale["source_digest"] = json!("wrong");
+        let ignored = context
+            .handle(ctx("context.prepared.v1", stale, restored))
+            .await
+            .unwrap();
+        assert!(ignored.events.is_empty());
+        let prepared = context
+            .handle(ctx("context.prepared.v1", request.clone(), ignored.state))
+            .await
+            .unwrap();
+        assert_eq!(prepared.events.len(), 1);
+        assert_eq!(prepared.events[0].kind, "model.requested.v1");
+        assert_eq!(prepared.state["messages"], request["messages"]);
+        let duplicate = context
+            .handle(ctx("context.prepared.v1", request, prepared.state))
+            .await
+            .unwrap();
+        assert!(duplicate.events.is_empty());
+        let batch = json!({"context":{"round":1,"calls":[],"text":"done"},"results":[]});
+        let next = context
+            .handle(ctx("gate.completed.v1", batch.clone(), duplicate.state))
+            .await
+            .unwrap();
+        assert_eq!(next.events[0].payload["round"], 2);
+        let duplicate = context
+            .handle(ctx("gate.completed.v1", batch, next.state))
+            .await
+            .unwrap();
+        assert!(duplicate.events.is_empty());
     }
     #[tokio::test]
     async fn gate_joins_opaque_approval_results_after_restore_without_duplicate_dispatch() {

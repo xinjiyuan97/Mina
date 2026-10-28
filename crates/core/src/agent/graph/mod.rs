@@ -1,7 +1,7 @@
 //! Static, protocol-checked single-agent graphs. Both construction paths use this engine.
 mod builtins;
 mod config;
-pub use config::GraphAgentConfig;
+pub use config::{CompactorConfig, GraphAgentConfig};
 mod host;
 mod runtime;
 mod stream;
@@ -418,6 +418,37 @@ fn compile(
             bindings.insert(format!("{name}:{field}:{resource}"), revision.clone());
         }
         descriptors.insert(name.clone(), desc.clone());
+    }
+    // The preflight budget must cover the actual downstream generation limit.
+    for (name, op) in &d.operators {
+        if op.kind != "agent.compactor" {
+            continue;
+        }
+        let reserve = op.config["reserved_output_tokens"].as_u64().unwrap_or(0);
+        for response in &d.subscriptions {
+            if response.from != *name || !response.events.iter().any(|e| e == "context.prepared.v1")
+            {
+                continue;
+            }
+            for request in &d.subscriptions {
+                if request.from != response.subscriber
+                    || !request.events.iter().any(|e| e == "model.requested.v1")
+                {
+                    continue;
+                }
+                if let Some(model) = d.operators.get(&request.subscriber)
+                    && model.kind == "agent.model"
+                    && model.config["max_output_tokens"]
+                        .as_u64()
+                        .is_none_or(|limit| limit > reserve)
+                {
+                    return Err(invalid(
+                        "compactor.reserved_output_tokens",
+                        "explicit downstream model output limit must fit reserve",
+                    ));
+                }
+            }
+        }
     }
     if d.triggers.is_empty() || d.triggers.len() > 32 {
         return Err(invalid("triggers", "expected 1..32 trigger nodes"));
