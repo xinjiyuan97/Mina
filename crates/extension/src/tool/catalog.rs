@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::workspace::{NativeWorkspaceFs, WorkspaceFs};
-use agent_core::contracts::{ToolRegistrationError, ToolRegistry};
+use agent_core::contracts::{BlobStore, ToolRegistrationError, ToolRegistry};
 use agent_core::sandbox::ProcessSandbox;
 use thiserror::Error;
 
@@ -28,6 +28,7 @@ use crate::tool::{
 #[derive(Clone)]
 pub struct BuiltinToolCatalog {
     workspace_root: PathBuf,
+    blobs: Option<Arc<dyn BlobStore>>,
     file_workspace: Option<Arc<dyn WorkspaceFs>>,
     terminal_enabled: bool,
     process_sandbox: Option<Arc<dyn ProcessSandbox>>,
@@ -72,6 +73,7 @@ impl BuiltinToolCatalog {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
         Self {
             workspace_root: workspace_root.into(),
+            blobs: None,
             file_workspace: None,
             terminal_enabled: false,
             process_sandbox: None,
@@ -81,6 +83,13 @@ impl BuiltinToolCatalog {
             xlsx_enabled: false,
             docx_enabled: false,
         }
+    }
+
+    /// Enables view_image. Use this same store on the model provider so it can resolve images.
+    #[must_use]
+    pub fn with_blob_store(mut self, blobs: Arc<dyn BlobStore>) -> Self {
+        self.blobs = Some(blobs);
+        self
     }
 
     /// Enables the shell, managed-session, stdin and workspace patch tools.
@@ -165,6 +174,12 @@ impl BuiltinToolCatalog {
         };
         let mut registry = ToolRegistry::new();
         registry.register(GetCurrentTimeTool)?;
+        if let Some(blobs) = self.blobs {
+            registry.register(super::ViewImageTool::new(
+                Arc::clone(&file_workspace),
+                blobs,
+            ))?;
+        }
         registry.register(ReadTool::new(Arc::clone(&file_workspace)))?;
         registry.register(ListDirectoryTool::new(Arc::clone(&file_workspace)))?;
         registry.register(WriteTool::new(Arc::clone(&file_workspace)))?;

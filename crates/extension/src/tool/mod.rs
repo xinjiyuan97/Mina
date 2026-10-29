@@ -4,6 +4,8 @@
 //! validation, risk approval, cancellation, and public events.
 
 mod catalog;
+mod view_image;
+pub use view_image::ViewImageTool;
 #[cfg(feature = "openai")]
 mod image;
 #[cfg(feature = "openai")]

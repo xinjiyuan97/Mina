@@ -28,10 +28,11 @@ pub struct ToolCallRequest {
     pub cancellation: RunCancellation,
 }
 
-/// Text returned to the model after a tool finishes successfully.
+/// Text and optional binary inputs returned after a tool finishes successfully.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolOutput {
     pub content: String,
+    pub attachments: Vec<crate::contracts::ModelAttachment>,
     pub suspension: Option<ToolSuspension>,
 }
 
@@ -40,14 +41,23 @@ impl ToolOutput {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            attachments: Vec::new(),
             suspension: None,
         }
+    }
+
+    /// Attach inputs stored in the same BlobStore used by the model provider.
+    #[must_use]
+    pub fn with_attachments(mut self, attachments: Vec<crate::contracts::ModelAttachment>) -> Self {
+        self.attachments = attachments;
+        self
     }
 
     #[must_use]
     pub fn suspend(waits: Vec<WaitSpec>, effects: Vec<EffectRequest>) -> Self {
         Self {
             content: String::new(),
+            attachments: Vec::new(),
             suspension: Some(ToolSuspension { waits, effects }),
         }
     }

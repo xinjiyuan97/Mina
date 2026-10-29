@@ -378,7 +378,7 @@ impl GraphOperator for Tools {
                     ),
                     None => GraphEvent::new(
                         "gate.result.v1",
-                        json!({"batch_id":dispatch["batch_id"],"id":dispatch["id"],"payload":{"ok":true,"output":output.content}}),
+                        json!({"batch_id":dispatch["batch_id"],"id":dispatch["id"],"payload":{"ok":true,"output":output.content,"attachments":output.attachments}}),
                     ),
                 },
                 Err(code) => policy::failure(dispatch, code, code),

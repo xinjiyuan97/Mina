@@ -1031,7 +1031,7 @@ fn build_agent(
     let model = config.default_model();
     let provider = ConfiguredModelProvider::from_model_config(model)?
         .with_token_estimator(estimator)
-        .with_blob_store(blobs);
+        .with_blob_store(Arc::clone(&blobs));
     let provider = ObservedModel::new(provider, Arc::clone(&hook));
     let workspace = env::current_dir()?;
     let process_sandbox: Arc<dyn ProcessSandbox> = Arc::new(HostProcessSandbox::default());
@@ -1045,6 +1045,7 @@ fn build_agent(
         adf_enabled: config.adf().enabled,
     };
     let mut tools = BuiltinToolCatalog::new(workspace)
+        .with_blob_store(blobs)
         .with_file_workspace(file_workspace)
         .with_process_sandbox(process_sandbox)
         .with_search_backend(search_backend)

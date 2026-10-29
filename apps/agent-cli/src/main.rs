@@ -95,7 +95,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| PathBuf::from("config/mina.toml"));
     let config = HarnessConfig::load(config_path)?;
     let model = config.default_model();
-    let provider = ConfiguredModelProvider::from_model_config(model)?;
+    let blob_path = env::var_os("MINA_BLOB_STORE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("data/blobs"));
+    let blobs: Arc<dyn agent_core::contracts::BlobStore> =
+        Arc::new(agent_extension::store::FilesystemBlobStore::new(blob_path));
+    let provider =
+        ConfiguredModelProvider::from_model_config(model)?.with_blob_store(Arc::clone(&blobs));
     let observation_worker = Arc::new(AsyncObservationHook::new(
         Arc::new(HookObservationExporter::new(Arc::new(
             TracingObservationHook,
@@ -111,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let search_backend: Arc<dyn SearchBackend> =
         Arc::new(WorkspaceSearchBackend::new(Arc::clone(&file_workspace)));
     let mut tools = BuiltinToolCatalog::new(workspace)
+        .with_blob_store(blobs)
         .with_file_workspace(file_workspace)
         .with_process_sandbox(process_sandbox)
         .with_search_backend(search_backend)

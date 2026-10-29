@@ -27,7 +27,7 @@ workspace-opfs = [
 ]
 workspace-skill = ["workspace", "dep:sha2", "dep:toml"]
 workspace-s3 = ["workspace", "dep:aws-sdk-s3"]
-builtin-tools = ["host-sandbox", "workspace-native", "dep:time"]
+builtin-tools = ["host-sandbox", "workspace-native", "dep:time", "dep:image"]
 pptx = ["ooxml"]
 pptx-tools = ["builtin-tools", "pptx"]
 xlsx = ["ooxml"]
@@ -70,6 +70,7 @@ name = "host_completion_projection"
 required-features = ["sqlite"]
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"], optional = true }
 agent-core.workspace = true
 async-stream = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }

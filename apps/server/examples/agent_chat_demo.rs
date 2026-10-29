@@ -483,7 +483,8 @@ fn build_app(
         .with_blob_store(Arc::clone(&blobs));
     let mut tools = if let Some(workspace) = &config.workspace {
         std::fs::create_dir_all(&workspace.root)?;
-        let mut catalog = BuiltinToolCatalog::new(&workspace.root);
+        let mut catalog =
+            BuiltinToolCatalog::new(&workspace.root).with_blob_store(Arc::clone(&blobs));
         if workspace.terminal {
             catalog = catalog.enable_terminal_tools();
         }

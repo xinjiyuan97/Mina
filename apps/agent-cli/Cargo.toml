@@ -14,6 +14,7 @@ agent-extension = { workspace = true, features = [
     "adf",
     "openai",
     "builtin-tools",
+    "filesystem",
     "host-sandbox",
     "observability-tracing",
     "office-tools",
