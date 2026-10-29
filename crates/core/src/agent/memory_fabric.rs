@@ -12,11 +12,25 @@ mod retention;
 
 #[derive(Default)]
 pub struct MemoryFabric {
+    limits: FabricLimits,
     state: Mutex<FabricState>,
     changed: tokio::sync::watch::Sender<u64>,
 }
 
+impl MemoryFabric {
+    pub fn with_limits(limits: FabricLimits) -> Result<Self, FabricError> {
+        limits.validate()?;
+        Ok(Self {
+            limits,
+            state: Mutex::new(FabricState::default().with_limits(limits)?),
+            ..Self::default()
+        })
+    }
+}
 impl OperatorFabric for MemoryFabric {
+    fn limits(&self) -> FabricLimits {
+        self.limits
+    }
     fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         Some(self.changed.subscribe())
     }
@@ -75,6 +89,8 @@ pub fn storage(error: impl std::fmt::Display) -> FabricError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FabricState {
     #[serde(skip)]
+    limits: FabricLimits,
+    #[serde(skip)]
     undo: Option<Undo>,
     #[serde(default = "schema_version")]
     schema_version: u64,
@@ -112,6 +128,7 @@ fn schema_version() -> u64 {
 impl Default for FabricState {
     fn default() -> Self {
         Self {
+            limits: FabricLimits::default(),
             undo: None,
             schema_version: schema_version(),
             lease_reclaims: 0,
@@ -167,7 +184,11 @@ fn same_partition(first: &FabricEvent, second: &FabricEvent) -> bool {
         && first.envelope.run_id == second.envelope.run_id
 }
 
-fn validate_events(events: &[FabricEvent], allow_empty: bool) -> Result<(), FabricError> {
+fn validate_events(
+    events: &[FabricEvent],
+    allow_empty: bool,
+    limits: FabricLimits,
+) -> Result<(), FabricError> {
     if events.is_empty() && allow_empty {
         return Ok(());
     }
@@ -182,13 +203,13 @@ fn validate_events(events: &[FabricEvent], allow_empty: bool) -> Result<(), Fabr
             ));
         }
         let size = serde_json::to_vec(event).map_err(storage)?.len();
-        if size > MAX_EVENT_BYTES {
+        if size > limits.max_event_bytes {
             return Err(invalid("event byte limit"));
         }
         bytes = bytes
             .checked_add(size)
             .ok_or_else(|| invalid("batch overflow"))?;
-        if bytes > MAX_BATCH_BYTES {
+        if bytes > limits.max_batch_bytes {
             return Err(invalid("batch byte limit"));
         }
         let legacy_context = event.envelope.engine_version == EngineVersion::LegacyMachine
@@ -208,7 +229,7 @@ fn validate_events(events: &[FabricEvent], allow_empty: bool) -> Result<(), Fabr
                 event_type: event.envelope.event_type.clone(),
                 delivery_class: DeliveryClass::Durable,
                 schema: event.payload_schema.clone(),
-                max_payload_bytes: MAX_EVENT_BYTES,
+                max_payload_bytes: limits.max_event_bytes,
             })
             .map_err(|error| invalid(&error.to_string()))?;
     }
@@ -216,6 +237,12 @@ fn validate_events(events: &[FabricEvent], allow_empty: bool) -> Result<(), Fabr
 }
 
 impl FabricState {
+    /// Runtime policy is injected by the adapter, never restored from serialized state.
+    pub fn with_limits(mut self, limits: FabricLimits) -> Result<Self, FabricError> {
+        limits.validate()?;
+        self.limits = limits;
+        Ok(self)
+    }
     fn apply_atomic(&mut self, command: FabricCommand) -> Result<FabricReply, FabricError> {
         debug_assert!(self.undo.is_none());
         self.undo = Some(Undo {
@@ -312,7 +339,7 @@ impl FabricState {
         events: Vec<FabricEvent>,
         visible: bool,
     ) -> Result<FabricReply, FabricError> {
-        validate_events(&events, false)?;
+        validate_events(&events, false, self.limits)?;
         let outbox_batch = (!visible).then_some(events[0].envelope.event_id);
         let mut ids = Vec::new();
         for event in events {
@@ -363,7 +390,7 @@ impl FabricState {
         if max_pending == 0 || max_pending > 4096 {
             return Err(invalid("pending limit"));
         }
-        validate_events(&events, false)?;
+        validate_events(&events, false, self.limits)?;
         self.apply(FabricCommand::Subscribe(subscription.clone()))?;
         let index = self.subscription(&subscription.consumer, &subscription.subscription)?;
         let matches = |event: &FabricEvent| {
@@ -476,7 +503,7 @@ impl FabricState {
                 }
                 let mut writes = std::collections::BTreeMap::new();
                 for record in records {
-                    record.validate()?;
+                    record.validate_with_limits(self.limits)?;
                     let key = crate::contracts::host::host_record_key(
                         &record.tenant,
                         &record.namespace,
@@ -1109,10 +1136,11 @@ impl FabricState {
                 outbox,
             } => {
                 let index = self.validate_lease(&lease, now_ms)?;
-                if serde_json::to_vec(&result).map_err(storage)?.len() > MAX_EVENT_BYTES {
+                if serde_json::to_vec(&result).map_err(storage)?.len() > self.limits.max_event_bytes
+                {
                     return Err(invalid("result byte limit"));
                 }
-                validate_events(&outbox, true)?;
+                validate_events(&outbox, true, self.limits)?;
                 let event = self
                     .stream(index)
                     .nth(usize::try_from(lease.offset.saturating_sub(1)).unwrap_or(usize::MAX))
@@ -1155,7 +1183,8 @@ impl FabricState {
                 if self.subscriptions[index].offset >= lease.offset {
                     return Err(FabricError::Fenced);
                 }
-                if backoff_ms < 0 || max_attempts == 0 || error.len() > MAX_EVENT_BYTES {
+                if backoff_ms < 0 || max_attempts == 0 || error.len() > self.limits.max_event_bytes
+                {
                     return Err(invalid("retry policy/error"));
                 }
                 let due_at_ms = now_ms

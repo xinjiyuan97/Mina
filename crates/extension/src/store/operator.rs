@@ -4,7 +4,18 @@ use crate::operator_fabric::{FabricState, storage};
 use agent_core::contracts::fabric::*;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
+impl SqliteEventStore {
+    /// Configure before sharing/cloning the adapter. Reapply after reopening a database.
+    pub fn with_fabric_limits(mut self, limits: FabricLimits) -> Result<Self, FabricError> {
+        limits.validate()?;
+        self.fabric_limits = limits;
+        Ok(self)
+    }
+}
 impl OperatorFabric for SqliteEventStore {
+    fn limits(&self) -> FabricLimits {
+        self.fabric_limits
+    }
     fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         Some(self.fabric_changed.subscribe())
     }
@@ -16,13 +27,14 @@ impl OperatorFabric for SqliteEventStore {
     }
 
     fn execute(&self, command: FabricCommand) -> FabricFuture<'_> {
+        let limits = self.fabric_limits;
         let writes_checkpoint = command.writes_checkpoint();
         let connection = self.connection.clone();
         let changed = self.fabric_changed.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 let mut connection = connection.lock().map_err(storage)?;
-                let result = transact(&mut connection, command);
+                let result = transact(&mut connection, command, limits);
                 if let Ok(reply) = &result
                     && (writes_checkpoint || observable_change(reply))
                 {
@@ -39,6 +51,7 @@ impl OperatorFabric for SqliteEventStore {
 fn transact(
     connection: &mut Connection,
     command: FabricCommand,
+    limits: FabricLimits,
 ) -> Result<FabricReply, FabricError> {
     let needs_v6 = match &command {
         FabricCommand::HostTransact { records, .. } => {
@@ -244,7 +257,9 @@ fn transact(
     }
     let value = assemble(&before)?;
     validate_legacy(&value)?;
-    let mut state: FabricState = serde_json::from_value(value).map_err(storage)?;
+    let mut state = serde_json::from_value::<FabricState>(value)
+        .map_err(storage)?
+        .with_limits(limits)?;
     let reply = match command {
         FabricCommand::BeginMaintenance { token, now_ms } => {
             super::wait_archive::check_leases(&transaction, now_ms)?;

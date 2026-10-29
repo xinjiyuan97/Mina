@@ -2830,3 +2830,45 @@ fn compaction_example_has_valid_wiring() {
         .validate(&OperatorRegistry::builtins(), &resources)
         .unwrap();
 }
+
+#[tokio::test]
+async fn configured_fabric_limits_allow_large_graph_inputs_and_outputs() {
+    use agent_core::contracts::fabric::FabricLimits;
+    for fabric in [
+        Arc::new(
+            MemoryFabric::with_limits(FabricLimits {
+                max_event_bytes: 128 * 1024,
+                max_batch_bytes: 1024 * 1024,
+            })
+            .unwrap(),
+        ) as Arc<dyn agent_core::contracts::fabric::OperatorFabric>,
+        Arc::new(
+            agent_extension::store::SqliteEventStore::open(":memory:", "limits")
+                .await
+                .unwrap()
+                .with_fabric_limits(FabricLimits {
+                    max_event_bytes: 128 * 1024,
+                    max_batch_bytes: 1024 * 1024,
+                })
+                .unwrap(),
+        ),
+    ] {
+        let mut registry = OperatorRegistry::default();
+        registry
+            .register(echo_descriptor(), |_, _| Ok(Arc::new(OversizedOutput)))
+            .unwrap();
+        let agent = AgentBuilder::new(registry, AgentResources::new(fabric))
+            .build(echo_definition())
+            .unwrap();
+        let run = agent.run("x".repeat(65536)).await.unwrap();
+        let completed = terminal(&agent, run.run_id).await;
+        assert_eq!(
+            completed.status,
+            GraphStatus::Completed,
+            "{:?}",
+            completed.error
+        );
+        assert!(agent.run("x".repeat(128 * 1024)).await.is_err());
+        agent.engine.stop_workers().await;
+    }
+}

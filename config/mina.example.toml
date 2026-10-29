@@ -1,7 +1,12 @@
 # The profile selected when a run does not name a model explicitly.
 default_model = "primary"
 
-# The server has one native reducer-backed Agent implementation.
+# Serialized internal event bytes, including envelope/schema; defaults shown.
+[fabric]
+max_event_bytes = 65536
+max_batch_bytes = 1048576
+
+# The server uses the single-agent graph runtime.
 [agent]
 kind = "agent-loop"
 system_prompt = "You are Mina, a helpful agent. Complete the user's task accurately and concisely."

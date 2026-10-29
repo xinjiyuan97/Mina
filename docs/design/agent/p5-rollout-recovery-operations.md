@@ -77,7 +77,7 @@ Fabric 当前是单 snapshot 的事务 adapter，未知版本隔离粒度是该 
 | Context admission backlog | `PublishBounded` 在同一 Fabric 事务内注册订阅、计算 pending、发布；最多 128 个未 ACK Context 请求；跨 worker 不依赖内存计数 |
 | 已满时重投 | 已存在的同内容 event 幂等返回；不因满队列拒绝已保存事实的确认 |
 | HTTP 限流 | 新 admission 返回 503 `admission_backlog_full`；Session 已预留的 attempt 保存失败终态并释放占用；重试相同幂等键仍指向原 attempt，新 attempt 使用新键 |
-| event / result | 64 KiB；checkpoint 4 MiB；Fabric batch 最多 128 项、1 MiB |
+| event / result | 默认 64 KiB；Fabric batch 默认 1 MiB，字节限制可配置，见 [FabricLimits](fabric-limits.md)；checkpoint 4 MiB、batch 最多 128 项不变 |
 | delta 平面 | 延用 P3/P4：32 KiB 消息、最多 128 项、channel capacity 最多 32、输出正文 4 MiB 与 delta 数上限 |
 | wait | 新 suspension 最多 32 waits、32 native effects；在 Coordinator 写绑定前拒绝。Bridge 保留历史结构 reader，不用新上限阻断已保存的 P4 wait |
 | Context 引用 | artifact / memory / skill refs 各最多 128；超限保存 `context_resource_limit`，不调用 Model/Tool |

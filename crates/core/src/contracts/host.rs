@@ -51,6 +51,10 @@ pub fn completion_log(tenant: &str) -> String {
 }
 impl HostRecord {
     pub fn validate(&self) -> Result<(), FabricError> {
+        self.validate_with_limits(FabricLimits::default())
+    }
+    pub fn validate_with_limits(&self, limits: FabricLimits) -> Result<(), FabricError> {
+        limits.validate()?;
         if self.schema_version == 0
             || [&self.tenant, &self.namespace, &self.operation_id]
                 .iter()
@@ -58,7 +62,7 @@ impl HostRecord {
             || serde_json::to_vec(&self.payload)
                 .map_err(|e| FabricError::Invalid(e.to_string()))?
                 .len()
-                > MAX_EVENT_BYTES
+                > limits.max_event_bytes
         {
             return Err(FabricError::Invalid("host record bounds".into()));
         }

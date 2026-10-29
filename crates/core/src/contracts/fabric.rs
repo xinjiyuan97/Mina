@@ -8,11 +8,42 @@ use serde_json::Value;
 
 use crate::{contracts::events::EventId, operator::OperatorEnvelope};
 
+/// Default event/result/error limit; configured adapters expose `OperatorFabric::limits`.
 pub const MAX_EVENT_BYTES: usize = 64 * 1024;
+/// Default total serialized event bytes per batch.
 pub const MAX_BATCH_BYTES: usize = 1024 * 1024;
 pub const MAX_BATCH_ITEMS: usize = 128;
 pub const MAX_KEY_BYTES: usize = 256;
 pub const MAX_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Host-owned write limits. Existing persisted records remain readable when limits shrink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FabricLimits {
+    pub max_event_bytes: usize,
+    pub max_batch_bytes: usize,
+}
+impl Default for FabricLimits {
+    fn default() -> Self {
+        Self {
+            max_event_bytes: MAX_EVENT_BYTES,
+            max_batch_bytes: MAX_BATCH_BYTES,
+        }
+    }
+}
+impl FabricLimits {
+    pub fn validate(&self) -> Result<(), FabricError> {
+        if self.max_event_bytes == 0
+            || self.max_event_bytes > self.max_batch_bytes
+            || self.max_batch_bytes > 64 * 1024 * 1024
+        {
+            return Err(FabricError::Invalid(
+                "fabric limits require 0 < max_event_bytes <= max_batch_bytes <= 64 MiB".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FabricCheckpoint {
@@ -358,6 +389,10 @@ pub struct CollectionReport {
 }
 
 pub trait OperatorFabric: Send + Sync {
+    /// Limits enforced by this adapter; the graph preflight uses the same values.
+    fn limits(&self) -> FabricLimits {
+        FabricLimits::default()
+    }
     /// In-process change hint. Durable reads remain authoritative; remote writers
     /// and adapters without notifications are discovered by the bounded fallback.
     fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {

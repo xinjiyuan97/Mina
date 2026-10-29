@@ -25,6 +25,7 @@ pub enum SqliteMigration {
 }
 #[derive(Debug, Clone)]
 pub struct SqliteOpenOptions {
+    pub fabric_limits: agent_core::contracts::fabric::FabricLimits,
     pub journal_mode: SqliteJournalMode,
     pub synchronous: SqliteSynchronous,
     pub busy_timeout: Duration,
@@ -33,6 +34,7 @@ pub struct SqliteOpenOptions {
 impl Default for SqliteOpenOptions {
     fn default() -> Self {
         Self {
+            fabric_limits: Default::default(),
             journal_mode: SqliteJournalMode::Wal,
             synchronous: SqliteSynchronous::Full,
             busy_timeout: Duration::from_secs(5),
@@ -101,6 +103,7 @@ impl SqliteEventStore {
         identity: String,
         options: SqliteOpenOptions,
     ) -> Result<Self, EventError> {
+        options.fabric_limits.validate().map_err(error)?;
         if !connection.is_autocommit() {
             return Err(error("active transaction"));
         }
@@ -179,6 +182,7 @@ impl SqliteEventStore {
             }
         }
         Ok(Self {
+            fabric_limits: options.fabric_limits,
             connection: Arc::new(Mutex::new(connection)),
             identity,
             fabric_changed: tokio::sync::watch::channel(0).0,

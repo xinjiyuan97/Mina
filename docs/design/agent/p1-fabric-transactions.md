@@ -22,7 +22,7 @@
 2. batch 只接受同 tenant/run 分区；不支持 best-effort。所有输入先验证，任何非法、序号不连续或冲突都整体回滚。
 3. batch 内完全相同的重复 ID 合并为一个存储事件；返回 IDs 仍保留输入位置。冲突重复 ID 整批失败。batch 重试使用相同稳定事件 IDs，不需要额外 batch ID。
 4. 每 tenant/run 的 `operator_seq` 从 1 连续递增，重复事件不推进序号；预留的 outbox 也占用序号，防止后续事实抢占其位置。
-5. 单个完整事件（含 schema/envelope）及 result/error 最大 64 KiB；batch 最大 128 项、序列化事件字节合计最大 1 MiB；查询/claim 最大 128；订阅身份、topic/filter 最大 256 bytes。空发布 batch 拒绝，空 outbox 合法。
+5. 单个完整事件（含 schema/envelope）及 result/error 默认最大 64 KiB；batch 最大 128 项、序列化事件字节合计默认最大 1 MiB；字节上限通过 [FabricLimits](fabric-limits.md) 配置；查询/claim 最大 128；订阅身份、topic/filter 最大 256 bytes。空发布 batch 拒绝，空 outbox 合法。
 6. `DispatchOutbox.limit` 的单位是**原子 batch**，返回值是事件数：绝不为了满足一个事件数量上限拆散一个已提交 batch。一次至多 128 个有界 batch。
 
 ### 订阅、lease 与 receipt

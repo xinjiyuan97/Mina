@@ -25,6 +25,7 @@ const MAX_CLAIM_BATCH: usize = 1_000;
 
 #[derive(Debug, Clone)]
 pub struct SqliteEventStore {
+    pub(super) fabric_limits: agent_core::contracts::fabric::FabricLimits,
     pub(super) fabric_changed: tokio::sync::watch::Sender<u64>,
     pub(super) connection: Arc<Mutex<Connection>>,
     pub(super) identity: String,
@@ -51,6 +52,7 @@ impl SqliteEventStore {
         })
         .await?;
         Ok(Self {
+            fabric_limits: Default::default(),
             connection: Arc::new(Mutex::new(connection)),
             fabric_changed: tokio::sync::watch::channel(0).0,
             identity: identity.into(),

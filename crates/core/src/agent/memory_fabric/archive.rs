@@ -586,7 +586,7 @@ impl FabricState {
         }
         let mut ids = BTreeSet::new();
         for (sequence, event) in incoming.events.iter().enumerate() {
-            validate_events(std::slice::from_ref(&event.event), false)?;
+            validate_events(std::slice::from_ref(&event.event), false, self.limits)?;
             if event.retired
                 || event.event.envelope.operator_seq.0 != sequence as u64 + 1
                 || !ids.insert(event.event.envelope.event_id.to_string())

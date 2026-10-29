@@ -87,6 +87,8 @@ type History = Arc<tokio::sync::Mutex<Vec<ModelMessage>>>;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
+    #[serde(default)]
+    fabric: agent_core::contracts::fabric::FabricLimits,
     listen: SocketAddr,
     #[serde(default)]
     graph: Option<std::path::PathBuf>,
@@ -568,7 +570,7 @@ fn build_app(
         };
         (Arc::new(preparer), policy)
     });
-    let resources = AgentResources::new(Arc::new(MemoryFabric::default()))
+    let resources = AgentResources::new(Arc::new(MemoryFabric::with_limits(config.fabric)?))
         .model("primary", "demo-v1", Arc::new(DebugProvider(provider)))
         .toolset("workspace", "demo-v1", Arc::new(tools));
     let mut agent = GraphAgent::new(definition, OperatorRegistry::builtins(), resources)?;
@@ -673,6 +675,7 @@ mod tests {
         let root = dir.path().join("workspace");
         std::fs::write(dir.path().join("outside.txt"), "private-outside").expect("outside");
         let config = Config {
+            fabric: Default::default(),
             context: None,
             workspace: Some(WorkspaceConfig {
                 root: root.clone(),
@@ -768,6 +771,7 @@ hints = ["hello"]
         )
         .expect("skill");
         let config = Config {
+            fabric: Default::default(),
             context: Some(ContextConfig {
                 skill_directory: skill_root,
             }),
@@ -871,6 +875,7 @@ hints = ["hello"]
         let upstream_task =
             tokio::spawn(async move { axum::serve(listener, upstream).await.expect("upstream") });
         let config = Config {
+            fabric: Default::default(),
             context: None,
             workspace: None,
             graph: None,
@@ -1095,7 +1100,7 @@ hints = ["hello"]
         let mock_task = tokio::spawn(async move {
             axum::serve(listener, mock).await.expect("mock");
         });
-        let config = Config { context: None, workspace: None, image_generation: None, graph: None, listen: "127.0.0.1:0".parse().expect("address"), system_prompt: prompt(), model: serde_json::from_value(json!({"model":"mock","provider":{"type":"openai-compatible","base_url":format!("http://{address}/v1/")}})).expect("model") };
+        let config = Config { fabric: Default::default(), context: None, workspace: None, image_generation: None, graph: None, listen: "127.0.0.1:0".parse().expect("address"), system_prompt: prompt(), model: serde_json::from_value(json!({"model":"mock","provider":{"type":"openai-compatible","base_url":format!("http://{address}/v1/")}})).expect("model") };
         let temp = tempfile::tempdir().expect("temp");
         let app = build_app(config, Arc::new(FilesystemBlobStore::new(temp.path()))).expect("app");
         let held = chat(
@@ -1303,7 +1308,7 @@ hints = ["hello"]
         let upstream_task = tokio::spawn(async move {
             axum::serve(listener, upstream).await.expect("upstream");
         });
-        let config = Config { context: None, workspace: None, image_generation: None, graph: None, listen: "127.0.0.1:0".parse().expect("address"), system_prompt: prompt(), model: serde_json::from_value(json!({"model":"mock","provider":{"type":"openai-compatible","base_url":format!("http://{addr}/v1/")}})).expect("model") };
+        let config = Config { fabric: Default::default(), context: None, workspace: None, image_generation: None, graph: None, listen: "127.0.0.1:0".parse().expect("address"), system_prompt: prompt(), model: serde_json::from_value(json!({"model":"mock","provider":{"type":"openai-compatible","base_url":format!("http://{addr}/v1/")}})).expect("model") };
         let temp = tempfile::tempdir().expect("temp");
         let app = build_app(config, Arc::new(FilesystemBlobStore::new(temp.path()))).expect("app");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

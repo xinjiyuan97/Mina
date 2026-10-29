@@ -421,7 +421,7 @@ let events = agent.engine.subscribe("local", run.run_id, 0);
 
 引擎原子提交节点状态、输出事件及投递确认，并保存图、协议与资源 revision。恢复时核验这些信息。`replay_safe` 默认为 false：执行中断且无法确定副作用结果时，不盲目重放；恢复会等待原租约或 Run 截止时间，再失败。只有可安全重放的算子才应声明 true；宿主必须随资源语义变化更新 revision。
 
-单事件（含信封和 Schema）最多 64 KiB，每次输出最多 128 条、合计 1 MiB，Run 检查点上限 4 MiB（引擎预留 64 KiB）。模型请求包含会话历史，也受事件大小限制。超限输入拒绝启动，超限算子输出使 Run 以 `output_capacity_exceeded` 失败；大内容需由自定义算子使用外部引用传递。
+单事件（含信封和 Schema）默认最多 64 KiB，每批默认合计最多 1 MiB，均可通过宿主 Fabric 配置调整，见 [Fabric 字节限制](fabric-limits.md)。每次输出最多 128 条，Run 检查点上限仍为 4 MiB（引擎预留 64 KiB）。模型请求包含会话历史，也受事件大小限制。超限输入拒绝启动，超限算子输出使 Run 以 `output_capacity_exceeded` 失败；大内容需由自定义算子使用外部引用传递。
 
 内存 Fabric 适合测试；跨进程恢复使用持久化 Fabric。后端必须支持原子批次、连续偏移、租约隔离与事务 outbox。
 

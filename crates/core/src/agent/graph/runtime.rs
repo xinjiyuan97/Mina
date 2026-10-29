@@ -268,7 +268,8 @@ async fn commit(
             .map_err(|e| invalid("event", e))?
             .len();
         batch_bytes += bytes;
-        if bytes > MAX_EVENT_BYTES || batch_bytes > MAX_BATCH_BYTES {
+        if bytes > fabric.limits().max_event_bytes || batch_bytes > fabric.limits().max_batch_bytes
+        {
             return Err(FabricError::Capacity);
         }
     }

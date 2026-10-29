@@ -185,7 +185,10 @@ impl FabricRuntime {
                         now_ms: clock(),
                         backoff_ms,
                         max_attempts: config.max_attempts,
-                        error: error.chars().take(MAX_EVENT_BYTES / 4).collect(),
+                        error: error
+                            .chars()
+                            .take(store.limits().max_event_bytes / 4)
+                            .collect(),
                     })
                     .await
                 {

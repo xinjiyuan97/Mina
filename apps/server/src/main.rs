@@ -839,8 +839,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "skills:filesystem-primary",
     ));
     let skills = Arc::new(SkillOrchestrator::new(skill_store));
-    let event_adapter =
-        Arc::new(SqliteEventStore::open(&store_path, "events:sqlite-primary").await?);
+    let event_adapter = Arc::new(
+        SqliteEventStore::open(&store_path, "events:sqlite-primary")
+            .await?
+            .with_fabric_limits(config.fabric())?,
+    );
     let event_store: Arc<dyn EventStore> = event_adapter.clone();
     let flow_store: Arc<dyn FlowStore> = event_adapter.clone();
     let job_store: Arc<dyn JobStore> = event_adapter.clone();

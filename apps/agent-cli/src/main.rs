@@ -165,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     graph_config.parallel_tools =
         config.agent().tool_call_strategy == agent_core::contracts::ToolCallStrategy::ParallelSafe;
     let resources = agent_core::agent::AgentResources::new(Arc::new(
-        agent_core::agent::memory_fabric::MemoryFabric::default(),
+        agent_core::agent::memory_fabric::MemoryFabric::with_limits(config.fabric())?,
     ))
     .model("primary", "cli-v1", Arc::new(provider))
     .toolset("workspace", "cli-v1", Arc::new(tools));

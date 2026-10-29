@@ -1527,3 +1527,170 @@ async fn sqlite_scheduling_does_not_decode_unrelated_coordination_records() {
         "{plan}"
     );
 }
+
+fn configured_limits() -> FabricLimits {
+    FabricLimits {
+        max_event_bytes: 100_000,
+        max_batch_bytes: 140_000,
+    }
+}
+fn large_event(sequence: u64, size: usize) -> FabricEvent {
+    let mut event = event(sequence);
+    event.payload_schema = json!({"type":"object"});
+    event.envelope.payload = json!({"text":"界".repeat(size / 3)});
+    event
+}
+async fn configured_byte_limits(store: &dyn OperatorFabric) {
+    assert_eq!(store.limits(), configured_limits());
+    subscribe(store).await;
+    store
+        .execute(FabricCommand::Publish(large_event(1, 70_000)))
+        .await
+        .unwrap();
+    assert_eq!(replay(store).await.len(), 1);
+    let lease = claim(store, 0).await.remove(0).lease;
+    store
+        .execute(FabricCommand::Commit {
+            lease,
+            now_ms: 1,
+            result: json!("r".repeat(70_000)),
+            outbox: vec![],
+        })
+        .await
+        .unwrap();
+    // Batch accounting uses complete serialized event bytes, not character counts.
+    assert!(
+        store
+            .execute(FabricCommand::PublishBatch(vec![
+                large_event(2, 70_000),
+                large_event(3, 70_000)
+            ]))
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .execute(FabricCommand::Transact {
+                checkpoint: CheckpointWrite {
+                    key: "oversized-transaction".into(),
+                    expected: None,
+                    value: json!({"written":true})
+                },
+                outbox: vec![large_event(4, 100_000)],
+                delivery: None,
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .execute(FabricCommand::ReadCheckpoint(
+                "oversized-transaction".into()
+            ))
+            .await
+            .unwrap(),
+        FabricReply::Checkpoint(None)
+    );
+    assert_eq!(replay(store).await.len(), 1);
+    store
+        .execute(FabricCommand::Publish(event(2)))
+        .await
+        .unwrap();
+    let lease = claim(store, 2).await.remove(0).lease;
+    assert!(
+        store
+            .execute(FabricCommand::Retry {
+                lease: lease.clone(),
+                now_ms: 3,
+                backoff_ms: 0,
+                max_attempts: 1,
+                error: "e".repeat(100_001)
+            })
+            .await
+            .is_err()
+    );
+    store
+        .execute(FabricCommand::Retry {
+            lease,
+            now_ms: 3,
+            backoff_ms: 0,
+            max_attempts: 1,
+            error: "e".repeat(70_000),
+        })
+        .await
+        .unwrap();
+}
+#[tokio::test]
+async fn configurable_memory_event_result_error_and_batch_limits() {
+    configured_byte_limits(&MemoryFabric::with_limits(configured_limits()).unwrap()).await;
+}
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn configurable_sqlite_limits_and_reopen_read_compatibility() {
+    use agent_extension::store::{SqliteEventStore, SqliteOpenOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("limits.db");
+    let options = SqliteOpenOptions {
+        fabric_limits: configured_limits(),
+        ..Default::default()
+    };
+    let store = SqliteEventStore::open_with_options(&path, "limits", options.clone())
+        .await
+        .unwrap();
+    assert_eq!(store.clone().limits(), configured_limits());
+    configured_byte_limits(&store).await;
+    drop(store);
+    let default = SqliteEventStore::open(&path, "limits").await.unwrap();
+    assert_eq!(default.limits(), FabricLimits::default());
+    assert_eq!(replay(&default).await.len(), 2);
+    assert!(
+        default
+            .execute(FabricCommand::Publish(large_event(3, 70_000)))
+            .await
+            .is_err()
+    );
+    drop(default);
+    let configured = SqliteEventStore::open_with_options(&path, "limits", options)
+        .await
+        .unwrap();
+    configured
+        .execute(FabricCommand::Publish(large_event(3, 70_000)))
+        .await
+        .unwrap();
+}
+#[tokio::test]
+async fn configurable_event_limit_counts_full_serialized_envelope_exactly() {
+    let event = large_event(1, 1000);
+    let bytes = serde_json::to_vec(&event).unwrap().len();
+    let exact = MemoryFabric::with_limits(FabricLimits {
+        max_event_bytes: bytes,
+        max_batch_bytes: bytes,
+    })
+    .unwrap();
+    exact
+        .execute(FabricCommand::Publish(event.clone()))
+        .await
+        .unwrap();
+    let short = MemoryFabric::with_limits(FabricLimits {
+        max_event_bytes: bytes - 1,
+        max_batch_bytes: bytes,
+    })
+    .unwrap();
+    assert!(short.execute(FabricCommand::Publish(event)).await.is_err());
+    for limits in [
+        FabricLimits {
+            max_event_bytes: 0,
+            max_batch_bytes: 1,
+        },
+        FabricLimits {
+            max_event_bytes: 2,
+            max_batch_bytes: 1,
+        },
+        FabricLimits {
+            max_event_bytes: 1,
+            max_batch_bytes: 64 * 1024 * 1024 + 1,
+        },
+    ] {
+        assert!(MemoryFabric::with_limits(limits).is_err());
+    }
+}

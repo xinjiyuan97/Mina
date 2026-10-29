@@ -2,6 +2,11 @@ listen = "127.0.0.1:8081"
 graph = "config/agents/demo.yaml"
 system_prompt = "You are Mina, a helpful assistant."
 
+# Serialized internal event bytes, including envelope/schema; defaults shown.
+[fabric]
+max_event_bytes = 65536
+max_batch_bytes = 1048576
+
 # Tools execute directly in this local demo (no approval UI).
 # Terminal uses host processes, not an OS security sandbox.
 [workspace]

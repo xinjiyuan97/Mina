@@ -20,6 +20,7 @@ pub struct HarnessConfig {
     script: ScriptConfig,
     adf: AdfConfig,
     jobs: JobsConfig,
+    fabric: agent_core::contracts::fabric::FabricLimits,
     default_model: String,
     models: BTreeMap<String, ModelConfig>,
 }
@@ -39,11 +40,17 @@ struct RawHarnessConfig {
     adf: AdfConfig,
     #[serde(default)]
     jobs: JobsConfig,
+    #[serde(default)]
+    fabric: agent_core::contracts::fabric::FabricLimits,
     default_model: String,
     models: BTreeMap<String, ModelConfig>,
 }
 
 impl HarnessConfig {
+    pub fn fabric(&self) -> agent_core::contracts::fabric::FabricLimits {
+        self.fabric
+    }
+
     pub fn from_toml_str(source: &str) -> Result<Self, ConfigError> {
         source.parse()
     }
@@ -112,6 +119,9 @@ impl HarnessConfig {
     }
 
     fn normalize_and_validate(&mut self) -> Result<(), ConfigError> {
+        self.fabric
+            .validate()
+            .map_err(|e| ConfigError::validation("fabric", e.to_string()))?;
         self.agent.normalize_and_validate("agent")?;
         self.approval.normalize_and_validate("approval")?;
         self.orchestration.normalize_and_validate("orchestration")?;
@@ -161,6 +171,7 @@ impl FromStr for HarnessConfig {
             script: raw.script,
             adf: raw.adf,
             jobs: raw.jobs,
+            fabric: raw.fabric,
             default_model: raw.default_model,
             models: raw.models,
         };
@@ -930,5 +941,34 @@ enabled = true"#,
 
         assert!(error.to_string().contains("adf.enabled"));
         assert!(error.to_string().contains("script.quickjs.enabled"));
+    }
+    #[test]
+    fn configurable_fabric_limits_validate_and_default() {
+        use agent_core::contracts::fabric::FabricLimits;
+        assert_eq!(
+            HarnessConfig::from_toml_str(VALID_CONFIG).unwrap().fabric(),
+            FabricLimits::default()
+        );
+        let configured = format!(
+            "{VALID_CONFIG}\n[fabric]\nmax_event_bytes = 524288\nmax_batch_bytes = 2097152\n"
+        );
+        assert_eq!(
+            HarnessConfig::from_toml_str(&configured).unwrap().fabric(),
+            FabricLimits {
+                max_event_bytes: 524288,
+                max_batch_bytes: 2097152
+            }
+        );
+        for values in [
+            "max_event_bytes = 0",
+            "max_event_bytes = 2097152",
+            "max_batch_bytes = 67108865",
+            "unknown = 1",
+        ] {
+            assert!(
+                HarnessConfig::from_toml_str(&format!("{VALID_CONFIG}\n[fabric]\n{values}\n"))
+                    .is_err()
+            );
+        }
     }
 }
