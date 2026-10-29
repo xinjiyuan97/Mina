@@ -5,10 +5,15 @@ pub(super) fn register(registry: &mut OperatorRegistry) {
     let mut context = descriptor(
         "agent.context",
         &["agent.start.v1", "gate.completed.v1"],
-        &["model.requested.v1", "context.failed.v1"],
+        &[
+            "model.requested.v1",
+            "context.failed.v1",
+            "finalize.requested.v1",
+        ],
         json!({"type":"object","additionalProperties":false,"required":["system_prompt","max_steps"],"properties":{"system_prompt":{"type":"string"},"max_steps":{"type":"integer","minimum":1,"maximum":100},"toolset":{"type":"string","minLength":1},"allowed_tools":{"type":"array","items":{"type":"string"},"uniqueItems":true},"allow_run_adf":{"type":"boolean"}}}),
         true,
     );
+    context.config_schema["properties"]["on_max_steps"] = json!({"enum":["fail","finalize"]});
     context
         .resources
         .insert("toolset".into(), ResourceKind::Toolset);
@@ -91,6 +96,8 @@ struct ContextConfig {
     #[serde(default)]
     context: BoundContext,
     max_steps: u32,
+    #[serde(default)]
+    on_max_steps: OnMaxSteps,
     toolset: Option<String>,
     allowed_tools: Option<Vec<String>>,
     #[serde(default)]
@@ -112,6 +119,8 @@ struct ContextState {
     pending: Option<Value>,
     #[serde(default)]
     completed_round: u32,
+    #[serde(default)]
+    finalizing: bool,
 }
 struct Context {
     compact: bool,
@@ -160,7 +169,15 @@ impl GraphOperator for Context {
                 saved.messages = messages;
                 saved.current_user_index = index;
                 request["messages"] = json!(saved.messages);
-                return output(saved, vec![GraphEvent::new("model.requested.v1", request)]);
+                let kind = if saved.finalizing {
+                    "finalize.requested.v1"
+                } else {
+                    "model.requested.v1"
+                };
+                return output(saved, vec![GraphEvent::new(kind, request)]);
+            }
+            if saved.finalizing {
+                return output(saved, vec![]);
             }
             match ctx.event.kind.as_str() {
                 "agent.start.v1" if saved.round == 0 => {
@@ -251,15 +268,24 @@ impl GraphOperator for Context {
                 }
                 _ => return output(saved, vec![]),
             }
-            if saved.round >= self.config.max_steps {
+            if saved.round >= self.config.max_steps && self.config.on_max_steps == OnMaxSteps::Fail
+            {
                 let event = GraphEvent::new(
                     "context.failed.v1",
                     json!({"round":saved.round+1,"code":"max_steps_exceeded"}),
                 );
                 return output(saved, vec![event]);
             }
+            saved.finalizing = saved.round >= self.config.max_steps;
+            if saved.finalizing {
+                saved
+                    .messages
+                    .push(ModelMessage::system(super::finalizer::PROMPT));
+            }
             saved.round += 1;
-            let snapshot = if let Some(name) = &self.config.toolset {
+            let snapshot = if let Some(name) = &self.config.toolset
+                && !saved.finalizing
+            {
                 Some(
                     self.resources
                         .get_toolset(name)?
@@ -296,6 +322,8 @@ impl GraphOperator for Context {
                 request["source_digest"] = json!(crate::agent::bindings::digest(&request)?);
                 saved.pending = Some(request.clone());
                 "context.prepare.requested.v1"
+            } else if saved.finalizing {
+                "finalize.requested.v1"
             } else {
                 "model.requested.v1"
             };
@@ -465,6 +493,62 @@ mod tests {
             .await
             .unwrap();
         assert!(duplicate.events.is_empty());
+    }
+    #[tokio::test]
+    async fn finalizing_context_ignores_duplicate_batches_and_preparation_after_restore() {
+        for compact in [false, true] {
+            let context = Context {
+                compact,
+                config: serde_json::from_value(
+                    json!({"system_prompt":"system", "max_steps":1, "on_max_steps":"finalize"}),
+                )
+                .unwrap(),
+                resources: AgentResources::new(Arc::new(
+                    crate::agent::memory_fabric::MemoryFabric::default(),
+                )),
+            };
+            let mut out = context
+                .handle(ctx("agent.start.v1", json!("task"), Value::Null))
+                .await
+                .unwrap();
+            if compact {
+                out = context
+                    .handle(ctx(
+                        "context.prepared.v1",
+                        out.events[0].payload.clone(),
+                        out.state,
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let batch = json!({"context":{"round":1,"calls":[],"text":"done"},"results":[]});
+            out = context
+                .handle(ctx("gate.completed.v1", batch.clone(), out.state))
+                .await
+                .unwrap();
+            assert_eq!(out.state["finalizing"], true);
+            assert_eq!(out.events[0].payload["tools"], json!([]));
+            let request = out.events[0].payload.clone();
+            let restored =
+                serde_json::from_str(&serde_json::to_string(&out.state).unwrap()).unwrap();
+            out = context
+                .handle(ctx("gate.completed.v1", batch, restored))
+                .await
+                .unwrap();
+            assert!(out.events.is_empty());
+            if compact {
+                out = context
+                    .handle(ctx("context.prepared.v1", request.clone(), out.state))
+                    .await
+                    .unwrap();
+                assert_eq!(out.events[0].kind, "finalize.requested.v1");
+                out = context
+                    .handle(ctx("context.prepared.v1", request, out.state))
+                    .await
+                    .unwrap();
+                assert!(out.events.is_empty());
+            }
+        }
     }
     #[tokio::test]
     async fn gate_joins_opaque_approval_results_after_restore_without_duplicate_dispatch() {

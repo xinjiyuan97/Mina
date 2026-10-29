@@ -2872,3 +2872,226 @@ async fn configured_fabric_limits_allow_large_graph_inputs_and_outputs() {
         agent.engine.stop_workers().await;
     }
 }
+
+struct FinalizingModel {
+    calls: Arc<AtomicUsize>,
+    refuse: bool,
+}
+impl ModelPort for FinalizingModel {
+    fn stream(&self, request: ModelRequest) -> ModelEventStream {
+        let round = self.calls.load(Ordering::SeqCst);
+        if round == 0 {
+            return RoundModel(self.calls.clone()).stream(request);
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(round, 1, "only one finalization call");
+        assert!(request.tools.is_empty());
+        assert_eq!(request.max_output_tokens, Some(256));
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|m| m.role == ModelRole::Tool && m.content == "value")
+        );
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|m| m.role == ModelRole::System && m.content.contains("round limit"))
+        );
+        let mut events = vec![ModelEvent::Usage {
+            usage: test_usage(7, 2),
+        }];
+        if self.refuse {
+            events.push(ModelEvent::ToolCallStarted {
+                call_id: "forbidden".into(),
+                name: "echo".into(),
+            });
+        } else {
+            events.push(ModelEvent::TextDelta {
+                delta: "Completed one step; further work remains.".into(),
+            });
+        }
+        events.push(ModelEvent::Completed {
+            finish_reason: if self.refuse {
+                FinishReason::ToolCall
+            } else {
+                FinishReason::Stop
+            },
+        });
+        Box::pin(futures_util::stream::iter(events))
+    }
+}
+
+#[tokio::test]
+async fn finalizer_runs_once_after_tools_with_compaction_and_accounts_usage() {
+    use agent_core::agent::{CompactorConfig, FinalizerConfig};
+    for compact in [false, true] {
+        for refuse in [false, true] {
+            let mut definition =
+                AgentDefinition::from_yaml(include_str!("../../../config/agents/tools.yaml"))
+                    .unwrap();
+            definition.operators.get_mut("context").unwrap().config["max_steps"] = json!(1);
+            definition.operators.get_mut("llm").unwrap().config["max_output_tokens"] = json!(256);
+            definition
+                .enable_finalization(FinalizerConfig {
+                    max_output_tokens: 256,
+                    timeout_ms: 1000,
+                })
+                .unwrap();
+            if compact {
+                definition
+                    .enable_compaction(CompactorConfig::new("primary", 32000, 256, 32000))
+                    .unwrap();
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tools = Arc::new(AtomicUsize::new(0));
+            let agent = AgentBuilder::new(
+                OperatorRegistry::builtins(),
+                AgentResources::new(Arc::new(MemoryFabric::default()))
+                    .model(
+                        "primary",
+                        "v1",
+                        Arc::new(FinalizingModel {
+                            calls: calls.clone(),
+                            refuse,
+                        }),
+                    )
+                    .toolset("workspace", "v1", Arc::new(EchoTool(tools.clone()))),
+            )
+            .build(definition)
+            .unwrap();
+            let run = agent.run("task").await.unwrap();
+            let state = terminal(&agent, run.run_id).await;
+            assert_eq!(
+                state.status,
+                if refuse {
+                    GraphStatus::Failed
+                } else {
+                    GraphStatus::Completed
+                },
+                "{:?}",
+                state.error
+            );
+            let output = state.output.unwrap();
+            assert_eq!(output["termination_reason"], "max_steps_exceeded");
+            if refuse {
+                assert_eq!(output["code"], "tools_disabled");
+            } else {
+                assert_eq!(
+                    output["output"],
+                    "Completed one step; further work remains."
+                );
+            }
+            assert_eq!(state.usage, Some(test_usage(17, 7)));
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(tools.load(Ordering::SeqCst), 1);
+            let events = agent
+                .engine
+                .events_after("local", run.run_id, 0, 128)
+                .await
+                .unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.kind == "finalize.requested.v1")
+                    .count(),
+                1
+            );
+            if compact {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|e| e.kind == "context.prepared.v1")
+                        .count(),
+                    2
+                );
+            }
+            agent.engine.stop_workers().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn finalizer_forwards_normal_completion_without_an_extra_call() {
+    let mut definition = text_definition();
+    definition.enable_finalization(Default::default()).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent = AgentBuilder::new(OperatorRegistry::builtins(), text_resources(calls.clone()))
+        .build(definition)
+        .unwrap();
+    let run = agent.run("hello").await.unwrap();
+    let state = terminal(&agent, run.run_id).await;
+    assert_eq!(state.status, GraphStatus::Completed);
+    assert_eq!(state.output.unwrap()["output"], "hello");
+    assert_eq!(state.usage, Some(test_usage(10, 5)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    agent.engine.stop_workers().await;
+}
+
+#[test]
+fn finalization_validates_wiring_and_compactor_reserve() {
+    use agent_core::agent::{CompactorConfig, FinalizerConfig, GraphAgentConfig, OnMaxSteps};
+    let mut config = GraphAgentConfig::new("test", "system");
+    config.on_max_steps = OnMaxSteps::Finalize;
+    let mut definition = config.definition().unwrap();
+    assert_eq!(definition.lifecycle.terminal.from, "finalizer");
+    assert!(
+        !OperatorRegistry::builtins()
+            .describe("agent.finalizer", 1)
+            .unwrap()
+            .replay_safe
+    );
+    assert!(
+        definition
+            .enable_compaction(CompactorConfig::new("primary", 32000, 256, 32000))
+            .is_err()
+    );
+    let mut definition = text_definition();
+    definition
+        .enable_compaction(CompactorConfig::new("primary", 32000, 256, 32000))
+        .unwrap();
+    assert!(
+        definition
+            .enable_finalization(FinalizerConfig::default())
+            .is_err()
+    );
+    definition
+        .enable_finalization(FinalizerConfig {
+            max_output_tokens: 256,
+            timeout_ms: 1000,
+        })
+        .unwrap();
+    let resources = text_resources(Arc::new(AtomicUsize::new(0)));
+    definition
+        .validate(&OperatorRegistry::builtins(), &resources)
+        .unwrap();
+    definition.operators.get_mut("finalizer").unwrap().config["max_output_tokens"] = json!(512);
+    assert!(
+        definition
+            .validate(&OperatorRegistry::builtins(), &resources)
+            .is_err()
+    );
+    let mut definition = text_definition();
+    definition.operators.get_mut("context").unwrap().config["on_max_steps"] = json!("finalize");
+    assert!(
+        definition
+            .validate(&OperatorRegistry::builtins(), &resources)
+            .is_err()
+    );
+}
+
+#[test]
+fn finalizer_example_has_valid_wiring() {
+    let definition =
+        AgentDefinition::from_yaml(include_str!("../../../config/agents/tools-finalize.yaml"))
+            .unwrap();
+    let resources = text_resources(Arc::new(AtomicUsize::new(0))).toolset(
+        "workspace",
+        "v1",
+        Arc::new(EchoTool(Arc::new(AtomicUsize::new(0)))),
+    );
+    definition
+        .validate(&OperatorRegistry::builtins(), &resources)
+        .unwrap();
+}

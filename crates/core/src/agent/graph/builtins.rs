@@ -3,6 +3,7 @@ use crate::contracts::*;
 use futures_util::StreamExt;
 use serde_json::json;
 mod compactor;
+mod finalizer;
 mod flow;
 mod policy;
 
@@ -28,7 +29,7 @@ fn protocol(event: &str) -> Value {
         "context.prepared.v1" => {
             json!({"type":"object","required":["prepare_id","source_digest","round"],"properties":{"prepare_id":{"type":"string","minLength":1},"source_digest":{"type":"string","minLength":1},"round":{"type":"integer","minimum":1},"messages":{"type":"array"},"current_user_index":{"type":"integer","minimum":0},"code":{"type":"string","minLength":1}},"oneOf":[{"required":["messages","current_user_index"],"not":{"required":["code"]}},{"required":["code"],"not":{"required":["messages"]}}]})
         }
-        "model.requested.v1" => {
+        "model.requested.v1" | "finalize.requested.v1" => {
             json!({"type":"object","required":["round","messages","tools"],"properties":{"round":{"type":"integer","minimum":1},"messages":{"type":"array"},"tools":{"type":"array"}}})
         }
         "gate.open.v1" | "stop.tool_calls.v1" => {
@@ -84,6 +85,7 @@ pub(super) fn registry() -> OperatorRegistry {
     flow::register(&mut registry);
     compactor::register(&mut registry);
     policy::register(&mut registry);
+    finalizer::register(&mut registry);
     super::waits::register(&mut registry);
     let mut model = descriptor(
         "agent.model",

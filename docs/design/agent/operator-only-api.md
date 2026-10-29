@@ -54,7 +54,7 @@ let started = engine.run(&config, "任务").await?;
 
 需要自行管理驱动与查询投影时，直接使用 `GraphHost`。`GraphAgent` 实现标准 Agent 流接口，供 Harness、CLI 和 demo 集成，其流丢弃时会取消 Run。MemoryFabric 只提供进程内保存；跨进程恢复需要持久化 Fabric。
 
-恢复不会盲目重放被中断的模型调用或非幂等外部副作用。资源 revision 与算子描述必须匹配。`max_steps` 计模型轮次，耗尽后直接失败，不再额外调用模型总结。
+恢复不会盲目重放被中断的模型调用或非幂等外部副作用。资源 revision 与算子描述必须匹配。`max_steps` 计正常模型轮次，默认耗尽后直接失败。配置 `on_max_steps: finalize` 并接入 `agent.finalizer@1` 后，最后一批工具结果收齐时额外调用一次禁用工具的模型，生成最终答复。参见 [Finalizer](finalizer.md)。
 
 ## 删除与验证
 

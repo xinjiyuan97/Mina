@@ -24,9 +24,10 @@ pub use definition::{
     OperatorDefinition, OperatorSubscription, TriggerDefinition,
 };
 pub use graph::{
-    AgentBuilder, AgentResources, CompactorConfig, ConfiguredAgent, GraphAgent, GraphAgentConfig,
-    GraphContext, GraphEngine, GraphEvent, GraphHost, GraphIngress, GraphOperator, GraphOutput,
-    GraphRun, GraphStatus, GraphStepUsage, GraphWaitBridge, OperatorDescriptor, OperatorRegistry,
+    AgentBuilder, AgentResources, CompactorConfig, ConfiguredAgent, FinalizerConfig, GraphAgent,
+    GraphAgentConfig, GraphContext, GraphEngine, GraphEvent, GraphHost, GraphIngress,
+    GraphOperator, GraphOutput, GraphRun, GraphStatus, GraphStepUsage, GraphWaitBridge, OnMaxSteps,
+    OperatorDescriptor, OperatorRegistry,
 };
 
 pub mod artifacts;

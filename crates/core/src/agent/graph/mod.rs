@@ -1,7 +1,7 @@
 //! Static, protocol-checked single-agent graphs. Both construction paths use this engine.
 mod builtins;
 mod config;
-pub use config::{CompactorConfig, GraphAgentConfig};
+pub use config::{CompactorConfig, FinalizerConfig, GraphAgentConfig, OnMaxSteps};
 mod host;
 mod runtime;
 mod stream;
@@ -419,6 +419,24 @@ fn compile(
         }
         descriptors.insert(name.clone(), desc.clone());
     }
+    for (name, op) in &d.operators {
+        if op.kind == "agent.context" && op.config["on_max_steps"] == "finalize" {
+            let wired = d.subscriptions.iter().any(|s| {
+                s.from == *name
+                    && s.events.iter().any(|e| e == "finalize.requested.v1")
+                    && s.subscriber == d.lifecycle.terminal.from
+                    && d.operators
+                        .get(&s.subscriber)
+                        .is_some_and(|o| o.kind == "agent.finalizer")
+            });
+            if !wired {
+                return Err(invalid(
+                    "on_max_steps",
+                    "finalize requires a finalizer wired as terminal outlet",
+                ));
+            }
+        }
+    }
     // The preflight budget must cover the actual downstream generation limit.
     for (name, op) in &d.operators {
         if op.kind != "agent.compactor" {
@@ -432,12 +450,14 @@ fn compile(
             }
             for request in &d.subscriptions {
                 if request.from != response.subscriber
-                    || !request.events.iter().any(|e| e == "model.requested.v1")
+                    || !request.events.iter().any(|e| {
+                        matches!(e.as_str(), "model.requested.v1" | "finalize.requested.v1")
+                    })
                 {
                     continue;
                 }
                 if let Some(model) = d.operators.get(&request.subscriber)
-                    && model.kind == "agent.model"
+                    && matches!(model.kind.as_str(), "agent.model" | "agent.finalizer")
                     && model.config["max_output_tokens"]
                         .as_u64()
                         .is_none_or(|limit| limit > reserve)

@@ -18,6 +18,10 @@ pub struct GraphAgentConfig {
     pub allow_suspend: bool,
     #[serde(default)]
     pub compaction: Option<CompactorConfig>,
+    #[serde(default)]
+    pub on_max_steps: OnMaxSteps,
+    #[serde(default)]
+    pub finalizer: FinalizerConfig,
 }
 impl GraphAgentConfig {
     pub fn new(model: impl Into<String>, system_prompt: impl Into<String>) -> Self {
@@ -34,6 +38,8 @@ impl GraphAgentConfig {
             parallel_tools: false,
             allow_suspend: false,
             compaction: None,
+            on_max_steps: OnMaxSteps::Fail,
+            finalizer: FinalizerConfig::default(),
         }
     }
     /// Resource names: primary (model), workspace (tools), durable (optional waits).
@@ -71,6 +77,9 @@ impl GraphAgentConfig {
                 .subscribe("cleanup", "$engine", "wait", ["engine.terminal.v1"]);
         }
         let mut definition = graph.finish()?;
+        if self.on_max_steps == OnMaxSteps::Finalize {
+            definition.enable_finalization(self.finalizer.clone())?;
+        }
         if let Some(config) = &self.compaction {
             definition.enable_compaction(config.clone())?;
         }
@@ -265,6 +274,17 @@ impl AgentDefinition {
                 "must cover model output limit",
             ));
         }
+        if self.operators.values().any(|op| {
+            op.kind == "agent.finalizer"
+                && op.config["max_output_tokens"]
+                    .as_u64()
+                    .is_none_or(|n| n > u64::from(reserve))
+        }) {
+            return Err(invalid(
+                "reserved_output_tokens",
+                "must cover finalizer output limit",
+            ));
+        }
         let value = serde_json::to_value(config).map_err(|e| invalid("compaction", e))?;
         self.operators.get_mut("context").expect("checked").version = 3;
         let model = self.operators.get_mut("llm").expect("checked");
@@ -289,6 +309,105 @@ impl AgentDefinition {
                 events: vec!["context.prepared.v1".into()],
             },
         ]);
+        Ok(())
+    }
+}
+
+/// Behavior when the normal model-round budget has been exhausted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnMaxSteps {
+    #[default]
+    Fail,
+    Finalize,
+}
+
+/// A separate, bounded final-response call using the main model resource.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FinalizerConfig {
+    pub max_output_tokens: u32,
+    pub timeout_ms: u64,
+}
+impl Default for FinalizerConfig {
+    fn default() -> Self {
+        Self {
+            max_output_tokens: 2048,
+            timeout_ms: 30_000,
+        }
+    }
+}
+
+impl AgentDefinition {
+    /// Enable one tool-free final response after the last permitted tool batch.
+    /// Configure before binding; existing compaction wiring is preserved.
+    pub fn enable_finalization(&mut self, config: FinalizerConfig) -> Result<(), FabricError> {
+        if self.binding_snapshot.is_some() || self.operators.contains_key("finalizer") {
+            return Err(invalid("finalizer", "configure before binding, once"));
+        }
+        let context = self
+            .operators
+            .get("context")
+            .ok_or_else(|| invalid("finalizer", "context node required"))?;
+        let model = self
+            .operators
+            .get("llm")
+            .ok_or_else(|| invalid("finalizer", "llm node required"))?;
+        if context.kind != "agent.context"
+            || model.kind != "agent.model"
+            || self.lifecycle.terminal != GraphLifecycle::model("llm").terminal
+        {
+            return Err(invalid(
+                "finalizer",
+                "expected built-in context/model and model lifecycle",
+            ));
+        }
+        if config.max_output_tokens == 0 || config.timeout_ms == 0 || config.timeout_ms > 86_400_000
+        {
+            return Err(invalid(
+                "finalizer",
+                "positive output limit and timeout <= 86400000 required",
+            ));
+        }
+        if self.operators.values().any(|op| {
+            op.kind == "agent.compactor"
+                && op.config["reserved_output_tokens"]
+                    .as_u64()
+                    .is_none_or(|n| n < u64::from(config.max_output_tokens))
+        }) {
+            return Err(invalid(
+                "finalizer",
+                "compactor reserve must cover finalizer output limit",
+            ));
+        }
+        let mut value = model.config.clone();
+        value["max_output_tokens"] = json!(config.max_output_tokens);
+        value["timeout_ms"] = json!(config.timeout_ms);
+        self.operators.get_mut("context").expect("checked").config["on_max_steps"] =
+            json!("finalize");
+        self.operators.insert(
+            "finalizer".into(),
+            OperatorDefinition::new("agent.finalizer", 1, value),
+        );
+        self.subscriptions.extend([
+            OperatorSubscription {
+                id: "request-finalize".into(),
+                from: "context".into(),
+                subscriber: "finalizer".into(),
+                events: vec!["finalize.requested.v1".into()],
+            },
+            OperatorSubscription {
+                id: "forward-terminal".into(),
+                from: "llm".into(),
+                subscriber: "finalizer".into(),
+                events: vec![
+                    "stop.completed.v1".into(),
+                    "stop.failed.v1".into(),
+                    "stop.cancelled.v1".into(),
+                ],
+            },
+        ]);
+        self.lifecycle.terminal = GraphLifecycle::model("finalizer").terminal;
         Ok(())
     }
 }
